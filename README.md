@@ -67,7 +67,7 @@ python app.py
 
 ```
 
-2. Browse to `http://localhost:5000` and log in with the credentials set in `datasets.json` ( defaults are`user` / `pass`).
+2. Browse to `http://localhost:5000` and log in with the credentials set in `datasets.json` ( defaults are`admin` / `pass`).
 
 3. In **Settings**, adjust:
 
