@@ -342,7 +342,7 @@ default_state = {
     "ps_dynamic": "RDSMASTR", "ps_centered": False, "ps_group_version": "0A",
     "rt_text": "RDS MASTER", "rt_manual_buffers": False, "rt_cycle_ab": False,
     "rt_a": "RDS MASTER", "rt_b": "Simple & Open Source RDS Encoder",
-    "rt_cr": True, "rt_centered": False,
+    "rt_cr": True, "rt_centered": False, "rt_disable_0d": False,
     "rt_mode": "2A", "rt_cycle": True, "rt_cycle_time": 5, "rt_active_buffer": 0,
     "rt_ab_cycle_count": 2,
     "rt_auto_ab": False,       # AUTO buffer mode: flip A/B only when file/text content changes
@@ -419,7 +419,7 @@ default_state = {
     "uecp_dsn": 0,   # Dataset Number filter (0 = accept all)
     "uecp_ws_enabled": False,
     "uecp_ws_url": "ws://127.0.0.1/pacific",
-    
+
     # Enhanced RadioText (eRT) - ODA Application
     "en_ert": False,  # Enable eRT transmission
     "ert_text": "RDSMaster RDS Encoder — ENHANCED RT (eRT)",  # eRT message text
@@ -766,7 +766,7 @@ def migrate_config_ini():
 
 def load_config():
     """Load configuration from datasets.json."""
-    global state, auth_config, current_dataset, auto_start, site_name
+    global state, auth_config, current_dataset, auto_start, site_name, http_port
     
     # First, check if we need to migrate from config.ini
     migrate_config_ini()
@@ -784,8 +784,9 @@ def load_config():
                 
                 if 'datasets' in data and current_dataset_str in data['datasets']:
                     dataset_state = data['datasets'][current_dataset_str].get('state', {})
-                    # Remove auto_start from state if it exists (it should only be at root level)
+                    # Remove auto_start and http_port from state if they exist (they should only be at root level)
                     dataset_state.pop('auto_start', None)
+                    dataset_state.pop('http_port', None)
                     state.update(dataset_state)
                     # Reset running state - encoder is never running at startup
                     state["running"] = False
@@ -801,9 +802,12 @@ def load_config():
                     auto_start_was_missing = True
                     print("⚠ auto_start missing from datasets.json, will add it...")
                 auto_start = data.get('auto_start', True)
-                
+
                 # Load site_name global setting
                 site_name = data.get('site_name', 'Secure Login')
+
+                # Load http_port global setting
+                http_port = data.get('http_port', 5000)
         else:
             print("datasets.json not found, using default state.")
     except Exception as e:
@@ -1013,10 +1017,13 @@ def save_config():
         
         # Save global auto_start setting
         data['auto_start'] = auto_start
-        
+
         # Save site_name
         data['site_name'] = site_name
-        
+
+        # Save http_port
+        data['http_port'] = http_port
+
         # Validate JSON serializability before writing
         try:
             json.dumps(data)
@@ -1037,6 +1044,7 @@ datasets = {}
 current_dataset = 1
 auto_start = True  # Global setting, not per-dataset
 site_name = "Secure Login"  # Global setting for UI branding
+http_port = 5000  # Global setting for HTTP port, not per-dataset
 
 def load_datasets():
     global datasets, current_dataset
@@ -1045,10 +1053,11 @@ def load_datasets():
             with open(DATASETS_FILE, 'r') as f:
                 data = json.load(f)
                 datasets = data.get('datasets', {})
-                # Clean up auto_start from all dataset states
+                # Clean up auto_start and http_port from all dataset states
                 for ds_key in datasets:
                     if 'state' in datasets[ds_key]:
                         datasets[ds_key]['state'].pop('auto_start', None)
+                        datasets[ds_key]['state'].pop('http_port', None)
                 current_dataset = data.get('current', 1)
         else:
             datasets = {'1': {'name': 'Dataset 1', 'state': dict(state)}}
@@ -1059,7 +1068,7 @@ def load_datasets():
 
 def save_datasets():
     """Save datasets along with auth and system settings."""
-    global auto_start
+    global auto_start, http_port
     try:
         # Load existing data to preserve auth and system (best-effort — if file is
         # unreadable/corrupt we start fresh rather than aborting the whole save)
@@ -1077,20 +1086,22 @@ def save_datasets():
         if str(current_dataset) in datasets:
             datasets[str(current_dataset)]['state'] = dict(state)
         
-        # Clean up: remove auto_start from all dataset states before saving
+        # Clean up: remove auto_start and http_port from all dataset states before saving
         datasets_clean = {}
         for ds_key, ds_value in datasets.items():
             datasets_clean[ds_key] = {'name': ds_value.get('name', f'Dataset {ds_key}')}
             if 'state' in ds_value:
                 state_copy = dict(ds_value['state'])
                 state_copy.pop('auto_start', None)  # Ensure auto_start never in state
+                state_copy.pop('http_port', None)  # Ensure http_port never in state
                 datasets_clean[ds_key]['state'] = state_copy
         
         # Update datasets and current
         data['datasets'] = datasets_clean
         data['current'] = current_dataset
         data['auto_start'] = auto_start  # Save global auto_start setting at root level
-        
+        data['http_port'] = http_port  # Save global http_port setting at root level
+
         # Always save current auth credentials
         data['auth'] = {'user': auth_config.get('user', 'admin'), 'pass': auth_config.get('pass', 'admin')}
         
@@ -1125,6 +1136,7 @@ def switch_dataset(dataset_num):
         state.update(default_state.copy())
         new_state = datasets[dataset_num]['state'].copy()
         new_state.pop('auto_start', None)  # Ensure auto_start not in state
+        new_state.pop('http_port', None)  # Ensure http_port not in state
         state.update(new_state)
 
         # Clear monitor_data to prevent showing stale values from previous dataset
@@ -1636,10 +1648,19 @@ class Sanitize:
 
     @staticmethod
     def to_state(data):
-        global state
+        global state, http_port
         changed = False
         # Fields that should NOT be converted to EBU Latin (JSON data, mode flags, etc.)
         skip_ebu_fields = {'rt_plus_builder_a', 'rt_plus_builder_b', 'rt_plus_mode', 'rt_messages', 'eon_services', 'af_pairs', 'custom_groups', 'custom_oda_list', 'rt_plus_regex_rules_a', 'rt_plus_regex_rules_b', 'dynamic_control_rules', 'ps_long_32', 'tdc_5a_text', 'tdc_5b_text', 'uecp_host', 'uecp_ws_url', 'ert_text', 'ert_messages', 'ert_source'}
+
+        # Handle system-wide settings that are global variables, not in state
+        if 'http_port' in data:
+            try:
+                http_port = int(data['http_port'])
+                changed = True
+            except:
+                pass
+
         for k, v in data.items():
             if k in state:
                 try:
@@ -2896,6 +2917,22 @@ class RDSScheduler:
             print(f"eRT RT+ formatting error: {e}")
         return content
 
+    def apply_rt_rtplus_formatting(self, msg, content):
+        """Apply RT+ formatting (prefix/suffix from first enabled default policy) for regular RT."""
+        try:
+            policies = json.loads(msg.get("tagging_policies", "[]") or "[]")
+            for p in policies:
+                if p.get("enabled", True) and p.get("type") == "default":
+                    s = p.get("settings", {})
+                    prefix = s.get("prefix", "")
+                    suffix = s.get("suffix", "")
+                    if prefix or suffix:
+                        return prefix + content + suffix
+                    return content
+        except Exception as e:
+            print(f"RT RT+ formatting error: {e}")
+        return content
+
     def freq_code(self, f):
         try: 
             freq_val = float(f)
@@ -3451,6 +3488,10 @@ class RDSScheduler:
                 if not raw:
                     raw = " " * limit  # Fallback to blank
 
+                # Apply RT+ formatting (prefix/suffix) if enabled for this message
+                if current_msg and current_msg.get("rt_plus_enabled", False):
+                    raw = self.apply_rt_rtplus_formatting(current_msg, raw)
+
                 # Truncate to limit
                 raw = raw[:limit]
 
@@ -3513,7 +3554,7 @@ class RDSScheduler:
                 self.rt_ptr = 0
                 self.last_rt_buf = buf
 
-            sig = f"{raw}_{state['rt_centered']}_{state['rt_cr']}"
+            sig = f"{raw}_{state['rt_centered']}_{state['rt_cr']}_{state.get('rt_disable_0d', False)}"
 
             # Calculate RT+ tags
             if current_msg:
@@ -3528,7 +3569,9 @@ class RDSScheduler:
                     self.rt_plus_tags = self.get_rt_plus_tags_for_message(current_msg, raw, limit)
 
                     tag_str = []
-                    display_clean = (raw + '\r') if state["rt_cr"] else raw.center(limit) if state["rt_centered"] else raw.ljust(limit)
+                    # Use same terminator logic for RT+ tag display
+                    term_char = ' ' if (state["rt_cr"] and state.get("rt_disable_0d", False)) else '\r' if state["rt_cr"] else ''
+                    display_clean = (raw + term_char) if term_char else (raw.center(limit) if state["rt_centered"] else raw.ljust(limit))
                     for t in self.rt_plus_tags:
                         t_name = RTPLUS_CONTENT_TYPES.get(t[0], ("Unknown", ""))[0]
                         content = display_clean[t[1]:t[1]+t[2]]
@@ -3556,7 +3599,9 @@ class RDSScheduler:
                         self.rt_plus_tags = RTPlusParser.parse(raw, fmt, centered=state['rt_centered'], limit=limit)
 
                     tag_str = []
-                    display_clean = (raw + '\r') if state["rt_cr"] else raw.center(limit) if state["rt_centered"] else raw.ljust(limit)
+                    # Use same terminator logic for RT+ tag display
+                    term_char = ' ' if (state["rt_cr"] and state.get("rt_disable_0d", False)) else '\r' if state["rt_cr"] else ''
+                    display_clean = (raw + term_char) if term_char else (raw.center(limit) if state["rt_centered"] else raw.ljust(limit))
                     for t in self.rt_plus_tags:
                         t_name = RTPLUS_CONTENT_TYPES.get(t[0], ("Unknown", ""))[0]
                         content = display_clean[t[1]:t[1]+t[2]]
@@ -3564,7 +3609,12 @@ class RDSScheduler:
                     monitor_data["rt_plus_info"] = " | ".join(tag_str) if tag_str else "(no tags)"
 
             if sig != self.last_rt_content: self.rt_ptr, self.last_rt_content = 0, sig
-            clean = (raw + '\r') if state["rt_cr"] else raw.center(limit) if state["rt_centered"] else raw.ljust(limit)
+            # Determine terminator: space if disable_0d is enabled, otherwise CR
+            terminator = ' ' if (state["rt_cr"] and state.get("rt_disable_0d", False)) else '\r' if state["rt_cr"] else ''
+            if terminator:
+                clean = raw + terminator
+            else:
+                clean = raw.center(limit) if state["rt_centered"] else raw.ljust(limit)
 
             monitor_data["rt"] = clean
 
@@ -3751,7 +3801,9 @@ class RDSScheduler:
                     mode = state.get("tdc_5a_mode", "custom")
                     if mode == "pc_status":
                         text = PCStatusMonitor.format_pc_status()
-                        # For PC status, update text but don't reset pointer (let it cycle)
+                        # For PC status, reset pointer if text changed (e.g., uptime length changed)
+                        if text != self.tdc_last_text_5a:
+                            self.tdc_5a_ptr = 0
                         self.tdc_last_text_5a = text
                     else:
                         text = state.get("tdc_5a_text", "")
@@ -3786,8 +3838,9 @@ class RDSScheduler:
                 segment = self.tdc_5a_ptr % num_segments
                 self.tdc_5a_ptr += 1
 
-                # Block 2 tail: 5-bit address (segment number 0-31)
-                b2_tail = segment & 0x1F
+                # Block 2 tail: 5-bit channel number (0-31)
+                channel = state.get("tdc_5a_channel", 0)
+                b2_tail = channel & 0x1F
 
                 # Blocks 3 and 4: 4 bytes of data (2 per block)
                 offset = segment * 4
@@ -3810,7 +3863,9 @@ class RDSScheduler:
                     mode = state.get("tdc_5b_mode", "custom")
                     if mode == "pc_status":
                         text = PCStatusMonitor.format_pc_status()
-                        # For PC status, update text but don't reset pointer (let it cycle)
+                        # For PC status, reset pointer if text changed (e.g., uptime length changed)
+                        if text != self.tdc_last_text_5b:
+                            self.tdc_5b_ptr = 0
                         self.tdc_last_text_5b = text
                     else:
                         text = state.get("tdc_5b_text", "")
@@ -3846,8 +3901,9 @@ class RDSScheduler:
                 segment = self.tdc_5b_ptr % num_segments
                 self.tdc_5b_ptr += 1
 
-                # Block 2 tail: 5-bit address (segment number 0-31)
-                b2_tail = segment & 0x1F
+                # Block 2 tail: 5-bit channel number (0-31)
+                channel = state.get("tdc_5b_channel", 0)
+                b2_tail = channel & 0x1F
 
                 # Blocks 3 and 4: 4 bytes of data (2 per block) - same as 5A
                 offset = segment * 4
@@ -4956,7 +5012,7 @@ def run_audio():
 def index():
     if not session.get('auth'): return redirect(url_for('login'))
     inputs, outputs = get_valid_devices()
-    return render_template_string(UI_HTML, inputs=inputs, outputs=outputs, state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, version=VERSION)
+    return render_template_string(UI_HTML, inputs=inputs, outputs=outputs, state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, http_port=http_port, version=VERSION)
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -6143,6 +6199,7 @@ UI_HTML = r"""
                                  <div class="flex flex-col items-center"><label>RT+ Enable</label><input type="checkbox" class="toggle-checkbox" id="en_rt_plus" {% if state.en_rt_plus %}checked{% endif %} onchange="sync()"></div>
                                  <div class="flex flex-col items-center"><label>Centre</label><input type="checkbox" class="toggle-checkbox" id="rt_centered" {% if state.rt_centered %}checked{% endif %} onchange="if(this.checked) document.getElementById('rt_cr').checked = false; sync()"></div>
                                  <div class="flex flex-col items-center"><label>Append CR</label><input type="checkbox" class="toggle-checkbox" id="rt_cr" {% if state.rt_cr %}checked{% endif %} onchange="sync()"></div>
+                                 <div class="flex flex-col items-center"><label>Disable 0D</label><input type="checkbox" class="toggle-checkbox" id="rt_disable_0d" {% if state.rt_disable_0d %}checked{% endif %} onchange="sync()"></div>
                              </div>
                         </div>
                     </div>
@@ -7729,6 +7786,11 @@ UI_HTML = r"""
                             <label>Site Name</label>
                             <div class="text-[9px] text-gray-500 mb-1">Displayed in login screen and page title (e.g., "POWER FM Burgas").</div>
                             <input type="text" id="site_name" value="{{site_name}}" placeholder="Where am I" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-pink-500">
+                        </div>
+                        <div class="mb-3">
+                            <label>HTTP Port</label>
+                            <div class="text-[9px] text-gray-500 mb-1">Port number for web interface (requires restart).</div>
+                            <input type="number" id="http_port" min="1024" max="65535" value="{{http_port}}" onchange="sync()" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-pink-500">
                         </div>
                         <div class="flex gap-2 items-center">
                             <button onclick="saveSettings()" class="bg-pink-600 hover:bg-pink-500 text-white font-semibold rounded px-4 py-2 text-sm transition">Save Settings</button>
@@ -11228,6 +11290,7 @@ UI_HTML = r"""
                 rt_cycle_ab: getVal('rt_cycle_ab'),
                 rt_a: getVal('rt_a'), rt_b: getVal('rt_b'), rt_mode: getVal('rt_mode'),
                 rt_cycle: getVal('rt_cycle'), rt_centered: getVal('rt_centered'), rt_cr: getVal('rt_cr'),
+                rt_disable_0d: getVal('rt_disable_0d'),
                 rt_cycle_time: getVal('rt_cycle_time'),
                 rt_ab_cycle_count: getVal('rt_ab_cycle_count'),
                 
@@ -11282,7 +11345,10 @@ UI_HTML = r"""
                 tdc_pc_show_temp: getVal('tdc_pc_show_temp'),
                 tdc_pc_show_ip: getVal('tdc_pc_show_ip'),
                 tdc_pc_show_ram: getVal('tdc_pc_show_ram'),
-                tdc_pc_show_uptime: getVal('tdc_pc_show_uptime')
+                tdc_pc_show_uptime: getVal('tdc_pc_show_uptime'),
+
+                // Web Interface
+                http_port: getVal('http_port')
             };
             socket.emit('update', data);
 
@@ -15135,5 +15201,5 @@ UI_HTML = r"""
 
 if __name__ == '__main__':
     print("[STARTUP] RDS Encoder application starting...", flush=True)
-    print("[STARTUP] Starting threads and web server on port 5000", flush=True)
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    print(f"[STARTUP] Starting threads and web server on port {http_port}", flush=True)
+    socketio.run(app, host='0.0.0.0', port=http_port, debug=False)
