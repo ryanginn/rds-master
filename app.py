@@ -20,7 +20,7 @@ from scipy import signal as dsp_signal
 from scipy.fft import fft
 
 # --- VERSION ---
-VERSION = "v1.3"
+VERSION = "v1.3a"
 
 # --- SETTINGS ---
 # Host API filtering: auto-detect based on OS, can be overridden via RDS_HOSTAPI env var
@@ -452,6 +452,7 @@ monitor_data = {
     "ert_rtplus_info": "",
     "lps": "",
     "ptyn": "",
+    "en_ptyn": False,
     "af": "",
     "pi": "0000",
     "pty_idx": 10,
@@ -1213,7 +1214,7 @@ def apply_text_trim(text, trim_parens=False, trim_brackets=False, trim_at_semico
     # Collapse multiple spaces
     text = re.sub(r'  +', ' ', text).strip()
     if max_len > 0 and len(text) > max_len:
-        text = text[:max_len].rstrip()
+        text = text[:max_len-3].rstrip() + '...'
     return text
 
 
@@ -1392,6 +1393,7 @@ def monitor_pusher_loop():
             # Pilot generation: disabled if pass-through is enabled and an input device is selected, or when genlock is active
             monitor_data["pilot_generated"] = not ((state.get("passthrough") and state.get("device_in_idx") != -1) or state.get("genlock"))
             monitor_data["en_ert"] = bool(state.get("en_ert", False))
+            monitor_data["en_ptyn"] = bool(state.get("en_ptyn", False))
             # Fallback: if scheduler hasn't fired an eRT group yet, show the configured text
             if monitor_data["en_ert"] and not monitor_data.get("ert"):
                 monitor_data["ert"] = state.get("ert_text", "")
@@ -1401,7 +1403,7 @@ def monitor_pusher_loop():
         else:
              socketio.emit('monitor', {
                  "ps": "OFF AIR", "rt": "Encoder Stopped", "ert": "", "en_ert": False, "ert_rtplus_info": "",
-                 "lps": "", "ptyn": "", "af_list": "", "af_method": "A", "af_pairs": "[]", "pty_idx": 0, "rt_plus_info": "", "pi": "----",
+                 "lps": "", "ptyn": "", "en_ptyn": False, "af_list": "", "af_method": "A", "af_pairs": "[]", "pty_idx": 0, "rt_plus_info": "", "pi": "----",
                  "heartbeat": monitor_data["heartbeat"],
                  "pilot_generated": False,
                  "tp": 0, "ta": 0, "ms": 0,
@@ -5818,7 +5820,7 @@ UI_HTML = r"""
         input[type=range] { flex: 1; accent-color: #d946ef; }
         
         .live-display { background: #000; border: 1px solid #333; color: #0f0; font-family: 'Courier New', monospace; padding: 8px; font-size: 14px; font-weight: bold; border-radius: 2px; letter-spacing: 1px; min-height: 20px; }
-        .live-display.lg { font-size: 24px; color: #d946ef; text-align: center; letter-spacing: 4px; background: #110011; border-color: #550055; text-transform: uppercase; }
+        .live-display.lg { font-size: 24px; color: #d946ef; text-align: center; letter-spacing: 4px; background: #110011; border-color: #550055; }
         .live-display.sub { color: #00ffcc; font-size: 12px; }
         
         /* DI Flag checkboxes - red/green indicators */
@@ -5935,7 +5937,6 @@ UI_HTML = r"""
                     {{site_name}} • <span id="heartbeat" class="text-xs">♥</span> 192kHz Ready
                 </div>
                 <button id="pwrBtn" onclick="togglePower()" class="pwr-btn">OFF AIR</button>
-                <button id="saveBtn" onclick="manualSave()" class="save-btn" title="Save configuration changes">Save Config</button>
                 <a href="/logout" class="text-[11px] text-gray-300 hover:text-white underline">Logout</a>
             </div>
         </div>
@@ -5992,12 +5993,12 @@ UI_HTML = r"""
                                      <label>Live PI</label>
                                      <div class="live-display sub text-center text-yellow-300" id="live_pi"></div>
                                  </div>
-                                 <div>
+                                 <div id="live_lps_col" class="col-span-2">
                                      <label>Long PS (Group 15)</label>
                                      <div class="live-display sub" id="live_lps"></div>
                                  </div>
-                                 <div>
-                                     <label>PTY Name</label>
+                                 <div id="live_ptyn_col" style="display:none">
+                                     <label>PTYN</label>
                                      <div class="live-display sub" id="live_ptyn"></div>
                                  </div>
                              </div>
@@ -6170,7 +6171,30 @@ UI_HTML = r"""
                         </div>
                     </div>
                 </div>
-            
+
+                <div class="section">
+                    <div class="section-header">PTYN</div>
+                    <div class="section-body">
+                         <div class="flex gap-3 items-center">
+                            <div class="flex gap-2 items-center"><label>Enable</label><input type="checkbox" class="toggle-checkbox" id="en_ptyn" {% if state.en_ptyn %}checked{% endif %} onchange="sync()"></div>
+                            <div class="flex gap-2 items-center"><label>Centre Text</label><input type="checkbox" class="toggle-checkbox" id="ptyn_centered" {% if state.ptyn_centered %}checked{% endif %} onchange="sync()"></div>
+                         </div>
+                         <input type="text" id="ptyn" value="{{state.ptyn}}" onchange="sync()">
+                    </div>
+                 </div>
+
+                 <div class="section">
+                    <div class="section-header">Long PS (Group 15)</div>
+                    <div class="section-body">
+                         <div class="flex gap-3 items-center">
+                             <div class="flex gap-2 items-center"><label>Enable</label><input type="checkbox" class="toggle-checkbox" id="en_lps" {% if state.en_lps %}checked{% endif %} onchange="sync()"></div>
+                             <div class="flex gap-2 items-center"><label>Centre Text</label><input type="checkbox" class="toggle-checkbox" id="lps_centered" {% if state.lps_centered %}checked{% endif %} onchange="sync()"></div>
+                             <div class="flex gap-2 items-center"><label>Append CR</label><input type="checkbox" class="toggle-checkbox" id="lps_cr" {% if state.lps_cr %}checked{% endif %} onchange="sync()"></div>
+                         </div>
+                         <input type="text" id="ps_long_32" value="{{state.ps_long_32}}" onchange="sync()">
+                    </div>
+                 </div>
+
                 <div class="section">
                     <div class="section-header flex justify-between items-center">
                         <span>RadioText Messages</span>
@@ -6356,9 +6380,8 @@ UI_HTML = r"""
                             <!-- Manual Mode: Sample Text Input (when RT+ enabled) -->
                             <div id="rt_msg_manual_builder" style="display:none" class="space-y-3">
                                 <div>
-                                    <label class="text-xs text-gray-400 mb-1 block">Sample Text for Rule Testing</label>
-                                    <input type="text" id="rt_msg_sample_text" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1" placeholder="e.g. Adele - Rolling in the Deep" oninput="updateSampleText(); updateMsgPreview()">
-                                    <div class="text-[10px] text-gray-500 mt-1">💡 Enter sample text to see how your tagging rules will work</div>
+                                    <label class="text-xs text-gray-400 mb-1 block">RadioText Content</label>
+                                    <input type="text" id="rt_msg_sample_text" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1" oninput="updateSampleText(); updateMsgPreview()">
                                 </div>
                             </div>
 
@@ -6564,7 +6587,6 @@ UI_HTML = r"""
                                         <span class="text-gray-300">Truncate to 64 chars</span>
                                     </label>
                                 </div>
-                                <div class="text-[10px] text-gray-500">e.g. "Artist; Artist 2 - Title" → "Artist - Title" with trim at ;</div>
                             </div>
 
                             <!-- Preview -->
@@ -6722,7 +6744,7 @@ UI_HTML = r"""
                          <div class="flex items-center gap-2"><label class="flex-1">Enable ID (1A)</label><input type="checkbox" class="toggle-checkbox" id="en_id" {% if state.en_id %}checked{% endif %} onchange="sync()"></div>
                      </div>
                  </div>
-                 
+
                  <div class="section">
                     <div class="section-header flex justify-between items-center">
                         <span>Enhanced RadioText (eRT) Messages</span>
@@ -7026,7 +7048,7 @@ UI_HTML = r"""
                                                  <span class="text-gray-600 ml-1">bytes</span>
                                              </div>
                                          </div>
-                                         <div id="ert_rtplus_preview" class="font-mono text-sm text-gray-300 min-h-[20px] whitespace-pre"></div>
+                                         <div id="ert_rtplus_preview" class="font-mono text-sm text-gray-300 min-h-[20px] whitespace-pre-wrap break-words"></div>
                                          <div class="mt-2 grid grid-cols-2 gap-2 text-xs">
                                              <div class="text-orange-400">Tag 1: <span id="ert_msg_tag1_info" class="text-orange-300">-</span></div>
                                              <div class="text-cyan-400">Tag 2: <span id="ert_msg_tag2_info" class="text-cyan-300">-</span></div>
@@ -7057,7 +7079,6 @@ UI_HTML = r"""
                                          <span class="text-gray-300">Truncate to 128 bytes</span>
                                      </label>
                                  </div>
-                                 <div class="text-[10px] text-gray-500">e.g. "Artist; Artist 2 - Title" → "Artist - Title" with trim at ;</div>
                              </div>
                          </div>
 
@@ -7105,29 +7126,6 @@ UI_HTML = r"""
                                  </select>
                              </div>
                          </div>
-                    </div>
-                 </div>
-                 
-                 <div class="section">
-                    <div class="section-header">PTYN</div>
-                    <div class="section-body">
-                         <div class="flex gap-3 items-center">
-                            <div class="flex gap-2 items-center"><label>Enable</label><input type="checkbox" class="toggle-checkbox" id="en_ptyn" {% if state.en_ptyn %}checked{% endif %} onchange="sync()"></div>
-                            <div class="flex gap-2 items-center"><label>Centre Text</label><input type="checkbox" class="toggle-checkbox" id="ptyn_centered" {% if state.ptyn_centered %}checked{% endif %} onchange="sync()"></div>
-                         </div>
-                         <input type="text" id="ptyn" value="{{state.ptyn}}" onchange="sync()">
-                    </div>
-                 </div>
-
-                 <div class="section">
-                    <div class="section-header">Long PS (Group 15)</div>
-                    <div class="section-body">
-                         <div class="flex gap-3 items-center">
-                             <div class="flex gap-2 items-center"><label>Enable</label><input type="checkbox" class="toggle-checkbox" id="en_lps" {% if state.en_lps %}checked{% endif %} onchange="sync()"></div>
-                             <div class="flex gap-2 items-center"><label>Centre Text</label><input type="checkbox" class="toggle-checkbox" id="lps_centered" {% if state.lps_centered %}checked{% endif %} onchange="sync()"></div>
-                             <div class="flex gap-2 items-center"><label>Append CR</label><input type="checkbox" class="toggle-checkbox" id="lps_cr" {% if state.lps_cr %}checked{% endif %} onchange="sync()"></div>
-                         </div>
-                         <input type="text" id="ps_long_32" value="{{state.ps_long_32}}" onchange="sync()">
                     </div>
                  </div>
 
@@ -8948,7 +8946,7 @@ UI_HTML = r"""
                 buffer: 'AB',
                 cycles: 2,
                 source_type: 'manual',
-                content: 'Artist - Song Title',
+                content: '',
                 split_delimiter: ' - ',
                 rt_plus_enabled: false,
                 rt_plus_tags: { tag1_type: 4, tag2_type: 1 },
@@ -8958,7 +8956,7 @@ UI_HTML = r"""
                 tagging_policies: '[]',
                 case_sensitive: false,
                 whole_words: false,
-                sample_text: 'Artist - Song Title'
+                sample_text: ''
             };
             openMessageModal(pendingNewMessage, true);
         }
@@ -8987,42 +8985,52 @@ UI_HTML = r"""
 
             // Load fields based on source type
             if (msg.source_type === 'manual') {
+                // Always clear both text fields first to prevent showing stale content
+                document.getElementById('rt_msg_simple_text').value = '';
+                if (document.getElementById('rt_msg_sample_text'))
+                    document.getElementById('rt_msg_sample_text').value = '';
+
                 if (msg.content && !msg.rt_plus_enabled) {
-                    // Simple text mode
+                    // Simple text mode - set the simple text field
                     document.getElementById('rt_msg_simple_text').value = msg.content || '';
-                } else {
-                    // Load intelligent tagging settings
-                    if (document.getElementById('rt_msg_prefix')) 
-                        document.getElementById('rt_msg_prefix').value = msg.prefix || '';
-                    if (document.getElementById('rt_msg_suffix')) 
-                        document.getElementById('rt_msg_suffix').value = msg.suffix || '';
-                    if (document.getElementById('rt_msg_split_pattern')) 
-                        document.getElementById('rt_msg_split_pattern').value = msg.split_delimiter || ' - ';
-                    if (document.getElementById('rt_msg_before_tag')) 
-                        document.getElementById('rt_msg_before_tag').value = (msg.rt_plus_tags && msg.rt_plus_tags.tag1_type) || 4;
-                    if (document.getElementById('rt_msg_after_tag')) 
-                        document.getElementById('rt_msg_after_tag').value = (msg.rt_plus_tags && msg.rt_plus_tags.tag2_type) || 1;
-                    if (document.getElementById('rt_msg_case_sensitive')) 
-                        document.getElementById('rt_msg_case_sensitive').checked = msg.case_sensitive || false;
-                    if (document.getElementById('rt_msg_whole_words')) 
-                        document.getElementById('rt_msg_whole_words').checked = msg.whole_words || false;
-                    
-                    // Load sample text for manual mode
+                } else if (msg.rt_plus_enabled) {
+                    // RT+ mode - set the sample text field
                     if (document.getElementById('rt_msg_sample_text'))
-                        document.getElementById('rt_msg_sample_text').value = msg.sample_text || 'Artist - Song Title';
-                    globalSampleText = msg.sample_text || 'Artist - Song Title';
-                    
-                    // Load smart rules (backward compatibility with old 'smart_rules' field)
-                    taggingPolicies = [];
-                    try {
-                        if (msg.tagging_policies) {
-                            taggingPolicies = JSON.parse(msg.tagging_policies) || [];
-                        } else if (msg.smart_rules) {
-                            taggingPolicies = JSON.parse(msg.smart_rules) || [];
-                        }
-                    } catch(e) {}
-                    renderTaggingPolicies();
+                        document.getElementById('rt_msg_sample_text').value = msg.sample_text || msg.content || '';
+                    globalSampleText = msg.sample_text || msg.content || '';
+                } else {
+                    // New message with no content - leave fields blank
+                    if (document.getElementById('rt_msg_sample_text'))
+                        document.getElementById('rt_msg_sample_text').value = msg.sample_text || '';
+                    globalSampleText = msg.sample_text || '';
                 }
+
+                // Load intelligent tagging settings
+                if (document.getElementById('rt_msg_prefix'))
+                    document.getElementById('rt_msg_prefix').value = msg.prefix || '';
+                if (document.getElementById('rt_msg_suffix'))
+                    document.getElementById('rt_msg_suffix').value = msg.suffix || '';
+                if (document.getElementById('rt_msg_split_pattern'))
+                    document.getElementById('rt_msg_split_pattern').value = msg.split_delimiter || ' - ';
+                if (document.getElementById('rt_msg_before_tag'))
+                    document.getElementById('rt_msg_before_tag').value = (msg.rt_plus_tags && msg.rt_plus_tags.tag1_type) || 4;
+                if (document.getElementById('rt_msg_after_tag'))
+                    document.getElementById('rt_msg_after_tag').value = (msg.rt_plus_tags && msg.rt_plus_tags.tag2_type) || 1;
+                if (document.getElementById('rt_msg_case_sensitive'))
+                    document.getElementById('rt_msg_case_sensitive').checked = msg.case_sensitive || false;
+                if (document.getElementById('rt_msg_whole_words'))
+                    document.getElementById('rt_msg_whole_words').checked = msg.whole_words || false;
+
+                // Load smart rules (backward compatibility with old 'smart_rules' field)
+                taggingPolicies = [];
+                try {
+                    if (msg.tagging_policies) {
+                        taggingPolicies = JSON.parse(msg.tagging_policies) || [];
+                    } else if (msg.smart_rules) {
+                        taggingPolicies = JSON.parse(msg.smart_rules) || [];
+                    }
+                } catch(e) {}
+                renderTaggingPolicies();
             } else if (msg.source_type === 'json') {
                 document.getElementById('rt_msg_json_url').value = msg.content || '';
                 
@@ -9199,6 +9207,8 @@ UI_HTML = r"""
             var opts = document.getElementById('rt_msg_rtplus_options');
             var manualSimple = document.getElementById('rt_msg_manual_simple');
             var manualBuilder = document.getElementById('rt_msg_manual_builder');
+            var simpleTextEl = document.getElementById('rt_msg_simple_text');
+            var sampleTextEl = document.getElementById('rt_msg_sample_text');
 
             // Show/hide RT+ options based on enabled state (for all modes)
             if (opts) opts.style.display = enabled ? 'block' : 'none';
@@ -9206,11 +9216,17 @@ UI_HTML = r"""
             // For manual mode: show simple text when RT+ disabled, sample text when RT+ enabled
             if (sourceType === 'manual') {
                 if (!enabled) {
-                    // RT+ disabled: show simple text input
+                    // RT+ disabled: transfer content from sample to simple and show simple text input
+                    if (sampleTextEl && simpleTextEl && sampleTextEl.value && !simpleTextEl.value) {
+                        simpleTextEl.value = sampleTextEl.value;
+                    }
                     if (manualSimple) manualSimple.style.display = 'block';
                     if (manualBuilder) manualBuilder.style.display = 'none';
                 } else {
-                    // RT+ enabled: show sample text builder
+                    // RT+ enabled: transfer content from simple to sample and show sample text builder
+                    if (simpleTextEl && sampleTextEl && simpleTextEl.value && !sampleTextEl.value) {
+                        sampleTextEl.value = simpleTextEl.value;
+                    }
                     if (manualSimple) manualSimple.style.display = 'none';
                     if (manualBuilder) manualBuilder.style.display = 'block';
                 }
@@ -9324,14 +9340,10 @@ UI_HTML = r"""
                     var countElem = document.getElementById('rt_msg_simple_count');
                     if (countElem) countElem.textContent = preview.length;
                 } else {
-                    // Intelligent tagging mode
-                    var sampleText = 'Artist - Song Title';  // Default sample
-                    
-                    // Get sample input if available
-                    if (typeof globalSampleText !== 'undefined' && globalSampleText) {
-                        sampleText = globalSampleText;
-                    }
-                    
+                    // Intelligent tagging mode - get sample text from input field
+                    var sampleTextEl = document.getElementById('rt_msg_sample_text');
+                    var sampleText = sampleTextEl ? (sampleTextEl.value || '') : '';
+
                     var result = applyTaggingPolicies(sampleText);
                     preview = result.text;
                     tag1Start = result.tag1Start;
@@ -10973,6 +10985,15 @@ UI_HTML = r"""
             setText('live_ptyn', data.ptyn);
             setText('live_pi', data.pi);
 
+            // PTYN column - show/hide based on enabled flag
+            var ptynCol = document.getElementById('live_ptyn_col');
+            var lpsCol = document.getElementById('live_lps_col');
+            if (ptynCol) ptynCol.style.display = data.en_ptyn ? '' : 'none';
+            // Expand Long PS to fill space when PTYN is hidden
+            if (lpsCol) {
+                lpsCol.className = data.en_ptyn ? '' : 'col-span-2';
+            }
+
             // PIN row - show/hide and update
             var pinRow = document.getElementById('live_pin_row');
             if (pinRow) pinRow.style.display = (data.en_pin && data.pin_str) ? '' : 'none';
@@ -11624,7 +11645,7 @@ UI_HTML = r"""
                     html += '<div class="font-mono text-pink-400">' + (svc.pi_on || 'C000') + '</div>';
                     
                     // Line 2: PS name
-                    html += '<div class="text-gray-200">' + (svc.ps || 'UNKNOWN') + '</div>';
+                    html += '<div class="text-gray-200">' + (svc.ps || '        ') + '</div>';
                     
                     // Line 3: AF info (A: method A list, B: mapped frequencies)
                     var afInfo = [];
@@ -11721,41 +11742,11 @@ UI_HTML = r"""
                 var tpBadge = svc.tp ? '<span class="text-[10px] bg-green-600 text-white px-1 rounded ml-2">TP</span>' : '';
 
                 info.innerHTML = '<div class="font-mono text-sm text-pink-400">' + (svc.pi_on || 'C000') + tpBadge + '</div>' +
-                                '<div class="text-sm">' + (svc.ps || 'UNKNOWN') + '</div>' +
+                                '<div class="text-sm">' + (svc.ps || '        ') + '</div>' +
                                 '<div class="text-xs text-gray-400 break-words">' + afDisplay + '</div>';
 
                 var actions = document.createElement('div');
                 actions.className = 'flex gap-2 items-center';
-
-                // Up button
-                var upBtn = document.createElement('button');
-                upBtn.textContent = '↑';
-                upBtn.title = 'Move Up';
-                upBtn.className = 'px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs' + (i === 0 ? ' opacity-30 cursor-default' : '');
-                if (i > 0) {
-                    upBtn.onclick = (function(idx) { return function() {
-                        var moved = eonServices.splice(idx, 1)[0];
-                        eonServices.splice(idx - 1, 0, moved);
-                        syncEONServices();
-                        renderEONServiceList();
-                        updateEONDisplay();
-                    }; })(i);
-                }
-
-                // Down button
-                var downBtn = document.createElement('button');
-                downBtn.textContent = '↓';
-                downBtn.title = 'Move Down';
-                downBtn.className = 'px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs' + (i === eonServices.length - 1 ? ' opacity-30 cursor-default' : '');
-                if (i < eonServices.length - 1) {
-                    downBtn.onclick = (function(idx) { return function() {
-                        var moved = eonServices.splice(idx, 1)[0];
-                        eonServices.splice(idx + 1, 0, moved);
-                        syncEONServices();
-                        renderEONServiceList();
-                        updateEONDisplay();
-                    }; })(i);
-                }
 
                 var editBtn = document.createElement('button');
                 editBtn.textContent = 'Edit';
@@ -11767,8 +11758,6 @@ UI_HTML = r"""
                 delBtn.className = 'px-3 py-1 bg-red-600 hover:bg-red-500 rounded text-xs';
                 delBtn.onclick = (function(idx) { return function() { deleteEONService(idx); }; })(i);
 
-                actions.appendChild(upBtn);
-                actions.appendChild(downBtn);
                 actions.appendChild(editBtn);
                 actions.appendChild(delBtn);
                 card.appendChild(info);
@@ -11847,7 +11836,7 @@ UI_HTML = r"""
             
             var svc = {
                 pi_on: document.getElementById('eon_pi').value.toUpperCase() || 'C000',
-                ps: document.getElementById('eon_ps').value || 'UNKNOWN',
+                ps: document.getElementById('eon_ps').value || '        ',
                 pty: parseInt(document.getElementById('eon_pty').value) || 0,
                 af_list: document.getElementById('eon_af').value || '',
                 mapped_freqs: mappedFreqs,
@@ -12359,7 +12348,7 @@ UI_HTML = r"""
                 condInput.type = 'text';
                 condInput.value = row.match || '';
                 condInput.placeholder = 'If equals...';
-                condInput.className = 'flex-1 min-w-0 bg-black border border-gray-600 rounded px-2 py-1 text-xs';
+                condInput.className = 'flex-1 min-w-[120px] bg-black border border-gray-600 rounded px-2 py-1 text-xs';
                 condInput.oninput = (function(i) { return function() { conditionRows[i].match = this.value; }; })(idx);
 
                 var arrow = document.createElement('span');
@@ -12383,7 +12372,7 @@ UI_HTML = r"""
                     outInput.type = 'text';
                     outInput.value = row.output || '';
                     outInput.placeholder = 'Set to...';
-                    outInput.className = 'w-20 bg-black border border-gray-600 rounded px-2 py-1 text-xs';
+                    outInput.className = 'w-32 bg-black border border-gray-600 rounded px-2 py-1 text-xs';
                     outInput.oninput = (function(i) { return function() { conditionRows[i].output = this.value; }; })(idx);
                 }
 
