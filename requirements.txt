@@ -4,3 +4,4 @@ sounddevice
 flask
 flask-socketio
 websocket-client
+pyserial
