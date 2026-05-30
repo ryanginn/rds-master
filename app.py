@@ -19,8 +19,17 @@ from flask_socketio import SocketIO
 from scipy import signal as dsp_signal
 from scipy.fft import fft
 
+# Try to import pyserial for serial RDS block output
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+    print("[Serial] pyserial not available - serial output disabled. Install with: pip install pyserial")
+
 # --- VERSION ---
-VERSION = "v1.3a"
+VERSION = "v1.3b"
 
 # --- SETTINGS ---
 # Host API filtering: auto-detect based on OS, can be overridden via RDS_HOSTAPI env var
@@ -391,6 +400,11 @@ default_state = {
 
     # Settings
     "rds_freq": 57000,
+
+    # Serial RDS Block Output
+    "serial_enabled": False,  # Enable serial RDS block output
+    "serial_port": "COM1" if sys.platform == 'win32' else "/dev/ttyUSB0",  # Serial port name
+    "serial_baud": 115200,  # Baud rate
 
     # Transparent Data Channels (TDC) - Type 5A/5B
     "en_tdc_5a": False,  # Enable TDC on 5A
@@ -1657,7 +1671,7 @@ class Sanitize:
         global state, http_port
         changed = False
         # Fields that should NOT be converted to EBU Latin (JSON data, mode flags, etc.)
-        skip_ebu_fields = {'rt_plus_builder_a', 'rt_plus_builder_b', 'rt_plus_mode', 'rt_messages', 'eon_services', 'af_pairs', 'custom_groups', 'custom_oda_list', 'rt_plus_regex_rules_a', 'rt_plus_regex_rules_b', 'dynamic_control_rules', 'ps_long_32', 'tdc_5a_text', 'tdc_5b_text', 'uecp_host', 'uecp_ws_url', 'ert_text', 'ert_messages', 'ert_source'}
+        skip_ebu_fields = {'rt_plus_builder_a', 'rt_plus_builder_b', 'rt_plus_mode', 'rt_messages', 'eon_services', 'af_pairs', 'custom_groups', 'custom_oda_list', 'rt_plus_regex_rules_a', 'rt_plus_regex_rules_b', 'dynamic_control_rules', 'ps_long_32', 'tdc_5a_text', 'tdc_5b_text', 'uecp_host', 'uecp_ws_url', 'ert_text', 'ert_messages', 'ert_source', 'serial_port'}
 
         # Handle system-wide settings that are global variables, not in state
         if 'http_port' in data:
@@ -1726,6 +1740,14 @@ class RDSHelper:
         for b in [b1, b2, b3, b4]:
             for i in range(25, -1, -1): bits.append((b >> i) & 1)
         return bits
+
+    @staticmethod
+    def get_raw_blocks(g_type, ver, b2_tail, b3_val, b4_val):
+        """Get the 4 raw RDS blocks (16-bit each, before CRC) for serial output"""
+        try: pi_v = int(get_effective_value("pi"), 16)
+        except: pi_v = 0x0000
+        b2_v = (int(g_type) << 12) | (int(ver) << 11) | (int(get_effective_value("tp")) << 10) | (int(get_effective_value("pty")) << 5) | (int(b2_tail) & 0x1F)
+        return (pi_v & 0xFFFF, b2_v & 0xFFFF, int(b3_val) & 0xFFFF, int(b4_val) & 0xFFFF)
     
     @staticmethod
     def rds2_blocks_to_bits(block0, block1, block2, block3):
@@ -1742,6 +1764,106 @@ class RDSHelper:
             for i in range(25, -1, -1):
                 bits.append((b >> i) & 1)
         return bits
+
+class RDSSerialOutput:
+    """Handles serial output of raw RDS blocks in hex format"""
+    def __init__(self):
+        self.serial_port = None
+        self.port_name = None
+        self.baud_rate = None
+        self.enabled = False
+        self.lock = threading.Lock()
+
+    def open(self, port_name, baud_rate):
+        """Open the serial port"""
+        if not SERIAL_AVAILABLE:
+            print("[Serial] pyserial not available")
+            return False
+
+        with self.lock:
+            try:
+                # Close existing port if open
+                if self.serial_port and self.serial_port.is_open:
+                    self.serial_port.close()
+
+                # Open new port
+                self.serial_port = serial.Serial(
+                    port=port_name,
+                    baudrate=baud_rate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=0.01,
+                    write_timeout=0.01,
+                    rtscts=False,
+                    dsrdtr=False
+                )
+
+                # Set DTR and RTS to signal connection
+                self.serial_port.dtr = True
+                self.serial_port.rts = True
+
+                # Flush any existing data
+                self.serial_port.reset_input_buffer()
+                self.serial_port.reset_output_buffer()
+
+                self.port_name = port_name
+                self.baud_rate = baud_rate
+                self.enabled = True
+
+                # Send a test block to verify connection
+                try:
+                    test_msg = "# RDS Serial Output Active\n"
+                    self.serial_port.write(test_msg.encode('ascii'))
+                    self.serial_port.flush()
+                except:
+                    pass
+
+                print(f"[Serial] Opened {port_name} at {baud_rate} baud (DTR/RTS active)")
+                return True
+            except Exception as e:
+                print(f"[Serial] Failed to open {port_name}: {e}")
+                self.serial_port = None
+                self.enabled = False
+                return False
+
+    def close(self):
+        """Close the serial port"""
+        with self.lock:
+            try:
+                if self.serial_port and self.serial_port.is_open:
+                    self.serial_port.close()
+                    print(f"[Serial] Closed {self.port_name}")
+                self.serial_port = None
+                self.enabled = False
+            except Exception as e:
+                print(f"[Serial] Error closing port: {e}")
+
+    def send_blocks(self, block1, block2, block3, block4):
+        """Send RDS blocks as hex string with newline"""
+        if not self.enabled or not self.serial_port:
+            return
+
+        try:
+            # Format: 2FFFXXXXXXXXXXXXXX (4 blocks as hex + newline)
+            hex_str = f"{block1:04x}{block2:04x}{block3:04x}{block4:04x}\n"
+            self.serial_port.write(hex_str.encode('ascii'))
+        except Exception as e:
+            # Don't spam the console with errors
+            if not hasattr(self, '_last_error_time') or time.time() - self._last_error_time > 5.0:
+                print(f"[Serial] Write error: {e}")
+                self._last_error_time = time.time()
+
+    @staticmethod
+    def list_ports():
+        """List available serial ports"""
+        if not SERIAL_AVAILABLE:
+            return []
+        try:
+            ports = serial.tools.list_ports.comports()
+            return [(p.device, p.description) for p in ports]
+        except:
+            return []
 
 class PCStatusMonitor:
     """Helper class to gather PC status information for TDC"""
@@ -1936,7 +2058,7 @@ class RDSScheduler:
         # New unified RT message system
         self.rt_msg_idx = 0
         self.rt_msg_cycle_count = 0  # Track completed cycles for current message
-        
+
         # Enhanced RadioText (eRT) state
         self.ert_ptr = 0  # Current segment pointer (5-bit, 0-31)
         self.last_ert_content = ""  # Track content changes
@@ -1967,6 +2089,14 @@ class RDSScheduler:
         # Cache parsed custom groups to avoid json.loads() on every next() call
         self._custom_groups_cache = []
         self._custom_groups_cache_str = None
+
+        # Cache for last generated raw blocks (for serial output)
+        self.last_raw_blocks = (0, 0, 0, 0)
+
+    def _get_group(self, g_type, ver, b2_tail, b3_val, b4_val):
+        """Helper to get group bits and cache raw blocks for serial output"""
+        self.last_raw_blocks = RDSHelper.get_raw_blocks(g_type, ver, b2_tail, b3_val, b4_val)
+        return RDSHelper.get_group_bits(g_type, ver, b2_tail, b3_val, b4_val)
 
     def get_text(self, key):
         val = get_effective_value(key) if key in ["ptyn"] else state.get(key, "")
@@ -2613,7 +2743,7 @@ class RDSScheduler:
         """Generate eRT application group (similar to RT but with 5-bit segment addressing)."""
         # Only version A supported for eRT
         if g_ver != 0:
-            return RDSHelper.get_group_bits(0, 0, 0, 0, 0)  # Fallback
+            return self._get_group(0, 0, 0, 0, 0)  # Fallback
 
         # Get current eRT text - use effective text from message management
         ert_text = self.get_effective_ert_text()
@@ -2789,7 +2919,7 @@ class RDSScheduler:
         ert_group_type = state.get("ert_group_type", 13)
         tail = (get_effective_value("tp") << 10) | (get_effective_value("pty") << 5) | segment_addr
         
-        return RDSHelper.get_group_bits(ert_group_type, 0, tail, b3, b4)
+        return self._get_group(ert_group_type, 0, tail, b3, b4)
 
     # Enhanced RadioText (eRT) Message Management
     def get_ert_messages(self):
@@ -3213,7 +3343,7 @@ class RDSScheduler:
             total_offset = auto_offset + state["tz_offset"]
 
             b4 = ((now.hour & 0x0F) << 12) | (now.minute << 6) | ((1 if total_offset<0 else 0) << 5) | int(abs(total_offset)*2)
-            return RDSHelper.get_group_bits(4, 0, (mjd>>15)&3, ((mjd&0x7FFF)<<1)|((now.hour>>4)&1), b4)
+            return self._get_group(4, 0, (mjd>>15)&3, ((mjd&0x7FFF)<<1)|((now.hour>>4)&1), b4)
 
         if state["scheduler_auto"]:
             # Recompute schedule only when relevant state changes or at the start of each cycle.
@@ -3241,7 +3371,7 @@ class RDSScheduler:
             ertrtplus_type = state.get("ert_rtplus_group_type", 6)
             toggle = self.ert_rt_plus_toggle & 1
             b2_tail = (toggle << 4) | 0  # running_bit=0, no active tags
-            return RDSHelper.get_group_bits(ertrtplus_type, 0, b2_tail, 0, 0)
+            return self._get_group(ertrtplus_type, 0, b2_tail, 0, 0)
         else:
             # Check if we should send DAB Group 12A (every 45 seconds)
             if state.get("en_dab") and (time.time() - self.dab_last_sent) >= 45.0:
@@ -3327,7 +3457,7 @@ class RDSScheduler:
                                 else:
                                     new_groups.append(g)
                             state["custom_groups"] = json.dumps(new_groups)
-                        return RDSHelper.get_group_bits(g_type, g_ver, b2_tail, b3_val, b4_val)
+                        return self._get_group(g_type, g_ver, b2_tail, b3_val, b4_val)
                 except Exception as e:
                     print(f"[Custom Groups] Error creating group: {e}")
                     pass  # Invalid custom data, skip
@@ -3489,7 +3619,7 @@ class RDSScheduler:
                              self.af_b_ptr = 0
             
             if g_ver == 1: b3 = int(state["pi"], 16)
-            return RDSHelper.get_group_bits(0, g_ver, tail, b3, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
+            return self._get_group(0, g_ver, tail, b3, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
 
         elif g_type == 2:
             limit = 32 if state["rt_mode"] == "2B" else 64
@@ -3706,7 +3836,7 @@ class RDSScheduler:
             # Use byte values directly instead of ord() to properly handle extended characters
             b3_val = (pad_bytes[a*4]<<8)|pad_bytes[a*4+1] if v==0 else int(state["pi"], 16)
             b4_val = (pad_bytes[a*4+2]<<8)|pad_bytes[a*4+3] if v==0 else (pad_bytes[a*2]<<8)|pad_bytes[a*2+1]
-            return RDSHelper.get_group_bits(2, v, (buf<<4)|a, b3_val, b4_val)
+            return self._get_group(2, v, (buf<<4)|a, b3_val, b4_val)
 
         elif g_type == 3:
              # Group 3A: ODA announcement for DAB, RT+, and custom ODAs
@@ -3765,7 +3895,7 @@ class RDSScheduler:
                  # Emit ODA announcement
                  # Application Group Type Code is now pre-encoded in the ODA list
                  app_group_code = current_oda["group_type"] & 0x1F  # Ensure 5-bit value
-                 return RDSHelper.get_group_bits(3, 0, app_group_code, 
+                 return self._get_group(3, 0, app_group_code, 
                                                   current_oda["msg"], current_oda["aid"])
         
         # Enhanced RadioText (eRT) Application Groups
@@ -3799,7 +3929,7 @@ class RDSScheduler:
             b3_val  = ((t1_typ & 0x07) << 13) | ((t1_start & 0x3F) << 7) | ((t1_len & 0x3F) << 1) | ((t2_typ >> 5) & 0x01)
             b4_val  = ((t2_typ & 0x1F) << 11) | ((t2_start & 0x3F) << 5) | (t2_len & 0x1F)
 
-            return RDSHelper.get_group_bits(state.get("ert_rtplus_group_type", 6), 0, b2_tail, b3_val, b4_val)
+            return self._get_group(state.get("ert_rtplus_group_type", 6), 0, b2_tail, b3_val, b4_val)
 
         elif g_type == 5:
             # Group 5A/5B: Transparent Data Channels (TDC)
@@ -3874,7 +4004,7 @@ class RDSScheduler:
                 b3_val = (text_bytes[offset] << 8) | text_bytes[offset + 1]
                 b4_val = (text_bytes[offset + 2] << 8) | text_bytes[offset + 3]
 
-                return RDSHelper.get_group_bits(5, 0, b2_tail, b3_val, b4_val)
+                return self._get_group(5, 0, b2_tail, b3_val, b4_val)
 
             else:  # 5B
                 # Check if dynamic control is providing text
@@ -3937,7 +4067,7 @@ class RDSScheduler:
                 b3_val = (text_bytes[offset] << 8) | text_bytes[offset + 1]
                 b4_val = (text_bytes[offset + 2] << 8) | text_bytes[offset + 3]
 
-                return RDSHelper.get_group_bits(5, 1, b2_tail, b3_val, b4_val)
+                return self._get_group(5, 1, b2_tail, b3_val, b4_val)
 
         elif g_type == 11 and (not state["scheduler_auto"] or state["en_rt_plus"]):
              # --- CORRECTED RT+ PACKING (37 Bits split across blocks) ---
@@ -3975,7 +4105,7 @@ class RDSScheduler:
              # Block 4 (16 bits): T2_Type_Lo5(5) | T2_Start(6) | T2_Len(5)
              b4_val = ((t2_typ & 0x1F) << 11) | ((t2_start & 0x3F) << 5) | (t2_len & 0x1F)
              
-             return RDSHelper.get_group_bits(11, 0, b2_tail, b3_val, b4_val)
+             return self._get_group(11, 0, b2_tail, b3_val, b4_val)
 
         elif g_type == 14 and (not state["scheduler_auto"] or state.get("en_eon")):
             # Group 14A: Enhanced Other Networks (EON) - EN 50067 section 3.2.1.8
@@ -4277,7 +4407,7 @@ class RDSScheduler:
 
             # Regular EON uses 14A format (variants 0-13)
             # 14B is only used for TA burst
-            return RDSHelper.get_group_bits(14, 0, b2_tail, b3_val, pi_on)  # 14A format
+            return self._get_group(14, 0, b2_tail, b3_val, pi_on)  # 14A format
 
         elif g_type == 15 and (not state["scheduler_auto"] or state["en_lps"]):
             raw = self.get_text("ps_long_32")
@@ -4312,7 +4442,7 @@ class RDSScheduler:
             # Pad segment data if needed
             while len(lps_txt) < (seg + 1) * 4:
                 lps_txt += b'\x00'
-            return RDSHelper.get_group_bits(15, g_ver, seg, (lps_txt[seg*4]<<8)|lps_txt[seg*4+1], (lps_txt[seg*4+2]<<8)|lps_txt[seg*4+3])
+            return self._get_group(15, g_ver, seg, (lps_txt[seg*4]<<8)|lps_txt[seg*4+1], (lps_txt[seg*4+2]<<8)|lps_txt[seg*4+3])
 
         elif g_type == 10 and (not state["scheduler_auto"] or state["en_ptyn"]):
             raw = self.get_text("ptyn")
@@ -4332,7 +4462,7 @@ class RDSScheduler:
             txt_bytes = text_to_rds_bytes(txt)
             seg = self.ptyn_ptr % 2
             self.ptyn_ptr += 1
-            return RDSHelper.get_group_bits(10, g_ver, seg, (txt_bytes[seg*4]<<8)|txt_bytes[seg*4+1], (txt_bytes[seg*4+2]<<8)|txt_bytes[seg*4+3])
+            return self._get_group(10, g_ver, seg, (txt_bytes[seg*4]<<8)|txt_bytes[seg*4+1], (txt_bytes[seg*4+2]<<8)|txt_bytes[seg*4+3])
             
         elif g_type == 1:
             # In manual mode, transmit if explicitly scheduled; in auto mode, check en_id or en_pin flag
@@ -4361,7 +4491,7 @@ class RDSScheduler:
                     # Pack PIN into 16-bit value: [day:5][hour:5][minute:6]
                     block4 = (day << 11) | (hour << 6) | minute
 
-                return RDSHelper.get_group_bits(1, g_ver, 0, block3, block4)
+                return self._get_group(1, g_ver, 0, block3, block4)
 
         elif g_type == 12 and (not state["scheduler_auto"] or state.get("en_dab")):
             # Group 12A: ODA data for DAB linkage (Ensemble table)
@@ -4433,7 +4563,7 @@ class RDSScheduler:
                 except:
                     b4_val = 0x0000  # Default fallback
             
-            return RDSHelper.get_group_bits(12, 0, b2_tail, b3_val, b4_val)
+            return self._get_group(12, 0, b2_tail, b3_val, b4_val)
 
         elif g_type == 8:
             # Group 8A: Traffic Message Channel (TMC) - not implemented
@@ -4444,7 +4574,7 @@ class RDSScheduler:
             seg = self.ps_ptr % 4
             self.ps_ptr += 1
             tail = (get_effective_value("ta")<<4)|(get_effective_value("ms")<<3)|([state['di_dyn'],state['di_comp'],state['di_head'],state['di_stereo']][seg]<<2)|seg
-            return RDSHelper.get_group_bits(0, 0, tail, 0xE0E0, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
+            return self._get_group(0, 0, tail, 0xE0E0, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
 
         # Group not implemented - send PS group to prevent recursion and blanks
         # NOTE: Pointer was already incremented at line 1295
@@ -4454,7 +4584,7 @@ class RDSScheduler:
         seg = self.ps_ptr % 4
         self.ps_ptr += 1
         tail = (get_effective_value("ta")<<4)|(get_effective_value("ms")<<3)|([state['di_dyn'],state['di_comp'],state['di_head'],state['di_stereo']][seg]<<2)|seg
-        return RDSHelper.get_group_bits(0, 0, tail, 0xE0E0, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
+        return self._get_group(0, 0, tail, 0xE0E0, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
 
 # --- RDS2 DATA GENERATOR ---
 class RDS2Generator:
@@ -4722,6 +4852,12 @@ class RDSDSP:
         # Stopband attenuation remains ~80 dB (set by Kaiser β, not tap count).
         self.taps = dsp_signal.firwin(2049, BITRATE * 2.0, fs=SAMPLE_RATE, window=('kaiser', 8.0))
         self.zi = np.zeros(2048)
+        # Serial output for raw RDS blocks
+        self.serial_output = RDSSerialOutput()
+        self._serial_enabled_cache = False
+        self._serial_port_cache = None
+        self._serial_baud_cache = None
+
         # Pre-fill the queue synchronously so audio starts immediately with data ready.
         self._last_good_bits = None  # Cache of last successfully generated group bits
         self._urgent_bits = collections.deque()  # Front-of-queue injections (e.g. eRT RT+ clears)
@@ -4755,7 +4891,25 @@ class RDSDSP:
                         # print(f"[RDS2] Failed to reload logo: {e}")
                         pass
                 state["rds2_logo_reload"] = False
-            
+
+            # Check if serial output settings changed
+            serial_enabled = state.get("serial_enabled", False)
+            serial_port = state.get("serial_port", "COM1")
+            serial_baud = state.get("serial_baud", 115200)
+
+            if serial_enabled != self._serial_enabled_cache or \
+               serial_port != self._serial_port_cache or \
+               serial_baud != self._serial_baud_cache:
+
+                self._serial_enabled_cache = serial_enabled
+                self._serial_port_cache = serial_port
+                self._serial_baud_cache = serial_baud
+
+                if serial_enabled:
+                    self.serial_output.open(serial_port, serial_baud)
+                else:
+                    self.serial_output.close()
+
             # Time-bound each fill burst to ≤3 ms so the audio callback always
             # wins the GIL within its 10.67 ms window.  A burst_counter=16 PS
             # update would otherwise monopolise the GIL for ~3–5 ms.
@@ -4765,6 +4919,11 @@ class RDSDSP:
                     bits = self.sched.next()
                     self._last_good_bits = list(bits)
                     self.bit_queue.extend(bits)
+
+                    # Send raw blocks over serial if enabled
+                    if self.serial_output.enabled:
+                        b1, b2, b3, b4 = self.sched.last_raw_blocks
+                        self.serial_output.send_blocks(b1, b2, b3, b4)
                 except Exception as e:
                     print(f"[RDS] fill-thread exception: {e}", flush=True)
                     fallback = self._last_good_bits or list(RDSHelper.get_group_bits(1, 0, 0, 0, 0))
@@ -5039,7 +5198,7 @@ def run_audio():
 def index():
     if not session.get('auth'): return redirect(url_for('login'))
     inputs, outputs = get_valid_devices()
-    return render_template_string(UI_HTML, inputs=inputs, outputs=outputs, state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, http_port=http_port, version=VERSION)
+    return render_template_string(UI_HTML, inputs=inputs, outputs=outputs, state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, http_port=http_port, version=VERSION, SERIAL_AVAILABLE=SERIAL_AVAILABLE)
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -7612,6 +7771,62 @@ UI_HTML = r"""
                                     <input type="range" id="rds_level" min="0" max="20" step="0.1" value="{{state.rds_level}}" oninput="sync()">
                                     <span class="slider-val" id="val_rds">{{state.rds_level}}</span>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section border-l-4 border-l-cyan-500 mt-4">
+                    <div class="section-header text-cyan-400">Serial RDS Block Output</div>
+                    <div class="section-body">
+                        <div class="bg-cyan-900/20 border border-cyan-500/30 rounded p-3 mb-4">
+                            <div class="text-sm text-cyan-300 font-semibold mb-1">ℹ️ About Serial Output</div>
+                            <div class="text-xs text-gray-300">
+                                Outputs raw RDS blocks in hexadecimal format over serial (e.g., 2FFFXXXXXXXXXXXXXX).
+                                Each line contains PI code + Block 2 + Block 3 + Block 4, useful for external RDS modulators.
+                                {% if not SERIAL_AVAILABLE %}<span class="text-yellow-400">⚠ pyserial not installed - install with: pip install pyserial</span>{% endif %}
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="bg-[#111] p-3 rounded flex items-center gap-2">
+                                <div class="flex-1">
+                                    <label class="text-cyan-400">Enable Serial Output</label>
+                                    <div class="text-[9px] text-gray-500">Send RDS blocks over serial port</div>
+                                </div>
+                                <label class="switch"><input type="checkbox" id="serial_enabled" onchange="sync()" {% if state.serial_enabled %}checked{% endif %} {% if not SERIAL_AVAILABLE %}disabled{% endif %}><span class="slider"></span></label>
+                            </div>
+                            <div>
+                                <label>Baud Rate</label>
+                                <select id="serial_baud" onchange="sync()" {% if not SERIAL_AVAILABLE %}disabled{% endif %}>
+                                    <option value="9600" {% if state.serial_baud == 9600 %}selected{% endif %}>9600</option>
+                                    <option value="19200" {% if state.serial_baud == 19200 %}selected{% endif %}>19200</option>
+                                    <option value="38400" {% if state.serial_baud == 38400 %}selected{% endif %}>38400</option>
+                                    <option value="57600" {% if state.serial_baud == 57600 %}selected{% endif %}>57600</option>
+                                    <option value="115200" {% if state.serial_baud == 115200 %}selected{% endif %}>115200</option>
+                                    <option value="230400" {% if state.serial_baud == 230400 %}selected{% endif %}>230400</option>
+                                    <option value="460800" {% if state.serial_baud == 460800 %}selected{% endif %}>460800</option>
+                                    <option value="921600" {% if state.serial_baud == 921600 %}selected{% endif %}>921600</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="mt-2">
+                            <label>Serial Port</label>
+                            <input type="text" id="serial_port" value="{{state.serial_port}}" placeholder="COM1 or /dev/ttyUSB0" onchange="sync()" {% if not SERIAL_AVAILABLE %}disabled{% endif %}>
+                            <div class="text-[9px] text-gray-500 mt-1">Windows: COM1, COM2, etc. | Linux/Mac: /dev/ttyUSB0, /dev/ttyS0, etc.</div>
+                        </div>
+
+                        <div class="bg-amber-900/20 border border-amber-500/30 rounded p-3 mt-4">
+                            <div class="text-sm text-amber-300 font-semibold mb-1">📋 Output Format</div>
+                            <div class="text-[10px] text-gray-300 font-mono bg-black/40 p-2 rounded">
+                                c1c8002b000035200a<br>
+                                c1c8202047442d320a<br>
+                                └─┬─┘└─┬─┘└─┬─┘└─┬─┘└── newline (0x0a)<br>
+                                &nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;└──── Block 4 (16-bit hex)<br>
+                                &nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;└──────── Block 3 (16-bit hex)<br>
+                                &nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;&nbsp;└───────────── Block 2 (16-bit hex)<br>
+                                &nbsp;&nbsp;└───────────────────── PI Code (16-bit hex)
                             </div>
                         </div>
                     </div>
@@ -11414,6 +11629,11 @@ UI_HTML = r"""
                 tdc_pc_show_ip: getVal('tdc_pc_show_ip'),
                 tdc_pc_show_ram: getVal('tdc_pc_show_ram'),
                 tdc_pc_show_uptime: getVal('tdc_pc_show_uptime'),
+
+                // Serial RDS Block Output
+                serial_enabled: getVal('serial_enabled'),
+                serial_port: getVal('serial_port'),
+                serial_baud: getVal('serial_baud'),
 
                 // Web Interface
                 http_port: getVal('http_port')
