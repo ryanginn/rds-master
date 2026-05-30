@@ -805,7 +805,7 @@ def load_config():
                 auto_start = data.get('auto_start', True)
 
                 # Load site_name global setting
-                site_name = data.get('site_name', 'Secure Login')
+                site_name = data.get('site_name', 'Where am I')
 
                 # Load http_port global setting
                 http_port = data.get('http_port', 5000)
@@ -821,9 +821,9 @@ def load_config():
 
     # Initialize monitor_data from loaded state to prevent blank display on startup
     global monitor_data
-    monitor_data["pi"] = state.get("pi", "0000")
+    monitor_data["pi"] = state.get("pi", "2FFF")
     monitor_data["pty_idx"] = state.get("pty", 0)
-    monitor_data["ps"] = state.get("ps_dynamic", "RDS PRO")
+    monitor_data["ps"] = state.get("ps_dynamic", "RDSMASTR")
     monitor_data["rt"] = state.get("rt_text", "")
     
     # Fix datasets.json if auto_start was missing
@@ -853,12 +853,12 @@ def migrate_rt_messages():
         if not text:
             return entries
 
-        # Check for timed syntax: "5s:Msg1 / 10s:Msg2"
-        if re.match(r"\s*\d+s:", text):
+        # Check for timed syntax: "5s:Msg1 / 10s:Msg2" (supports decimals like "3.5s:")
+        if re.match(r"\s*\d+(?:\.\d+)?s:", text):
             for part in re.split(r"\s*/\s*", text):
-                m = re.match(r"\s*(\d+)s:(.*)", part)
+                m = re.match(r"\s*(\d+(?:\.\d+)?)s:(.*)", part)
                 if m:
-                    cycles = int(m.group(1))
+                    cycles = float(m.group(1))
                     content = m.group(2).strip()
                     if content:
                         entries.append({
@@ -1044,7 +1044,7 @@ def save_config():
 datasets = {}
 current_dataset = 1
 auto_start = True  # Global setting, not per-dataset
-site_name = "Secure Login"  # Global setting for UI branding
+site_name = "Where am I"  # Global setting for UI branding
 http_port = 5000  # Global setting for HTTP port, not per-dataset
 
 def load_datasets():
@@ -1394,11 +1394,15 @@ def monitor_pusher_loop():
             monitor_data["pilot_generated"] = not ((state.get("passthrough") and state.get("device_in_idx") != -1) or state.get("genlock"))
             monitor_data["en_ert"] = bool(state.get("en_ert", False))
             monitor_data["en_ptyn"] = bool(state.get("en_ptyn", False))
+            monitor_data["en_lps"] = bool(state.get("en_lps", False))
             # Fallback: if scheduler hasn't fired an eRT group yet, show the configured text
             if monitor_data["en_ert"] and not monitor_data.get("ert"):
                 monitor_data["ert"] = state.get("ert_text", "")
             elif not monitor_data["en_ert"]:
                 monitor_data["ert"] = ""
+            # Clear Long PS if disabled
+            if not monitor_data["en_lps"]:
+                monitor_data["lps"] = ""
             socketio.emit('monitor', monitor_data)
         else:
              socketio.emit('monitor', {
@@ -1677,7 +1681,21 @@ class Sanitize:
                             elif k == 'ert_text': state[k] = ''
                             else: state[k] = str(v) if v is not None else ''
                         else:
-                            state[k] = str(v)
+                            # Special handling for eon_services: convert PS fields inside the JSON
+                            if k == 'eon_services':
+                                try:
+                                    eon_services = json.loads(v) if isinstance(v, str) else v
+                                    if isinstance(eon_services, list):
+                                        for service in eon_services:
+                                            if isinstance(service, dict) and 'ps' in service:
+                                                service['ps'] = convert_to_ebu_latin(service['ps'])
+                                        state[k] = json.dumps(eon_services)
+                                    else:
+                                        state[k] = str(v)
+                                except:
+                                    state[k] = str(v)
+                            else:
+                                state[k] = str(v)
                     else:
                         # Enforce EBU Latin for text fields to ensure spec compliance
                         state[k] = convert_to_ebu_latin(str(v))
@@ -2088,6 +2106,13 @@ class RDSScheduler:
                 trim_at_semicolon=msg.get('trim_at_semicolon', False),
                 max_len=64 if msg.get('trim_max_len') else 0
             )
+
+        # Apply time placeholders: \HR\, \MN\, \S\ for dynamic time display
+        if resolved and "\\" in resolved:
+            now = datetime.now()
+            resolved = resolved.replace("\\HR\\", f"{now.hour:02d}")
+            resolved = resolved.replace("\\MN\\", f"{now.minute:02d}")
+            resolved = resolved.replace("\\S\\", f"{now.second:02d}")
 
         return resolved
 
@@ -2999,18 +3024,18 @@ class RDSScheduler:
 
     def parse_smart(self, raw, width, center):
         seq = []
-        if re.match(r"\s*\d+s:", raw):
-            # Only treat timed syntax when the string starts with Ns: tokens.
+        if re.match(r"\s*\d+(?:\.\d+)?s:", raw):
+            # Only treat timed syntax when the string starts with Ns: or N.Ns: tokens.
             # Split on whitespace-delimited slashes so literal slashes remain intact.
             for p in re.split(r"\s*/\s*", raw):
                 # Preserve trailing spaces in content; allow leading spaces before the number
-                m = re.match(r"\s*(\d+)s:(.*)", p)
+                m = re.match(r"\s*(\d+(?:\.\d+)?)s:(.*)", p)
                 if m:
                     content = m.group(2)
                     # Skip entries with blank/empty content (e.g., from empty file reads)
                     if not content.strip():
                         continue
-                    for sf in self.split(content, width, center): seq.append((int(m.group(1)), sf))
+                    for sf in self.split(content, width, center): seq.append((float(m.group(1)), sf))
                 else:
                     if not p.strip():
                         continue
@@ -3523,9 +3548,9 @@ class RDSScheduler:
                     if "/" in raw_input:
                         self.rt_sequence = self.parse_smart(raw_input, limit, False)
                     else:
-                        m = re.match(r"\s*(\d+)s:(.*)", raw_input.strip())
+                        m = re.match(r"\s*(\d+(?:\.\d+)?)s:(.*)", raw_input.strip())
                         if m:
-                            duration = int(m.group(1))
+                            duration = float(m.group(1))
                             text = m.group(2).strip()[:limit]
                         else:
                             duration = 10
@@ -5058,7 +5083,7 @@ def update_settings():
     site = data.get('site_name')
     if isinstance(site, str):
         global site_name
-        site_name = site.strip() if site.strip() else 'Secure Login'
+        site_name = site.strip() if site.strip() else 'Where am I'
         changed = True
 
     if changed: save_config()
@@ -5997,6 +6022,10 @@ UI_HTML = r"""
                                      <label>Long PS (Group 15)</label>
                                      <div class="live-display sub" id="live_lps"></div>
                                  </div>
+                                 <div id="live_pin_col" class="col-span-2" style="display:none">
+                                     <label>Programme PIN</label>
+                                     <div class="live-display sub text-center text-green-300" id="live_pin"></div>
+                                 </div>
                                  <div id="live_ptyn_col" style="display:none">
                                      <label>PTYN</label>
                                      <div class="live-display sub" id="live_ptyn"></div>
@@ -6004,9 +6033,9 @@ UI_HTML = r"""
                              </div>
                              <div id="live_pin_row" style="display:none">
                                  <label>Programme PIN</label>
-                                 <div class="live-display sub text-center text-green-300" id="live_pin"></div>
+                                 <div class="live-display sub text-center text-green-300" id="live_pin_alt"></div>
                              </div>
-                             
+
                              <div class="grid grid-cols-2 gap-2">
                                  <div>
                                      <label>Decoder Flags (DI)</label>
@@ -8101,13 +8130,13 @@ UI_HTML = r"""
                 <div class="space-y-3">
                     <div>
                         <label class="text-xs text-gray-400 mb-1 block">PI Code (ON)</label>
-                        <input type="text" id="eon_pi" maxlength="4" pattern="[0-9A-Fa-f]{4}" class="w-full bg-black border border-gray-600 rounded px-2 py-1 font-mono" placeholder="C201">
+                        <input type="text" id="eon_pi" maxlength="4" pattern="[0-9A-Fa-f]{4}" class="w-full bg-black border border-gray-600 rounded px-2 py-1 font-mono" placeholder="">
                         <div class="text-[10px] text-gray-500 mt-1">4-digit hex code</div>
                     </div>
 
                     <div>
                         <label class="text-xs text-gray-400 mb-1 block">PS Name (ON)</label>
-                        <input type="text" id="eon_ps" maxlength="8" class="w-full bg-black border border-gray-600 rounded px-2 py-1 font-mono" placeholder="OTHER FM">
+                        <input type="text" id="eon_ps" maxlength="8" class="w-full bg-black border border-gray-600 rounded px-2 py-1 font-mono" placeholder="">
                         <div class="text-[10px] text-gray-500 mt-1">8 characters max</div>
                     </div>
 
@@ -8151,7 +8180,7 @@ UI_HTML = r"""
 
                     <div>
                         <label class="text-xs text-gray-400 mb-1 block">AF List (ON)</label>
-                        <input type="text" id="eon_af" class="w-full bg-black border border-gray-600 rounded px-2 py-1" placeholder="88.1, 101.5">
+                        <input type="text" id="eon_af" class="w-full bg-black border border-gray-600 rounded px-2 py-1" placeholder="87.6, 87.7">
                         <div class="text-[10px] text-gray-500 mt-1">Comma-separated frequencies in MHz (Method A)</div>
                     </div>
 
@@ -10985,19 +11014,37 @@ UI_HTML = r"""
             setText('live_ptyn', data.ptyn);
             setText('live_pi', data.pi);
 
-            // PTYN column - show/hide based on enabled flag
-            var ptynCol = document.getElementById('live_ptyn_col');
+            // Long PS column - show/hide based on enabled flag
             var lpsCol = document.getElementById('live_lps_col');
-            if (ptynCol) ptynCol.style.display = data.en_ptyn ? '' : 'none';
-            // Expand Long PS to fill space when PTYN is hidden
-            if (lpsCol) {
-                lpsCol.className = data.en_ptyn ? '' : 'col-span-2';
+            var lpsEnabled = data.en_lps && data.lps && data.lps.trim() !== '';
+            if (lpsCol) lpsCol.style.display = lpsEnabled ? '' : 'none';
+
+            // PIN display logic: show beside PI when Long PS is off, show in separate row when Long PS is on
+            var pinCol = document.getElementById('live_pin_col');
+            var pinRow = document.getElementById('live_pin_row');
+            var pinEnabled = data.en_pin && data.pin_str;
+
+            if (pinEnabled) {
+                if (lpsEnabled) {
+                    // Long PS is ON - show PIN in its own row below
+                    if (pinCol) pinCol.style.display = 'none';
+                    if (pinRow) pinRow.style.display = '';
+                    setText('live_pin_alt', data.pin_str || '');
+                } else {
+                    // Long PS is OFF - show PIN beside PI
+                    if (pinCol) pinCol.style.display = '';
+                    if (pinRow) pinRow.style.display = 'none';
+                    setText('live_pin', data.pin_str || '');
+                }
+            } else {
+                // PIN is disabled - hide both
+                if (pinCol) pinCol.style.display = 'none';
+                if (pinRow) pinRow.style.display = 'none';
             }
 
-            // PIN row - show/hide and update
-            var pinRow = document.getElementById('live_pin_row');
-            if (pinRow) pinRow.style.display = (data.en_pin && data.pin_str) ? '' : 'none';
-            setText('live_pin', data.pin_str || '');
+            // PTYN column - show/hide based on enabled flag
+            var ptynCol = document.getElementById('live_ptyn_col');
+            if (ptynCol) ptynCol.style.display = data.en_ptyn ? '' : 'none';
 
             // eRT row - show/hide based on en_ert
             const ertRow = document.getElementById('live_ert_row');
@@ -11613,6 +11660,47 @@ UI_HTML = r"""
 
         // === EON FUNCTIONS ===
         var eonServices = [];
+
+        // Convert text to EBU Latin (RDS character set) - simplified JavaScript version
+        function convertToEbuLatin(text) {
+            if (!text) return '';
+            // Map of common special characters to RDS equivalents
+            var charMap = {
+                // Keep ASCII printable characters (0x20-0x7E mostly work)
+                // Replace characters not in RDS charset with space
+                '\u00C9': 'É', '\u00E9': 'é', // É, é (already in RDS)
+                '\u00C0': 'À', '\u00E0': 'à',
+                '\u00C1': 'Á', '\u00E1': 'á',
+                '\u00C8': 'È', '\u00E8': 'è',
+                '\u00C7': 'Ç', '\u00E7': 'ç',
+                '\u00D1': 'Ñ', '\u00F1': 'ñ',
+                '\u00D6': 'Ö', '\u00F6': 'ö',
+                '\u00DC': 'Ü', '\u00FC': 'ü',
+                '\u00DF': 'ß'
+            };
+            var result = '';
+            for (var i = 0; i < text.length; i++) {
+                var char = text[i];
+                var code = char.charCodeAt(0);
+                // Allow basic ASCII (space through ~)
+                if (code >= 0x20 && code <= 0x7E) {
+                    result += char;
+                }
+                // Check if it's a known RDS special character
+                else if (charMap[char]) {
+                    result += charMap[char];
+                }
+                // Extended Latin characters that are in RDS (0x80-0xFF range mostly)
+                else if (code >= 0xC0 && code <= 0xFF) {
+                    result += char; // Keep extended Latin
+                }
+                // Other characters: replace with space
+                else {
+                    result += ' ';
+                }
+            }
+            return result;
+        }
 
         function loadEONServices() {
             var getVal = function(id) {
