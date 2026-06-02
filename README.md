@@ -45,7 +45,7 @@ Many thanks to **Bkram, Hans van Eijsden, RZCH, Wötkylä, notluca, Dido, Hyper 
 
 ## Installation
 
-1. Install Python 3.10+ and the PortAudio-compatible drivers for your audio hardware.
+1. Install Python 3.10+ and the PortAudio-compatible drivers for your audio hardware. (```sudo apt install libportaudio2 portaudio19-dev```)
 
 2. Install dependencies:
 
