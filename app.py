@@ -1,3 +1,21 @@
+"""
+    RDS Master Open Source RDS Encoder
+    Copyright (C) 2026 Rían Mac Guinneál (FMDX.ie)
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+
 import numpy as np
 import sounddevice as sd
 import threading
@@ -1773,6 +1791,10 @@ class RDSSerialOutput:
         self.baud_rate = None
         self.enabled = False
         self.lock = threading.Lock()
+        # Track current indices for PS and RT cycling
+        self.ps_index = 0
+        self.rt_index = 0
+        self.rt_addresses = list(range(0x40, 0x50))  # 0x40-0x4F for RT
 
     def open(self, port_name, baud_rate):
         """Open the serial port"""
@@ -1786,38 +1808,23 @@ class RDSSerialOutput:
                 if self.serial_port and self.serial_port.is_open:
                     self.serial_port.close()
 
-                # Open new port
+                # Open new port with simple configuration matching manufacturer's code
                 self.serial_port = serial.Serial(
                     port=port_name,
                     baudrate=baud_rate,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=0.01,
-                    write_timeout=0.01,
-                    rtscts=False,
-                    dsrdtr=False
+                    timeout=1
                 )
 
-                # Set DTR and RTS to signal connection
-                self.serial_port.dtr = True
-                self.serial_port.rts = True
-
-                # Flush any existing data
-                self.serial_port.reset_input_buffer()
-                self.serial_port.reset_output_buffer()
+                # Disable DTR/RTS as per manufacturer's code
+                try:
+                    self.serial_port.dtr = False
+                    self.serial_port.rts = False
+                except Exception:
+                    pass
 
                 self.port_name = port_name
                 self.baud_rate = baud_rate
                 self.enabled = True
-
-                # Send a test block to verify connection
-                try:
-                    test_msg = "# RDS Serial Output Active\n"
-                    self.serial_port.write(test_msg.encode('ascii'))
-                    self.serial_port.flush()
-                except:
-                    pass
 
                 print(f"[Serial] Opened {port_name} at {baud_rate} baud (DTR/RTS active)")
                 return True
@@ -1839,17 +1846,107 @@ class RDSSerialOutput:
             except Exception as e:
                 print(f"[Serial] Error closing port: {e}")
 
+    def send_cmd(self, data):
+        """Send binary data over serial with error handling"""
+        try:
+            self.serial_port.write(data)
+            self.serial_port.flush()
+        except Exception as e:
+            if not hasattr(self, '_last_error_time') or time.time() - self._last_error_time > 5.0:
+                print(f"[Serial] Write error: {e}")
+                self._last_error_time = time.time()
+                try:
+                    self.serial_port.close()
+                except:
+                    pass
+                self.enabled = False
+
+    def send_ps_chunk(self, pi_code, index, chunk):
+        """Send PS chunk in binary format: [PI_high, PI_low, 0x01, block, 0x00, 0x00, char1, char2, 0x0A]"""
+        if not self.enabled or not self.serial_port:
+            return
+
+        # Ensure chunk is at least 2 characters
+        if len(chunk) < 2:
+            chunk += ' '
+
+        block = 0x48 + index
+        cmd = bytes([
+            (pi_code >> 8) & 0xFF,  # PI high byte
+            pi_code & 0xFF,          # PI low byte
+            0x01,                     # PS command
+            block,                    # Block index (0x48-0x4B)
+            0x00,                     # Reserved
+            0x00,                     # Reserved
+        ]) + chunk[:2].encode('ascii', errors='replace') + b'\x0A'
+
+        self.send_cmd(cmd)
+
+    def send_rt_block(self, pi_code, block_text, add_index):
+        """Send RT block in binary format: [PI_high, PI_low, 0x21, add_index, char1, char2, char3, char4, 0x0A]"""
+        if not self.enabled or not self.serial_port:
+            return
+
+        # Ensure block is exactly 4 characters
+        block_text = block_text[:4].ljust(4)
+
+        buffer = bytearray(9)
+        buffer[0] = (pi_code >> 8) & 0xFF  # PI high byte
+        buffer[1] = pi_code & 0xFF          # PI low byte
+        buffer[2] = 0x21                    # RT command
+        buffer[3] = add_index               # Address index (0x40-0x4F)
+        for j in range(4):
+            buffer[4 + j] = ord(block_text[j])
+        buffer[8] = 0x0A                    # Line feed
+
+        self.send_cmd(bytes(buffer))
+
+    @staticmethod
+    def get_ps_chunks(ps_text):
+        """Split PS text into 2-character chunks (4 chunks for 8 characters)"""
+        ps_text = ps_text[:8].ljust(8)
+        return [ps_text[i:i+2] for i in range(0, 8, 2)]
+
+    @staticmethod
+    def build_rt_blocks(rt_text):
+        """Split RT text into 4-character blocks (16 blocks for 64 characters)"""
+        rt_text = rt_text[:64].ljust(64)
+        return [rt_text[i:i+4] for i in range(0, len(rt_text), 4)]
+
+    def send_ps_rt_cycle(self, pi_code, ps_text, rt_text):
+        """Send one PS chunk and one RT block in the working format"""
+        if not self.enabled or not self.serial_port:
+            return
+
+        # Get chunks
+        ps_chunks = self.get_ps_chunks(ps_text)
+        rt_blocks = self.build_rt_blocks(rt_text)
+
+        # Send PS chunk
+        self.send_ps_chunk(pi_code, self.ps_index, ps_chunks[self.ps_index])
+        self.ps_index = (self.ps_index + 1) % len(ps_chunks)
+
+        # Send RT block
+        self.send_rt_block(pi_code, rt_blocks[self.rt_index],
+                          self.rt_addresses[self.rt_index % len(self.rt_addresses)])
+        self.rt_index = (self.rt_index + 1) % len(rt_blocks)
+
     def send_blocks(self, block1, block2, block3, block4):
-        """Send RDS blocks as hex string with newline"""
+        """Send RDS blocks in binary format (all groups: 0A, 2A, RT+, ODA, etc.)"""
         if not self.enabled or not self.serial_port:
             return
 
         try:
-            # Format: 2FFFXXXXXXXXXXXXXX (4 blocks as hex + newline)
-            hex_str = f"{block1:04x}{block2:04x}{block3:04x}{block4:04x}\n"
-            self.serial_port.write(hex_str.encode('ascii'))
+            # Binary format: 8 bytes (4 blocks × 2 bytes each) + newline
+            data = bytes([
+                (block1 >> 8) & 0xFF, block1 & 0xFF,
+                (block2 >> 8) & 0xFF, block2 & 0xFF,
+                (block3 >> 8) & 0xFF, block3 & 0xFF,
+                (block4 >> 8) & 0xFF, block4 & 0xFF
+            ]) + b'\x0A'
+
+            self.send_cmd(data)
         except Exception as e:
-            # Don't spam the console with errors
             if not hasattr(self, '_last_error_time') or time.time() - self._last_error_time > 5.0:
                 print(f"[Serial] Write error: {e}")
                 self._last_error_time = time.time()
@@ -5905,6 +6002,299 @@ def delayed_auto_start():
 
 threading.Thread(target=delayed_auto_start, daemon=True).start()
 
+# Config Export/Import Routes
+@app.route('/config/export', methods=['POST'])
+def export_config():
+    """Export configuration to .rdsm file format."""
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+
+    try:
+        data = request.json
+        export_type = data.get('export_type', 'full')  # 'full', 'dataset', 'partial'
+        dataset_ids = data.get('dataset_ids', [])  # List of dataset IDs to export
+        include_params = data.get('include_params', None)  # List of param keys to include (None = all)
+        include_global = data.get('include_global', True)  # Include auth, site_name, etc.
+
+        # Load current datasets.json
+        full_data = {}
+        if os.path.exists(DATASETS_FILE):
+            with open(DATASETS_FILE, 'r', encoding='utf-8') as f:
+                full_data = json.load(f)
+
+        # Build export metadata
+        export_data = {
+            'export_type': export_type,
+            'exported_at': datetime.now(timezone.utc).isoformat(),
+            'exported_from_site': full_data.get('site_name', site_name),
+            'rds_master_version': VERSION,
+            'data': {}
+        }
+
+        # Export based on type
+        if export_type == 'full':
+            # Export everything
+            export_data['data'] = {
+                'global': {
+                    'auth': full_data.get('auth', {}),
+                    'auto_start': full_data.get('auto_start', True),
+                    'site_name': full_data.get('site_name', 'Where am I'),
+                    'http_port': full_data.get('http_port', 5000)
+                } if include_global else {},
+                'datasets': full_data.get('datasets', {})
+            }
+
+        elif export_type == 'dataset':
+            # Export specific datasets
+            export_data['data'] = {
+                'global': {} if not include_global else {
+                    'auth': full_data.get('auth', {}),
+                    'auto_start': full_data.get('auto_start', True),
+                    'site_name': full_data.get('site_name', 'Where am I'),
+                    'http_port': full_data.get('http_port', 5000)
+                },
+                'datasets': {}
+            }
+
+            all_datasets = full_data.get('datasets', {})
+            for ds_id in dataset_ids:
+                ds_str = str(ds_id)
+                if ds_str in all_datasets:
+                    export_data['data']['datasets'][ds_str] = all_datasets[ds_str]
+
+        elif export_type == 'partial':
+            # Export with parameter filtering
+            export_data['data'] = {
+                'global': {} if not include_global else {
+                    'auth': full_data.get('auth', {}),
+                    'auto_start': full_data.get('auto_start', True),
+                    'site_name': full_data.get('site_name', 'Where am I'),
+                    'http_port': full_data.get('http_port', 5000)
+                },
+                'datasets': {},
+                'metadata': {
+                    'included_params': include_params if include_params else []
+                }
+            }
+
+            all_datasets = full_data.get('datasets', {})
+            for ds_id in dataset_ids:
+                ds_str = str(ds_id)
+                if ds_str in all_datasets:
+                    dataset = all_datasets[ds_str]
+                    if include_params:
+                        # Filter state to only include specified params
+                        filtered_state = {}
+                        original_state = dataset.get('state', {})
+                        for param in include_params:
+                            if param in original_state:
+                                filtered_state[param] = original_state[param]
+
+                        export_data['data']['datasets'][ds_str] = {
+                            'name': dataset.get('name', f'Dataset {ds_str}'),
+                            'state': filtered_state
+                        }
+                    else:
+                        export_data['data']['datasets'][ds_str] = dataset
+
+        return jsonify({
+            'success': True,
+            'data': export_data
+        })
+
+    except Exception as e:
+        print(f"[EXPORT] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Export failed: {str(e)}'}), 500
+
+
+@app.route('/config/import', methods=['POST'])
+def import_config():
+    """Import configuration from .rdsm file format."""
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+
+    try:
+        data = request.json
+        import_data = data.get('rdsm_data', {})
+        import_mode = data.get('import_mode', 'new')  # 'new', 'overwrite', 'merge'
+        target_dataset = data.get('target_dataset', None)  # For overwrite mode
+        dataset_ids_to_import = data.get('dataset_ids', [])  # Which datasets from file to import
+        import_global = data.get('import_global', False)
+        selected_params = data.get('selected_params', None)  # Specific params to import (None = all)
+
+        # Validate .rdsm structure
+        if 'data' not in import_data:
+            return jsonify({'error': 'Invalid .rdsm file format'}), 400
+
+        # Load current datasets.json
+        full_data = {}
+        if os.path.exists(DATASETS_FILE):
+            with open(DATASETS_FILE, 'r', encoding='utf-8') as f:
+                full_data = json.load(f)
+
+        if 'datasets' not in full_data:
+            full_data['datasets'] = {}
+
+        # Import global settings if requested
+        if import_global and 'global' in import_data['data']:
+            global_data = import_data['data']['global']
+            if 'auth' in global_data:
+                full_data['auth'] = global_data['auth']
+            if 'auto_start' in global_data:
+                full_data['auto_start'] = global_data['auto_start']
+            if 'site_name' in global_data:
+                full_data['site_name'] = global_data['site_name']
+            if 'http_port' in global_data:
+                full_data['http_port'] = global_data['http_port']
+
+        # Import datasets
+        imported_datasets = import_data['data'].get('datasets', {})
+        new_dataset_ids = []
+
+        if import_mode == 'new':
+            # Import as new datasets - find next available IDs
+            existing_ids = [int(k) for k in full_data['datasets'].keys()]
+            next_id = max(existing_ids) + 1 if existing_ids else 1
+
+            for ds_id_str in dataset_ids_to_import:
+                if ds_id_str in imported_datasets:
+                    dataset_to_import = imported_datasets[ds_id_str].copy()
+
+                    # Filter state by selected params if specified
+                    if selected_params:
+                        filtered_state = {}
+                        for param in selected_params:
+                            if param in dataset_to_import.get('state', {}):
+                                filtered_state[param] = dataset_to_import['state'][param]
+                        dataset_to_import['state'] = filtered_state
+
+                    full_data['datasets'][str(next_id)] = dataset_to_import
+                    new_dataset_ids.append(next_id)
+                    next_id += 1
+
+        elif import_mode == 'overwrite':
+            # Overwrite specific dataset
+            if target_dataset and dataset_ids_to_import:
+                # Take first dataset from import and overwrite target
+                source_id = str(dataset_ids_to_import[0])
+                if source_id in imported_datasets:
+                    target_str = str(target_dataset)
+
+                    if selected_params:
+                        # Merge only specific parameters
+                        if target_str not in full_data['datasets']:
+                            full_data['datasets'][target_str] = {'name': f'Dataset {target_str}', 'state': {}}
+
+                        # Update only selected params
+                        for param in selected_params:
+                            if param in imported_datasets[source_id].get('state', {}):
+                                full_data['datasets'][target_str]['state'][param] = imported_datasets[source_id]['state'][param]
+                    else:
+                        # Full overwrite
+                        full_data['datasets'][target_str] = imported_datasets[source_id]
+
+                    new_dataset_ids.append(target_dataset)
+
+        elif import_mode == 'merge':
+            # Merge into existing datasets by ID
+            for ds_id_str in dataset_ids_to_import:
+                if ds_id_str in imported_datasets:
+                    if ds_id_str not in full_data['datasets']:
+                        full_data['datasets'][ds_id_str] = {'name': f'Dataset {ds_id_str}', 'state': {}}
+
+                    # Update name
+                    full_data['datasets'][ds_id_str]['name'] = imported_datasets[ds_id_str].get('name', f'Dataset {ds_id_str}')
+
+                    # Merge state (filtered by selected params if specified)
+                    state_to_merge = imported_datasets[ds_id_str].get('state', {})
+                    if selected_params:
+                        # Only merge selected params
+                        for param in selected_params:
+                            if param in state_to_merge:
+                                full_data['datasets'][ds_id_str]['state'][param] = state_to_merge[param]
+                    else:
+                        # Merge all params
+                        full_data['datasets'][ds_id_str]['state'].update(state_to_merge)
+
+                    new_dataset_ids.append(int(ds_id_str))
+
+        # Save to datasets.json
+        _atomic_write_json(DATASETS_FILE, full_data)
+
+        # Reload config if current dataset was affected
+        global current_dataset, state, auth_config, auto_start, site_name, http_port
+        if current_dataset in new_dataset_ids or import_global:
+            load_config()
+            # Emit socket update to refresh all connected clients
+            socketio.emit('full_reload', {})
+
+        return jsonify({
+            'success': True,
+            'imported_datasets': new_dataset_ids,
+            'message': f'Successfully imported {len(new_dataset_ids)} dataset(s)'
+        })
+
+    except Exception as e:
+        print(f"[IMPORT] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Import failed: {str(e)}'}), 500
+
+
+@app.route('/config/preview', methods=['POST'])
+def preview_config():
+    """Preview contents of .rdsm file before importing."""
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+
+    try:
+        data = request.json
+        import_data = data.get('rdsm_data', {})
+
+        # Validate structure
+        if 'data' not in import_data:
+            return jsonify({'error': 'Invalid .rdsm file format'}), 400
+
+        # Extract info for preview
+        preview = {
+            'rds_master_version': import_data.get('rds_master_version', 'Unknown'),
+            'exported_at': import_data.get('exported_at', 'Unknown'),
+            'exported_from_site': import_data.get('exported_from_site', 'Unknown'),
+            'export_type': import_data.get('export_type', 'unknown'),
+            'has_global_settings': bool(import_data['data'].get('global', {})),
+            'datasets': []
+        }
+
+        # List datasets
+        datasets = import_data['data'].get('datasets', {})
+        for ds_id, ds_data in datasets.items():
+            ds_preview = {
+                'id': ds_id,
+                'name': ds_data.get('name', f'Dataset {ds_id}'),
+                'param_count': len(ds_data.get('state', {}))
+            }
+
+            # Sample key parameters for preview
+            state_data = ds_data.get('state', {})
+            ds_preview['samples'] = {
+                'pi': state_data.get('pi', 'N/A'),
+                'ps_dynamic': state_data.get('ps_dynamic', 'N/A')[:20] + '...' if len(state_data.get('ps_dynamic', '')) > 20 else state_data.get('ps_dynamic', 'N/A'),
+                'pty': state_data.get('pty', 'N/A')
+            }
+
+            preview['datasets'].append(ds_preview)
+
+        return jsonify({
+            'success': True,
+            'preview': preview
+        })
+
+    except Exception as e:
+        print(f"[PREVIEW] Error: {e}")
+        return jsonify({'error': f'Preview failed: {str(e)}'}), 500
+
 LOGIN_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -7768,7 +8158,7 @@ UI_HTML = r"""
                             <div>
                                 <label>RDS Carrier Level (%)</label>
                                 <div class="slider-container">
-                                    <input type="range" id="rds_level" min="0" max="20" step="0.1" value="{{state.rds_level}}" oninput="sync()">
+                                    <input type="range" id="rds_level" min="0" max="100" step="0.1" value="{{state.rds_level}}" oninput="sync()">
                                     <span class="slider-val" id="val_rds">{{state.rds_level}}</span>
                                 </div>
                             </div>
@@ -7782,8 +8172,8 @@ UI_HTML = r"""
                         <div class="bg-cyan-900/20 border border-cyan-500/30 rounded p-3 mb-4">
                             <div class="text-sm text-cyan-300 font-semibold mb-1">ℹ️ About Serial Output</div>
                             <div class="text-xs text-gray-300">
-                                Outputs raw RDS blocks in hexadecimal format over serial (e.g., 2FFFXXXXXXXXXXXXXX).
-                                Each line contains PI code + Block 2 + Block 3 + Block 4, useful for external RDS modulators.
+                                Outputs ALL RDS groups (0A, 2A, RT+, ODA, etc.) in binary format over serial.
+                                Each line contains 8 bytes (4 blocks × 2 bytes) + newline, sent to external RDS transmitters.
                                 {% if not SERIAL_AVAILABLE %}<span class="text-yellow-400">⚠ pyserial not installed - install with: pip install pyserial</span>{% endif %}
                             </div>
                         </div>
@@ -8039,6 +8429,225 @@ UI_HTML = r"""
                             <a href="/logout" class="text-[12px] text-gray-300 hover:text-white underline">Logout</a>
                         </div>
                         <div id="settings_status" class="text-[11px] text-gray-400 mt-2"></div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">Export Configuration</div>
+                    <div class="section-body">
+                        <div class="mb-3">
+                            <label>Export Type</label>
+                            <select id="export_type" onchange="updateExportOptions()" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm">
+                                <option value="full">Full System (All datasets + global settings)</option>
+                                <option value="dataset">Current Dataset Only</option>
+                                <option value="partial">Custom Selection</option>
+                            </select>
+                        </div>
+
+                        <div id="export_dataset_options" style="display: none;" class="mb-3">
+                            <label>Select Datasets to Export</label>
+                            <div id="export_dataset_checkboxes" class="bg-black/30 border border-gray-700 rounded p-3 space-y-2 max-h-40 overflow-y-auto">
+                                <!-- Populated dynamically -->
+                            </div>
+                        </div>
+
+                        <div id="export_param_options" style="display: none;" class="mb-3">
+                            <label>Parameter Categories</label>
+                            <div class="bg-black/30 border border-gray-700 rounded p-3 space-y-2">
+                                <label class="flex items-center gap-2 text-xs">
+                                    <input type="checkbox" class="export-param-cat" value="basic" checked>
+                                    <span>Basic (PI, PTY, TP, TA, MS, DI)</span>
+                                </label>
+                                <label class="flex items-center gap-2 text-xs">
+                                    <input type="checkbox" class="export-param-cat" value="station" checked>
+                                    <span>Station Info (PS, RT, RT+, PTYN, LPS)</span>
+                                </label>
+                                <label class="flex items-center gap-2 text-xs">
+                                    <input type="checkbox" class="export-param-cat" value="features" checked>
+                                    <span>Features (AF, EON, DAB, CT, PIN, eRT)</span>
+                                </label>
+                                <label class="flex items-center gap-2 text-xs">
+                                    <input type="checkbox" class="export-param-cat" value="advanced" checked>
+                                    <span>Advanced (Custom Groups, ODAs, Group Sequence)</span>
+                                </label>
+                                <label class="flex items-center gap-2 text-xs">
+                                    <input type="checkbox" class="export-param-cat" value="audio" checked>
+                                    <span>Audio (Device, Levels, Genlock)</span>
+                                </label>
+                                <label class="flex items-center gap-2 text-xs">
+                                    <input type="checkbox" class="export-param-cat" value="connectivity" checked>
+                                    <span>Connectivity (Serial, UECP)</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="flex items-center gap-2 text-xs">
+                                <input type="checkbox" id="export_include_global" checked class="toggle-checkbox">
+                                <span>Include Global Settings (auth, site name, auto-start, port)</span>
+                            </label>
+                        </div>
+
+                        <button onclick="exportConfig()" class="bg-pink-600 hover:bg-pink-500 text-white font-semibold rounded px-4 py-2 text-sm transition">
+                            Export to .rdsm File
+                        </button>
+                        <div id="export_status" class="text-xs text-gray-400 mt-2"></div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">Import Configuration</div>
+                    <div class="section-body">
+                        <div class="mb-3">
+                            <label>Select .rdsm File</label>
+                            <input type="file" id="import_file" accept=".rdsm" onchange="handleImportFile()" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm">
+                        </div>
+
+                        <div id="import_preview_section" style="display: none;" class="mb-3">
+                            <div class="bg-black/30 border border-gray-700 rounded p-3">
+                                <div class="text-xs font-bold text-pink-500 mb-2">File Preview</div>
+                                <div id="import_preview_content" class="text-xs text-gray-300 space-y-1">
+                                    <!-- Populated after file selection -->
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="import_options_section" style="display: none;">
+                            <div class="mb-3">
+                                <label>Import Mode</label>
+                                <select id="import_mode" onchange="updateImportOptions()" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm">
+                                    <option value="new">Import as New Dataset(s)</option>
+                                    <option value="overwrite">Overwrite Existing Dataset</option>
+                                    <option value="merge">Merge into Existing Dataset(s)</option>
+                                </select>
+                            </div>
+
+                            <div id="import_target_dataset" style="display: none;" class="mb-3">
+                                <label>Target Dataset</label>
+                                <select id="import_target_dataset_select" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm">
+                                    <!-- Populated dynamically -->
+                                </select>
+                            </div>
+
+                            <div id="import_dataset_selection" class="mb-3">
+                                <label>Select Datasets to Import</label>
+                                <div id="import_dataset_checkboxes" class="bg-black/30 border border-gray-700 rounded p-3 space-y-2 max-h-40 overflow-y-auto">
+                                    <!-- Populated from file -->
+                                </div>
+                            </div>
+
+                            <div class="mb-3">
+                                <label>Select Specific Features to Import</label>
+                                <div class="bg-black/30 border border-gray-700 rounded p-3 space-y-1 max-h-64 overflow-y-auto">
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="all" checked onchange="toggleAllImportFeatures(this)">
+                                        <span class="font-bold text-pink-400">Select All</span>
+                                    </label>
+                                    <div class="border-t border-gray-600 my-1"></div>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="basic" checked>
+                                        <span>Basic RDS (PI, PTY, TP, TA, MS, DI, RBDS)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="ps" checked>
+                                        <span>PS (Programme Service Name)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="rt" checked>
+                                        <span>RT (RadioText Messages)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="rtplus" checked>
+                                        <span>RT+ (RadioText Plus Tagging)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="af" checked>
+                                        <span>AF (Alternative Frequencies)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="eon" checked>
+                                        <span>EON (Enhanced Other Networks)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="dab" checked>
+                                        <span>DAB Linkage (12A ODA)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="ct" checked>
+                                        <span>CT/PIN (Clock Time & Programme Item Number)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="ptyn" checked>
+                                        <span>PTYN (Programme Type Name)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="lps" checked>
+                                        <span>LPS (Long PS - 32 char)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="tdc" checked>
+                                        <span>TDC (Transparent Data Channels 5A/5B)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="ert" checked>
+                                        <span>eRT (Enhanced RadioText)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="paging" checked>
+                                        <span>Paging</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="custom_groups" checked>
+                                        <span>Custom Groups</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="custom_oda" checked>
+                                        <span>Custom ODA List</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="group_sequence" checked>
+                                        <span>Group Sequence</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="dynamic_control" checked>
+                                        <span>Dynamic Control Rules</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="audio" checked>
+                                        <span>Audio Settings (Device, Levels, Genlock)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="rds2" checked>
+                                        <span>RDS2 Carriers</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="ari" checked>
+                                        <span>ARI (Autofahrer-Rundfunk-Information)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="serial" checked>
+                                        <span>Serial Output</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="uecp" checked>
+                                        <span>UECP Settings</span>
+                                    </label>
+                                </div>
+                                <div class="text-[9px] text-gray-500 mt-1">Uncheck features you don't want to import. Unchecked features will keep their current values.</div>
+                            </div>
+
+                            <div class="mb-3">
+                                <label class="flex items-center gap-2 text-xs">
+                                    <input type="checkbox" id="import_include_global" class="toggle-checkbox">
+                                    <span>Import Global Settings (will overwrite current auth, site name, etc.)</span>
+                                </label>
+                            </div>
+
+                            <button onclick="importConfig()" class="bg-pink-600 hover:bg-pink-500 text-white font-semibold rounded px-4 py-2 text-sm transition">
+                                Import Configuration
+                            </button>
+                            <div id="import_status" class="text-xs text-gray-400 mt-2"></div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -15491,6 +16100,389 @@ UI_HTML = r"""
             });
         });
 
+        // ===== IMPORT/EXPORT FUNCTIONS =====
+
+        // Parameter categories mapping
+        // Export parameter categories (for export feature)
+        const PARAM_CATEGORIES = {
+            'basic': ['pi', 'pty', 'rbds', 'tp', 'ta', 'ms', 'di_stereo', 'di_head', 'di_comp', 'di_dyn'],
+            'station': ['ps_dynamic', 'ps_centered', 'ps_group_version', 'rt_text', 'rt_a', 'rt_b', 'rt_manual_buffers',
+                        'rt_cycle_ab', 'rt_cr', 'rt_centered', 'rt_disable_0d', 'rt_mode', 'rt_cycle', 'rt_cycle_time',
+                        'rt_messages', 'en_rt_plus', 'rt_plus_mode', 'rt_plus_format_a', 'rt_plus_format_b',
+                        'ptyn', 'en_ptyn', 'ptyn_centered', 'ps_long_32', 'en_lps', 'lps_centered', 'lps_cr'],
+            'features': ['en_af', 'af_list', 'af_method', 'af_pairs', 'en_eon', 'eon_services',
+                         'en_dab', 'dab_channel', 'dab_eid', 'dab_mode', 'dab_es_flag', 'dab_sid', 'dab_variant',
+                         'ecc', 'lic', 'tz_offset', 'en_ct', 'en_id', 'en_pin', 'pin_day', 'pin_hour', 'pin_minute',
+                         'en_ert', 'ert_text', 'ert_encoding', 'ert_messages', 'ert_group_type', 'ert_direction',
+                         'en_ert_rtplus', 'ert_rtplus_tags', 'ert_rtplus_group_type', 'ert_source',
+                         'en_paging', 'paging_group_designation'],
+            'advanced': ['custom_oda_list', 'custom_groups', 'group_sequence', 'scheduler_auto',
+                         'dynamic_control_enabled', 'dynamic_control_rules',
+                         'en_tdc_5a', 'en_tdc_5b', 'tdc_5a_channel', 'tdc_5b_channel', 'tdc_5a_text', 'tdc_5b_text',
+                         'tdc_5a_mode', 'tdc_5b_mode', 'tdc_pc_show_cpu', 'tdc_pc_show_temp', 'tdc_pc_show_ip',
+                         'tdc_pc_show_ram', 'tdc_pc_show_uptime'],
+            'audio': ['device_out_idx', 'device_in_idx', 'genlock', 'passthrough', 'pilot_level', 'rds_level',
+                      'genlock_offset', 'output_channel', 'rds_freq',
+                      'en_rds2', 'rds2_num_carriers', 'rds2_carrier1_level', 'rds2_carrier2_level', 'rds2_carrier3_level',
+                      'rds2_logo_path', 'rds2_logo_filename',
+                      'en_ari', 'ari_region', 'ari_announcement', 'ari_announcement_mode', 'ari_bk_level', 'ari_dk_level'],
+            'connectivity': ['serial_enabled', 'serial_port', 'serial_baud',
+                            'uecp_enabled', 'uecp_port', 'uecp_host', 'uecp_psn', 'uecp_dsn',
+                            'uecp_ws_enabled', 'uecp_ws_url']
+        };
+
+        // Import feature mapping (granular control for imports)
+        const IMPORT_FEATURES = {
+            'basic': ['pi', 'pty', 'rbds', 'tp', 'ta', 'ms', 'di_stereo', 'di_head', 'di_comp', 'di_dyn'],
+            'ps': ['ps_dynamic', 'ps_centered', 'ps_group_version'],
+            'rt': ['rt_text', 'rt_a', 'rt_b', 'rt_manual_buffers', 'rt_cycle_ab', 'rt_cr', 'rt_centered',
+                   'rt_disable_0d', 'rt_mode', 'rt_cycle', 'rt_cycle_time', 'rt_messages', 'rt_active_buffer',
+                   'rt_ab_cycle_count', 'rt_auto_ab'],
+            'rtplus': ['en_rt_plus', 'rt_plus_mode', 'rt_plus_format_a', 'rt_plus_format_b',
+                       'rt_plus_builder_a', 'rt_plus_builder_b', 'rt_plus_regex_rules_a', 'rt_plus_regex_rules_b'],
+            'af': ['en_af', 'af_list', 'af_method', 'af_pairs'],
+            'eon': ['en_eon', 'eon_services'],
+            'dab': ['en_dab', 'dab_channel', 'dab_eid', 'dab_mode', 'dab_es_flag', 'dab_sid', 'dab_variant'],
+            'ct': ['ecc', 'lic', 'tz_offset', 'en_ct', 'en_id', 'en_pin', 'pin_day', 'pin_hour', 'pin_minute'],
+            'ptyn': ['ptyn', 'en_ptyn', 'ptyn_centered'],
+            'lps': ['ps_long_32', 'en_lps', 'lps_centered', 'lps_cr'],
+            'tdc': ['en_tdc_5a', 'en_tdc_5b', 'tdc_5a_channel', 'tdc_5b_channel', 'tdc_5a_text', 'tdc_5b_text',
+                    'tdc_5a_mode', 'tdc_5b_mode', 'tdc_pc_show_cpu', 'tdc_pc_show_temp', 'tdc_pc_show_ip',
+                    'tdc_pc_show_ram', 'tdc_pc_show_uptime'],
+            'ert': ['en_ert', 'ert_text', 'ert_encoding', 'ert_messages', 'ert_group_type', 'ert_direction',
+                    'en_ert_rtplus', 'ert_rtplus_tags', 'ert_rtplus_group_type', 'ert_source'],
+            'paging': ['en_paging', 'paging_group_designation'],
+            'custom_groups': ['custom_groups'],
+            'custom_oda': ['custom_oda_list'],
+            'group_sequence': ['group_sequence', 'scheduler_auto'],
+            'dynamic_control': ['dynamic_control_enabled', 'dynamic_control_rules'],
+            'audio': ['device_out_idx', 'device_in_idx', 'genlock', 'passthrough', 'pilot_level', 'rds_level',
+                      'genlock_offset', 'output_channel', 'rds_freq'],
+            'rds2': ['en_rds2', 'rds2_num_carriers', 'rds2_carrier1_level', 'rds2_carrier2_level', 'rds2_carrier3_level',
+                     'rds2_logo_path', 'rds2_logo_filename'],
+            'ari': ['en_ari', 'ari_region', 'ari_announcement', 'ari_announcement_mode', 'ari_bk_level', 'ari_dk_level'],
+            'serial': ['serial_enabled', 'serial_port', 'serial_baud'],
+            'uecp': ['uecp_enabled', 'uecp_port', 'uecp_host', 'uecp_psn', 'uecp_dsn', 'uecp_ws_enabled', 'uecp_ws_url']
+        };
+
+        function updateExportOptions() {
+            const exportType = document.getElementById('export_type').value;
+            const datasetOptions = document.getElementById('export_dataset_options');
+            const paramOptions = document.getElementById('export_param_options');
+
+            if (exportType === 'full') {
+                datasetOptions.style.display = 'none';
+                paramOptions.style.display = 'none';
+            } else if (exportType === 'dataset') {
+                datasetOptions.style.display = 'block';
+                paramOptions.style.display = 'none';
+                populateExportDatasets();
+            } else if (exportType === 'partial') {
+                datasetOptions.style.display = 'block';
+                paramOptions.style.display = 'block';
+                populateExportDatasets();
+            }
+        }
+
+        async function populateExportDatasets() {
+            try {
+                const res = await fetch('/datasets');
+                const data = await res.json();
+                const container = document.getElementById('export_dataset_checkboxes');
+                container.innerHTML = '';
+
+                Object.keys(data.datasets).forEach(dsId => {
+                    const ds = data.datasets[dsId];
+                    const label = document.createElement('label');
+                    label.className = 'flex items-center gap-2 text-xs';
+                    label.innerHTML = `
+                        <input type="checkbox" class="export-dataset-cb" value="${dsId}" ${dsId == data.current ? 'checked' : ''}>
+                        <span>${ds.name} ${dsId == data.current ? '(Current)' : ''}</span>
+                    `;
+                    container.appendChild(label);
+                });
+            } catch (e) {
+                console.error('Failed to load datasets:', e);
+            }
+        }
+
+        async function exportConfig() {
+            const statusEl = document.getElementById('export_status');
+            statusEl.innerText = 'Preparing export...';
+
+            try {
+                const exportType = document.getElementById('export_type').value;
+                let payload = {
+                    export_type: exportType,
+                    include_global: document.getElementById('export_include_global').checked
+                };
+
+                if (exportType === 'dataset' || exportType === 'partial') {
+                    const selectedDatasets = Array.from(document.querySelectorAll('.export-dataset-cb:checked'))
+                        .map(cb => cb.value);
+
+                    if (selectedDatasets.length === 0) {
+                        statusEl.innerText = 'Please select at least one dataset to export.';
+                        return;
+                    }
+                    payload.dataset_ids = selectedDatasets;
+                }
+
+                if (exportType === 'partial') {
+                    const selectedCategories = Array.from(document.querySelectorAll('.export-param-cat:checked'))
+                        .map(cb => cb.value);
+
+                    if (selectedCategories.length === 0) {
+                        statusEl.innerText = 'Please select at least one parameter category.';
+                        return;
+                    }
+
+                    // Build list of all params from selected categories
+                    let allParams = [];
+                    selectedCategories.forEach(cat => {
+                        if (PARAM_CATEGORIES[cat]) {
+                            allParams = allParams.concat(PARAM_CATEGORIES[cat]);
+                        }
+                    });
+                    payload.include_params = allParams;
+                }
+
+                const res = await fetch('/config/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    statusEl.innerText = 'Export failed: ' + (err.error || 'Unknown error');
+                    return;
+                }
+
+                const result = await res.json();
+
+                // Download as .rdsm file
+                const blob = new Blob([JSON.stringify(result.data, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+
+                // Generate filename with timestamp
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+                a.download = `rds-config-${exportType}-${timestamp}.rdsm`;
+
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                statusEl.innerText = 'Export successful! File downloaded.';
+            } catch (e) {
+                statusEl.innerText = 'Export failed: ' + e.message;
+                console.error('Export error:', e);
+            }
+        }
+
+        let currentImportData = null;
+
+        async function handleImportFile() {
+            const fileInput = document.getElementById('import_file');
+            const previewSection = document.getElementById('import_preview_section');
+            const optionsSection = document.getElementById('import_options_section');
+            const statusEl = document.getElementById('import_status');
+
+            if (!fileInput.files || fileInput.files.length === 0) {
+                previewSection.style.display = 'none';
+                optionsSection.style.display = 'none';
+                return;
+            }
+
+            statusEl.innerText = 'Reading file...';
+
+            try {
+                const file = fileInput.files[0];
+                const text = await file.text();
+                currentImportData = JSON.parse(text);
+
+                // Preview the file
+                const res = await fetch('/config/preview', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rdsm_data: currentImportData })
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    statusEl.innerText = 'Invalid file: ' + (err.error || 'Unknown error');
+                    return;
+                }
+
+                const previewData = await res.json();
+                displayImportPreview(previewData.preview);
+                populateImportDatasets(previewData.preview);
+
+                previewSection.style.display = 'block';
+                optionsSection.style.display = 'block';
+                statusEl.innerText = 'File loaded. Review and configure import options below.';
+
+            } catch (e) {
+                statusEl.innerText = 'Failed to read file: ' + e.message;
+                console.error('File read error:', e);
+                previewSection.style.display = 'none';
+                optionsSection.style.display = 'none';
+            }
+        }
+
+        function displayImportPreview(preview) {
+            const container = document.getElementById('import_preview_content');
+            container.innerHTML = `
+                <div class="text-pink-400"><strong>Exported from:</strong> ${preview.exported_from_site || 'Unknown'}</div>
+                <div class="text-pink-400"><strong>Exported on:</strong> ${new Date(preview.exported_at).toLocaleString()}</div>
+                <div class="border-t border-gray-600 my-2 pt-2"></div>
+                <div><strong>RDS Master Version:</strong> ${preview.rds_master_version}</div>
+                <div><strong>Export Type:</strong> ${preview.export_type}</div>
+                <div><strong>Global Settings:</strong> ${preview.has_global_settings ? 'Yes' : 'No'}</div>
+                <div><strong>Datasets:</strong> ${preview.datasets.length}</div>
+                ${preview.datasets.map(ds => `
+                    <div class="ml-4 text-gray-400">
+                        - ${ds.name} (ID: ${ds.id}, ${ds.param_count} parameters)
+                        <div class="ml-4 text-xs">PI: ${ds.samples.pi}, PS: ${ds.samples.ps_dynamic}, PTY: ${ds.samples.pty}</div>
+                    </div>
+                `).join('')}
+            `;
+        }
+
+        function populateImportDatasets(preview) {
+            const container = document.getElementById('import_dataset_checkboxes');
+            container.innerHTML = '';
+
+            preview.datasets.forEach(ds => {
+                const label = document.createElement('label');
+                label.className = 'flex items-center gap-2 text-xs';
+                label.innerHTML = `
+                    <input type="checkbox" class="import-dataset-cb" value="${ds.id}" checked>
+                    <span>${ds.name} (${ds.param_count} params)</span>
+                `;
+                container.appendChild(label);
+            });
+
+            // Also populate target dataset dropdown
+            populateTargetDatasets();
+        }
+
+        async function populateTargetDatasets() {
+            try {
+                const res = await fetch('/datasets');
+                const data = await res.json();
+                const select = document.getElementById('import_target_dataset_select');
+                select.innerHTML = '';
+
+                Object.keys(data.datasets).forEach(dsId => {
+                    const ds = data.datasets[dsId];
+                    const option = document.createElement('option');
+                    option.value = dsId;
+                    option.textContent = `${ds.name} ${dsId == data.current ? '(Current)' : ''}`;
+                    if (dsId == data.current) option.selected = true;
+                    select.appendChild(option);
+                });
+            } catch (e) {
+                console.error('Failed to load target datasets:', e);
+            }
+        }
+
+        function updateImportOptions() {
+            const mode = document.getElementById('import_mode').value;
+            const targetSection = document.getElementById('import_target_dataset');
+
+            if (mode === 'overwrite') {
+                targetSection.style.display = 'block';
+            } else {
+                targetSection.style.display = 'none';
+            }
+        }
+
+        function toggleAllImportFeatures(checkbox) {
+            const allCheckboxes = document.querySelectorAll('.import-feature-cb:not([value="all"])');
+            allCheckboxes.forEach(cb => {
+                cb.checked = checkbox.checked;
+            });
+        }
+
+        async function importConfig() {
+            if (!currentImportData) {
+                document.getElementById('import_status').innerText = 'No file loaded.';
+                return;
+            }
+
+            const statusEl = document.getElementById('import_status');
+            statusEl.innerText = 'Importing...';
+
+            try {
+                const mode = document.getElementById('import_mode').value;
+                const selectedDatasets = Array.from(document.querySelectorAll('.import-dataset-cb:checked'))
+                    .map(cb => cb.value);
+
+                if (selectedDatasets.length === 0) {
+                    statusEl.innerText = 'Please select at least one dataset to import.';
+                    return;
+                }
+
+                // Collect selected features
+                const selectedFeatures = Array.from(document.querySelectorAll('.import-feature-cb:checked:not([value="all"])'))
+                    .map(cb => cb.value);
+
+                // Build list of all params from selected features
+                let selectedParams = [];
+                selectedFeatures.forEach(feature => {
+                    if (IMPORT_FEATURES[feature]) {
+                        selectedParams = selectedParams.concat(IMPORT_FEATURES[feature]);
+                    }
+                });
+
+                // Remove duplicates
+                selectedParams = [...new Set(selectedParams)];
+
+                let payload = {
+                    rdsm_data: currentImportData,
+                    import_mode: mode,
+                    dataset_ids: selectedDatasets,
+                    import_global: document.getElementById('import_include_global').checked,
+                    selected_params: selectedParams.length > 0 ? selectedParams : null
+                };
+
+                if (mode === 'overwrite') {
+                    payload.target_dataset = parseInt(document.getElementById('import_target_dataset_select').value);
+                }
+
+                const res = await fetch('/config/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    statusEl.innerText = 'Import failed: ' + (err.error || 'Unknown error');
+                    return;
+                }
+
+                const result = await res.json();
+                statusEl.innerText = result.message || 'Import successful!';
+
+                // Reload datasets in UI
+                setTimeout(() => {
+                    window.location.reload();
+                }, 1500);
+
+            } catch (e) {
+                statusEl.innerText = 'Import failed: ' + e.message;
+                console.error('Import error:', e);
+            }
+        }
+
+        // Initialize export options on page load
+        updateExportOptions();
+
     </script>
 </body>
 </html>
@@ -15499,4 +16491,4 @@ UI_HTML = r"""
 if __name__ == '__main__':
     print("[STARTUP] RDS Encoder application starting...", flush=True)
     print(f"[STARTUP] Starting threads and web server on port {http_port}", flush=True)
-    socketio.run(app, host='0.0.0.0', port=http_port, debug=False)
+    socketio.run(app, host='0.0.0.0', port=http_port, debug=False, log_output=False, allow_unsafe_werkzeug=True)
