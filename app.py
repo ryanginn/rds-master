@@ -439,6 +439,14 @@ default_state = {
     "tdc_pc_show_ram": False,  # Show RAM usage in PC status
     "tdc_pc_show_uptime": False,  # Show system uptime in PC status
 
+    # In-House Application (IH) - Group 6A
+    "en_ih": True,  # Enable IH transmission (enabled by default)
+    "ih_channel": 31,  # Channel number for IH (0-31, default 31)
+    "ih_first_start_date": "",  # Date when RDS Master was first started (YYYY-MM-DD) - always sent when IH enabled
+    "en_ih_station_id": False,  # Enable station identifier transmission (alternates with date)
+    "ih_frequency": "87.5",  # Station frequency (e.g., "99.7", "107.9") - sent when station ID enabled
+    "ih_site_code": "0000",  # 4-digit hex site identifier (e.g., "CA5B") - sent when station ID enabled
+
     # Scheduler
     "group_sequence": "0A 0A 2A 0A 0A 2A 0A",
     "scheduler_auto": True,
@@ -461,7 +469,7 @@ default_state = {
     "ert_direction": "ltr",  # Text direction: "ltr" (left-to-right) - always 0 per spec
     "en_ert_rtplus": False,  # Enable RT+ tagging for eRT
     "ert_rtplus_tags": "[]",  # JSON array of RT+ tag definitions for eRT
-    "ert_rtplus_group_type": 6,  # Application group type for eRT RT+ (separate from eRT data group)
+    "ert_rtplus_group_type": 7,  # Application group type for eRT RT+ (changed from 6A to 7A to avoid IH collision)
     "ert_source": "ert",  # Content source: "ert" = eRT message manager, "rt" = mirror RT message manager
 }
 
@@ -850,6 +858,7 @@ def load_config():
     
     print("Config loaded from datasets.json.")
     migrate_rt_messages()
+    initialize_ih_first_start_date()
 
     # Initialize monitor_data from loaded state to prevent blank display on startup
     global monitor_data
@@ -936,6 +945,16 @@ def migrate_rt_messages():
     if messages:
         state["rt_messages"] = json.dumps(messages)
         print(f"Migrated {len(messages)} RT message(s) from legacy config.")
+
+def initialize_ih_first_start_date():
+    """Initialize IH first start date if not set."""
+    global state
+    if not state.get("ih_first_start_date"):
+        # Set to today's date
+        today = datetime.now().strftime("%Y-%m-%d")
+        state["ih_first_start_date"] = today
+        save_config()
+        print(f"✓ Initialized IH first start date: {today}")
 
 def _atomic_write_json(filepath, data):
     """Write JSON atomically: write to temp file then rename, so the original
@@ -3326,6 +3345,7 @@ class RDSScheduler:
         # Transparent Data Channels
         if state.get("en_tdc_5a"): optional_groups.append((5,0))  # Group 5A
         if state.get("en_tdc_5b"): optional_groups.append((5,1))  # Group 5B
+        if state.get("en_ih"): optional_groups.append((6,0))  # Group 6A - In-House Application
 
         # Group 3A is ODA announcement - add if any ODA is active
         needs_3a = False
@@ -3363,7 +3383,7 @@ class RDSScheduler:
             optional_groups.append((ert_group_type, 0))  # eRT groups x2
 
         if state.get("en_ert") and state.get("en_ert_rtplus"):
-            ert_rtplus_group_type = state.get("ert_rtplus_group_type", 6)
+            ert_rtplus_group_type = state.get("ert_rtplus_group_type", 7)
             optional_groups.append((ert_rtplus_group_type, 0))  # eRT RT+ group (reduced from 4x to 1x for better balance)
 
         # Add enabled custom groups to auto schedule
@@ -3465,7 +3485,7 @@ class RDSScheduler:
             # This closes the window where the decoder holds stale tags from the previous
             # eRT message while the new 13A content is already being transmitted.
             self._ert_rtplus_needs_clear -= 1
-            ertrtplus_type = state.get("ert_rtplus_group_type", 6)
+            ertrtplus_type = state.get("ert_rtplus_group_type", 7)
             toggle = self.ert_rt_plus_toggle & 1
             b2_tail = (toggle << 4) | 0  # running_bit=0, no active tags
             return self._get_group(ertrtplus_type, 0, b2_tail, 0, 0)
@@ -3958,7 +3978,7 @@ class RDSScheduler:
              
              # Add eRT RT+ if enabled (separate ODA on its own dedicated group)
              if state.get("en_ert") and state.get("en_ert_rtplus"):
-                 ert_rtplus_group_type = state.get("ert_rtplus_group_type", 6)
+                 ert_rtplus_group_type = state.get("ert_rtplus_group_type", 7)
                  # eRT RT+ AGTC = (group_number*2) + 0 for version A
                  ert_rtplus_agtc = (ert_rtplus_group_type * 2) + 0
                  active_odas.append({"type": "ert_rtplus", "group_type": ert_rtplus_agtc, "aid": 0x4BD8, "msg": 0x0000})
@@ -4000,7 +4020,7 @@ class RDSScheduler:
             return self.generate_ert_group(g_ver)
 
         # eRT RT+ (ODA AID: 0x4BD8) — same wire format as Group 11A RT+ but for eRT content
-        elif g_type == state.get("ert_rtplus_group_type", 6) and state.get("en_ert") and state.get("en_ert_rtplus"):
+        elif g_type == state.get("ert_rtplus_group_type", 7) and state.get("en_ert") and state.get("en_ert_rtplus"):
             t1_typ, t1_start, t1_len = 0, 0, 0
             t2_typ, t2_start, t2_len = 0, 0, 0
 
@@ -4026,7 +4046,7 @@ class RDSScheduler:
             b3_val  = ((t1_typ & 0x07) << 13) | ((t1_start & 0x3F) << 7) | ((t1_len & 0x3F) << 1) | ((t2_typ >> 5) & 0x01)
             b4_val  = ((t2_typ & 0x1F) << 11) | ((t2_start & 0x3F) << 5) | (t2_len & 0x1F)
 
-            return self._get_group(state.get("ert_rtplus_group_type", 6), 0, b2_tail, b3_val, b4_val)
+            return self._get_group(state.get("ert_rtplus_group_type", 7), 0, b2_tail, b3_val, b4_val)
 
         elif g_type == 5:
             # Group 5A/5B: Transparent Data Channels (TDC)
@@ -4165,6 +4185,126 @@ class RDSScheduler:
                 b4_val = (text_bytes[offset + 2] << 8) | text_bytes[offset + 3]
 
                 return self._get_group(5, 1, b2_tail, b3_val, b4_val)
+
+        elif g_type == 6 and g_ver == 0 and state.get("en_ih"):
+            # Group 6A: In-House Application (IH)
+            # Sends first start date (always) and optionally alternates with station identifier
+            # Date format: Day (BCD) | Month (BCD) | Year High (BCD) | Year Low (BCD)
+            # Station format: Freq High (BCD) | Freq Low (BCD) | Site High (hex) | Site Low (hex)
+
+            # Initialize IH pointer if needed
+            if not hasattr(self, 'ih_toggle'):
+                self.ih_toggle = False  # False = send date, True = send station
+
+            # Check if station ID is enabled
+            en_station_id = state.get("en_ih_station_id", False)
+
+            # Decide what to send this time
+            send_station = self.ih_toggle and en_station_id
+
+            if send_station:
+                # Station Identifier Mode
+                # Format: Frequency (BCD) | Site Code (4-digit hex)
+                # Example: 99.7 MHz, Site CA5B → 00 97 CA 5B
+
+                try:
+                    # Get frequency (e.g., "99.7")
+                    freq_str = state.get("ih_frequency", "87.5")
+                    # Remove decimal point and parse as integer (e.g., "99.7" -> 997)
+                    freq_int = int(freq_str.replace(".", ""))
+
+                    # Convert to BCD for display (e.g., 997 -> 0x0997 in BCD)
+                    # Split into digits: 997 -> 0, 9, 9, 7
+                    freq_high = freq_int // 100  # First 2 digits (e.g., 9)
+                    freq_low = freq_int % 100     # Last 2 digits (e.g., 97)
+
+                    # Convert to BCD
+                    freq_high_bcd = int(str(freq_high), 16) if freq_high < 100 else 0x00
+                    freq_low_bcd = int(str(freq_low), 16) if freq_low < 100 else 0x00
+
+                except (ValueError, AttributeError):
+                    # If parsing fails, use default 87.5 (0x0875)
+                    freq_high_bcd = 0x08
+                    freq_low_bcd = 0x75
+
+                # Get site code (4-digit hex, e.g., "CA5B")
+                site_code_str = state.get("ih_site_code", "0000").upper()
+                try:
+                    # Parse as hex (e.g., "CA5B" -> 0xCA5B)
+                    site_code = int(site_code_str, 16) & 0xFFFF
+
+                    # Split into high and low bytes
+                    site_high = (site_code >> 8) & 0xFF
+                    site_low = site_code & 0xFF
+
+                except (ValueError, AttributeError):
+                    # If parsing fails, use 0x0000
+                    site_high = 0x00
+                    site_low = 0x00
+
+                # Block 3: Frequency High and Low (BCD)
+                b3_val = (freq_high_bcd << 8) | freq_low_bcd
+
+                # Block 4: Site Code High and Low (hex)
+                b4_val = (site_high << 8) | site_low
+
+            else:
+                # Date Mode (default)
+                # Format: Day (BCD) | Month (BCD) | Year High (BCD) | Year Low (BCD)
+                # Example: 01 01 20 26 = January 1, 2026
+
+                first_start_date = state.get("ih_first_start_date", "")
+
+                if first_start_date:
+                    try:
+                        # Parse date string (YYYY-MM-DD)
+                        year, month, day = first_start_date.split("-")
+                        year = int(year)
+                        month = int(month)
+                        day = int(day)
+
+                        # Convert to BCD (Binary Coded Decimal)
+                        day_bcd = int(str(day), 16) if day < 10 else int(str(day), 16)
+                        month_bcd = int(str(month), 16) if month < 10 else int(str(month), 16)
+
+                        # For year, split into century/tens and units
+                        # e.g., 2026 -> 20 (0x20) and 26 (0x26)
+                        year_high = year // 100  # e.g., 2026 // 100 = 20
+                        year_low = year % 100    # e.g., 2026 % 100 = 26
+                        year_high_bcd = int(str(year_high), 16)
+                        year_low_bcd = int(str(year_low), 16)
+
+                    except (ValueError, AttributeError):
+                        # If date parsing fails, use defaults
+                        day_bcd = 0x01
+                        month_bcd = 0x01
+                        year_high_bcd = 0x20
+                        year_low_bcd = 0x26
+                else:
+                    # No date set, use default (January 1, 2026)
+                    day_bcd = 0x01
+                    month_bcd = 0x01
+                    year_high_bcd = 0x20
+                    year_low_bcd = 0x26
+
+                # Block 3: Day and Month (BCD)
+                b3_val = (day_bcd << 8) | month_bcd
+
+                # Block 4: Year High and Year Low (BCD)
+                b4_val = (year_high_bcd << 8) | year_low_bcd
+
+            # Block 2 tail: 5-bit channel number
+            # Date uses channel 31, Station ID uses channel 30
+            if send_station:
+                b2_tail = 30 & 0x1F
+            else:
+                b2_tail = 31 & 0x1F  # Always use channel 31 for date
+
+            # Toggle for next transmission (only if station ID is enabled)
+            if en_station_id:
+                self.ih_toggle = not self.ih_toggle
+
+            return self._get_group(6, 0, b2_tail, b3_val, b4_val)
 
         elif g_type == 11 and (not state["scheduler_auto"] or state["en_rt_plus"]):
              # --- CORRECTED RT+ PACKING (37 Bits split across blocks) ---
@@ -7802,6 +7942,70 @@ UI_HTML = r"""
                  </div>
 
                  <div class="section">
+                    <div class="section-header">In-House Application (IH) - Group 6A</div>
+                    <div class="section-body">
+                         <div class="text-[9px] text-gray-500 mb-3">
+                             Transmit custom station identification data on Group 6A. When Station ID is enabled, alternates between transmitting First Start Date and Station Identifier.
+                         </div>
+
+                         <div class="flex items-start gap-2 mb-2">
+                             <div class="flex-1">
+                                 <label>Enable IH Transmission</label>
+                                 <div class="text-[9px] text-gray-500">Sends identification data on Group 6A (enabled by default)</div>
+                             </div>
+                             <input type="checkbox" class="toggle-checkbox" id="en_ih" {% if state.en_ih %}checked{% endif %} onchange="sync()">
+                         </div>
+
+                         <!-- Date Fields (Always visible) -->
+                         <div class="mb-3 p-2 border border-gray-700 rounded">
+                             <label class="font-semibold text-blue-300 block mb-2">First Start Date</label>
+                             <div class="text-[9px] text-gray-500 mb-2">Format: Day (BCD) | Month (BCD) | Year High (BCD) | Year Low (BCD). Example: 01 01 20 26 = January 1, 2026</div>
+                             <div>
+                                 <label>First Start Date (YYYY-MM-DD)</label>
+                                 <input type="text" id="ih_first_start_date" value="{{state.ih_first_start_date}}" onchange="sync()" placeholder="YYYY-MM-DD">
+                                 <div class="text-[9px] text-gray-500 mt-1">Auto-set on first run, manually editable</div>
+                             </div>
+                         </div>
+
+                         <!-- Station ID Fields (with separate toggle) -->
+                         <div class="mb-3 p-2 border border-gray-700 rounded">
+                             <div class="flex items-start gap-2 mb-2">
+                                 <div class="flex-1">
+                                     <label class="font-semibold text-blue-300">Station Identifier (Optional)</label>
+                                     <div class="text-[9px] text-gray-500">When enabled, alternates with date transmission on Channel 30</div>
+                                 </div>
+                                 <input type="checkbox" class="toggle-checkbox" id="en_ih_station_id" {% if state.en_ih_station_id %}checked{% endif %} onchange="sync()">
+                             </div>
+                             <div class="text-[9px] text-gray-500 mb-2">Format: Frequency (BCD) | Site Code (4-digit hex). Example: 99.7 MHz, CA5B → 00 97 CA 5B</div>
+                             <div class="grid grid-cols-2 gap-2">
+                                 <div>
+                                     <label>Frequency (MHz)</label>
+                                     <input type="text" id="ih_frequency" value="{{state.ih_frequency}}" onchange="sync()" placeholder="99.7">
+                                     <div class="text-[9px] text-gray-500 mt-1">e.g., 99.7, 107.9</div>
+                                 </div>
+                                 <div>
+                                     <label>Site Code (4-digit hex)</label>
+                                     <input type="text" id="ih_site_code" value="{{state.ih_site_code}}" oninput="this.value = this.value.replace(/[^0-9A-Fa-f]/g, '').toUpperCase()" onchange="sync()" placeholder="CA5B" maxlength="4">
+                                     <div class="text-[9px] text-gray-500 mt-1">Transmitter identifier</div>
+                                 </div>
+                             </div>
+                         </div>
+
+                         <div class="bg-black/30 border border-gray-700 rounded p-2 text-xs text-gray-400">
+                             <div class="font-bold text-pink-400 mb-1">Transmitted Data:</div>
+                             {% if state.ih_first_start_date %}
+                             <div>Date: {{ state.ih_first_start_date }} → Channel 31</div>
+                             {% else %}
+                             <div>Date: Not set (will be initialized on first run) → Channel 31</div>
+                             {% endif %}
+                             {% if state.en_ih_station_id %}
+                             <div>Station: {{ state.ih_frequency }} MHz, Site {{ state.ih_site_code }} → Channel 30 (alternates with date)</div>
+                             {% endif %}
+                         </div>
+                    </div>
+                 </div>
+
+                 <div class="section">
                     <div class="section-header">DAB Cross-Reference (Group 12A)</div>
                     <div class="section-body">
                          <div class="flex items-start gap-2 mb-2">
@@ -8587,6 +8791,10 @@ UI_HTML = r"""
                                     <label class="flex items-center gap-2 text-xs">
                                         <input type="checkbox" class="import-feature-cb" value="tdc" checked>
                                         <span>TDC (Transparent Data Channels 5A/5B)</span>
+                                    </label>
+                                    <label class="flex items-center gap-2 text-xs">
+                                        <input type="checkbox" class="import-feature-cb" value="ih" checked>
+                                        <span>IH (In-House Application - Group 6A)</span>
                                     </label>
                                     <label class="flex items-center gap-2 text-xs">
                                         <input type="checkbox" class="import-feature-cb" value="ert" checked>
@@ -12198,7 +12406,7 @@ UI_HTML = r"""
                 // Enhanced RadioText (eRT)
                 en_ert: getVal('en_ert'), ert_text: getVal('ert_text') || '', ert_encoding: getVal('ert_encoding'), 
                 ert_group_type: getVal('ert_group_type'), en_ert_rtplus: getVal('en_ert_rtplus'),
-                ert_rtplus_group_type: getVal('ert_rtplus_group_type') || 6,
+                ert_rtplus_group_type: getVal('ert_rtplus_group_type') || 7,
                 ert_source: getVal('ert_source') || 'ert',
                 ert_messages: JSON.stringify(ertMessages),
                 en_dab: getVal('en_dab'), dab_channel: getVal('dab_channel'),
@@ -12238,6 +12446,13 @@ UI_HTML = r"""
                 tdc_pc_show_ip: getVal('tdc_pc_show_ip'),
                 tdc_pc_show_ram: getVal('tdc_pc_show_ram'),
                 tdc_pc_show_uptime: getVal('tdc_pc_show_uptime'),
+
+                // In-House Application (IH)
+                en_ih: getVal('en_ih'),
+                en_ih_station_id: getVal('en_ih_station_id'),
+                ih_first_start_date: getVal('ih_first_start_date'),
+                ih_frequency: getVal('ih_frequency'),
+                ih_site_code: getVal('ih_site_code'),
 
                 // Serial RDS Block Output
                 serial_enabled: getVal('serial_enabled'),
@@ -16149,6 +16364,7 @@ UI_HTML = r"""
             'tdc': ['en_tdc_5a', 'en_tdc_5b', 'tdc_5a_channel', 'tdc_5b_channel', 'tdc_5a_text', 'tdc_5b_text',
                     'tdc_5a_mode', 'tdc_5b_mode', 'tdc_pc_show_cpu', 'tdc_pc_show_temp', 'tdc_pc_show_ip',
                     'tdc_pc_show_ram', 'tdc_pc_show_uptime'],
+            'ih': ['en_ih', 'en_ih_station_id', 'ih_first_start_date', 'ih_frequency', 'ih_site_code'],
             'ert': ['en_ert', 'ert_text', 'ert_encoding', 'ert_messages', 'ert_group_type', 'ert_direction',
                     'en_ert_rtplus', 'ert_rtplus_tags', 'ert_rtplus_group_type', 'ert_source'],
             'paging': ['en_paging', 'paging_group_designation'],
