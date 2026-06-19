@@ -46,8 +46,16 @@ except ImportError:
     SERIAL_AVAILABLE = False
     print("[Serial] pyserial not available - serial output disabled. Install with: pip install pyserial")
 
+# Try to import updater module
+try:
+    from updater import UpdateManager
+    UPDATER_AVAILABLE = True
+except ImportError:
+    UPDATER_AVAILABLE = False
+    print("[Updater] updater.py not found - update functionality disabled")
+
 # --- VERSION ---
-VERSION = "v1.3b"
+VERSION = "v1.4"
 
 # --- SETTINGS ---
 # Host API filtering: auto-detect based on OS, can be overridden via RDS_HOSTAPI env var
@@ -305,6 +313,9 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
 
 # Create upload folder if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Initialize update manager
+update_manager = UpdateManager() if UPDATER_AVAILABLE else None
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -5485,6 +5496,136 @@ def update_settings():
     if changed: save_config()
     return {"ok": True}
 
+@app.route('/update/upload', methods=['POST'])
+def upload_update():
+    """Handle update file upload"""
+    if not session.get('auth'):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    if not UPDATER_AVAILABLE:
+        return jsonify({"ok": False, "error": "Updater module not available"}), 500
+
+    # Check if file was uploaded
+    if 'file' not in request.files:
+        return jsonify({"ok": False, "error": "No file uploaded"}), 400
+
+    file = request.files['file']
+
+    if file.filename == '':
+        return jsonify({"ok": False, "error": "No file selected"}), 400
+
+    # Save uploaded file to temp location
+    try:
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, secure_filename(file.filename))
+        file.save(temp_path)
+
+        # Validate the zip file
+        is_valid, message = update_manager.validate_zip(temp_path)
+
+        if not is_valid:
+            os.remove(temp_path)
+            return jsonify({"ok": False, "error": message}), 400
+
+        # Create backup
+        backup_info = update_manager.create_backup()
+
+        # Extract update
+        success, extract_msg, extracted_files = update_manager.extract_update(temp_path)
+
+        # Clean up temp file
+        os.remove(temp_path)
+
+        if not success:
+            return jsonify({"ok": False, "error": extract_msg}), 500
+
+        return jsonify({
+            "ok": True,
+            "message": "Update extracted successfully. Ready to restart.",
+            "backup_created": backup_info["timestamp"],
+            "extracted_files": extracted_files
+        })
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route('/update/restart', methods=['POST'])
+def restart_application():
+    """Restart the application after update"""
+    if not session.get('auth'):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    if not UPDATER_AVAILABLE:
+        return jsonify({"ok": False, "error": "Updater module not available"}), 500
+
+    try:
+        # Stop audio if running
+        if state.get("running"):
+            state["running"] = False
+            time.sleep(0.5)  # Give audio thread time to stop
+
+        # Save current state
+        save_datasets()
+
+        # Trigger restart in a separate thread to allow response to be sent
+        def delayed_restart():
+            time.sleep(1)  # Give time for response to be sent
+            update_manager.restart_application()
+
+        threading.Thread(target=delayed_restart, daemon=True).start()
+
+        return jsonify({"ok": True, "message": "Restarting application..."})
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route('/update/status', methods=['GET'])
+def update_status():
+    """Get update/backup status"""
+    if not session.get('auth'):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    if not UPDATER_AVAILABLE:
+        return jsonify({"ok": False, "updater_available": False})
+
+    try:
+        backups = update_manager.get_available_backups()
+
+        return jsonify({
+            "ok": True,
+            "updater_available": True,
+            "backups": backups
+        })
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route('/update/restore', methods=['POST'])
+def restore_backup():
+    """Restore from a specific backup"""
+    if not session.get('auth'):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    if not UPDATER_AVAILABLE:
+        return jsonify({"ok": False, "error": "Updater module not available"}), 500
+
+    data = request.get_json(silent=True) or {}
+    backup_path = data.get('backup_path')
+
+    if not backup_path:
+        return jsonify({"ok": False, "error": "No backup path specified"}), 400
+
+    try:
+        success, message = update_manager.restore_backup(backup_path)
+
+        if success:
+            return jsonify({"ok": True, "message": message})
+        else:
+            return jsonify({"ok": False, "error": message}), 500
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route('/uecp_settings', methods=['GET', 'POST'])
 def uecp_settings_route():
     global _uecp_tcp_server, _uecp_ws_client
@@ -6072,6 +6213,17 @@ def parse_rds_spy_format(text):
 # Load configuration and datasets - order matters!
 load_datasets()  # Load datasets first to populate the datasets dict
 load_config()    # Then load config which applies the current dataset's state
+
+# Check for post-update validation
+if UPDATER_AVAILABLE:
+    validation = update_manager.check_post_update_validation()
+    if validation.get("validation_needed"):
+        if validation.get("can_delete_backup"):
+            print(f"[Updater] Update validation successful - cleaning up backup")
+            update_manager.cleanup_backup(validation["backup_path"])
+        else:
+            print(f"[Updater] WARNING: Update validation failed - backup preserved at {validation['backup_path']}")
+            print(f"[Updater] You may need to manually restore from backup")
 
 # --- UECP SERVER ---
 _uecp_tcp_server = None
@@ -8855,6 +9007,54 @@ UI_HTML = r"""
                                 Import Configuration
                             </button>
                             <div id="import_status" class="text-xs text-gray-400 mt-2"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">System Updater</div>
+                    <div class="section-body">
+                        <div class="mb-3">
+                            <div class="bg-yellow-900/20 border border-yellow-700/50 rounded p-3 mb-3">
+                                <div class="text-xs text-yellow-400 font-semibold mb-1">⚠️ Important</div>
+                                <div class="text-[10px] text-gray-300">
+                                    • Upload a release ZIP file to update the application<br>
+                                    • Dataset backup is created automatically before update<br>
+                                    • Application will restart after extraction<br>
+                                    • Only upload official release files from trusted sources
+                                </div>
+                            </div>
+
+                            <label>Select Update ZIP File</label>
+                            <div class="text-[9px] text-gray-500 mb-2">Upload official RDS Master release package (.zip)</div>
+                            <input type="file" id="update_file" accept=".zip" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm">
+                        </div>
+
+                        <div class="flex gap-2">
+                            <button onclick="uploadUpdate()" id="upload_update_btn" class="bg-pink-600 hover:bg-pink-500 text-white font-semibold rounded px-4 py-2 text-sm transition">
+                                Upload & Extract Update
+                            </button>
+                            <button onclick="restartApplication()" id="restart_btn" class="bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded px-4 py-2 text-sm transition" style="display: none;">
+                                Restart Application
+                            </button>
+                        </div>
+
+                        <div id="update_status" class="text-xs mt-3"></div>
+
+                        <div id="update_progress" style="display: none;" class="mt-3">
+                            <div class="bg-black/30 border border-gray-700 rounded p-3">
+                                <div class="text-xs font-semibold text-pink-500 mb-2">Update Progress</div>
+                                <div id="update_progress_text" class="text-[10px] text-gray-300 space-y-1">
+                                    <!-- Progress steps will appear here -->
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="backup_list" class="mt-4" style="display: none;">
+                            <div class="text-xs font-semibold text-gray-400 mb-2">Available Backups</div>
+                            <div id="backup_list_content" class="bg-black/30 border border-gray-700 rounded p-3 text-[10px] text-gray-300 max-h-40 overflow-y-auto">
+                                <!-- Backup list will appear here -->
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -16698,6 +16898,172 @@ UI_HTML = r"""
 
         // Initialize export options on page load
         updateExportOptions();
+
+        // ===== UPDATER FUNCTIONS =====
+
+        async function uploadUpdate() {
+            const fileInput = document.getElementById('update_file');
+            const statusEl = document.getElementById('update_status');
+            const progressDiv = document.getElementById('update_progress');
+            const progressText = document.getElementById('update_progress_text');
+            const uploadBtn = document.getElementById('upload_update_btn');
+            const restartBtn = document.getElementById('restart_btn');
+
+            if (!fileInput.files || fileInput.files.length === 0) {
+                statusEl.className = 'text-xs mt-3 text-red-400';
+                statusEl.innerText = 'Please select a ZIP file first';
+                return;
+            }
+
+            const file = fileInput.files[0];
+
+            // Validate file extension
+            if (!file.name.toLowerCase().endsWith('.zip')) {
+                statusEl.className = 'text-xs mt-3 text-red-400';
+                statusEl.innerText = 'Only .zip files are allowed';
+                return;
+            }
+
+            // Show progress
+            progressDiv.style.display = 'block';
+            progressText.innerHTML = '<div>⏳ Uploading update file...</div>';
+            statusEl.className = 'text-xs mt-3 text-blue-400';
+            statusEl.innerText = 'Uploading...';
+            uploadBtn.disabled = true;
+
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const res = await fetch('/update/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.error || 'Upload failed');
+                }
+
+                const result = await res.json();
+
+                // Show success
+                progressText.innerHTML += '<div>✓ Backup created: ' + result.backup_created + '</div>';
+                progressText.innerHTML += '<div>✓ Extracted ' + result.extracted_files.length + ' files</div>';
+                progressText.innerHTML += '<div>✓ Update ready - click Restart to apply changes</div>';
+
+                statusEl.className = 'text-xs mt-3 text-green-400';
+                statusEl.innerText = result.message;
+
+                // Show restart button
+                uploadBtn.style.display = 'none';
+                restartBtn.style.display = 'inline-block';
+
+            } catch (e) {
+                progressText.innerHTML += '<div class="text-red-400">✗ ' + e.message + '</div>';
+                statusEl.className = 'text-xs mt-3 text-red-400';
+                statusEl.innerText = 'Update failed: ' + e.message;
+                uploadBtn.disabled = false;
+                console.error('Update error:', e);
+            }
+        }
+
+        async function restartApplication() {
+            const statusEl = document.getElementById('update_status');
+            const progressText = document.getElementById('update_progress_text');
+            const restartBtn = document.getElementById('restart_btn');
+
+            if (!confirm('Restart the application now? The page will reload after restart.')) {
+                return;
+            }
+
+            statusEl.className = 'text-xs mt-3 text-orange-400';
+            statusEl.innerText = 'Restarting application...';
+            progressText.innerHTML += '<div>🔄 Initiating restart...</div>';
+            restartBtn.disabled = true;
+
+            try {
+                const res = await fetch('/update/restart', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'}
+                });
+
+                if (res.ok) {
+                    progressText.innerHTML += '<div>✓ Restart signal sent</div>';
+                    progressText.innerHTML += '<div>⏳ Waiting for application to restart...</div>';
+                    statusEl.innerText = 'Restarting... Page will reload shortly.';
+
+                    // Poll for server to come back up
+                    let attempts = 0;
+                    const checkInterval = setInterval(async () => {
+                        attempts++;
+                        try {
+                            const checkRes = await fetch('/');
+                            if (checkRes.ok) {
+                                clearInterval(checkInterval);
+                                progressText.innerHTML += '<div class="text-green-400">✓ Application restarted successfully!</div>';
+                                statusEl.className = 'text-xs mt-3 text-green-400';
+                                statusEl.innerText = 'Restart complete! Reloading page...';
+                                setTimeout(() => {
+                                    window.location.reload();
+                                }, 1000);
+                            }
+                        } catch (e) {
+                            // Server not ready yet
+                            if (attempts > 30) {
+                                clearInterval(checkInterval);
+                                statusEl.className = 'text-xs mt-3 text-red-400';
+                                statusEl.innerText = 'Restart timeout - please refresh page manually';
+                            }
+                        }
+                    }, 2000);
+                } else {
+                    const err = await res.json();
+                    throw new Error(err.error || 'Restart failed');
+                }
+
+            } catch (e) {
+                statusEl.className = 'text-xs mt-3 text-red-400';
+                statusEl.innerText = 'Restart error: ' + e.message;
+                restartBtn.disabled = false;
+                console.error('Restart error:', e);
+            }
+        }
+
+        async function loadBackupList() {
+            try {
+                const res = await fetch('/update/status');
+                if (!res.ok) return;
+
+                const data = await res.json();
+
+                if (data.backups && data.backups.length > 0) {
+                    const backupList = document.getElementById('backup_list');
+                    const backupContent = document.getElementById('backup_list_content');
+
+                    backupList.style.display = 'block';
+                    backupContent.innerHTML = '';
+
+                    data.backups.forEach(backup => {
+                        const backupDiv = document.createElement('div');
+                        backupDiv.className = 'mb-2 pb-2 border-b border-gray-700 last:border-0';
+                        backupDiv.innerHTML = `
+                            <div class="font-semibold">${backup.name}</div>
+                            <div class="text-[9px] text-gray-400">Timestamp: ${backup.timestamp}</div>
+                            <div class="text-[9px] text-gray-400">Files: ${Object.keys(backup.files).join(', ')}</div>
+                        `;
+                        backupContent.appendChild(backupDiv);
+                    });
+                }
+            } catch (e) {
+                console.error('Failed to load backup list:', e);
+            }
+        }
+
+        // Load backup list on settings page load
+        if (document.getElementById('update_file')) {
+            loadBackupList();
+        }
 
     </script>
 </body>
