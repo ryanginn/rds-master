@@ -7,7 +7,7 @@
 
 A work-in-progress open-source webUI based RDS encoder. Ships with a lightweight Flask + Socket.IO server, Tailwind-styled UI, and session-gated access for secure usage.
 
-Many thanks to **Bkram, Hans van Eijsden, RZCH, Wötkylä, notluca, Dido, Hyper DX, almyyyzzz and Adam W** (not in order) for Testing, ideas and assistance in the development of this program! ❤️
+Many thanks to **Bkram, Hans van Eijsden, RZCH, Wötkylä, notluca, Dido, Hyper DX, almyyyzzz, Andrzejek, Lucas Gallone and Adam W** (not in order) for Beta testing new features, ideas and assistance in the development of this program! ❤️
 
   
 
@@ -42,6 +42,8 @@ Many thanks to **Bkram, Hans van Eijsden, RZCH, Wötkylä, notluca, Dido, Hyper 
 - Live monitor panel that reflects PS/RT/PI/PTY and pilot status via WebSocket.
 
 - Basic RDS2 logos (experimental)
+
+- Remote updating via Web interface
 
 ## Installation
 
