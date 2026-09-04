@@ -339,20 +339,26 @@ def get_or_create_secret():
     # Generate new secret
     secret = os.urandom(24).hex()
     
-    # Save to datasets.json
+    # Save to datasets.json. This runs before load_datasets(), so it must never
+    # truncate an existing file — write to a temp file and swap it in.
     try:
         data = {}
         if os.path.exists(DATASETS_FILE):
-            with open(DATASETS_FILE, 'r') as f:
-                data = json.load(f)
+            with open(DATASETS_FILE, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+            if content:
+                data = json.loads(content)
         if 'system' not in data:
             data['system'] = {}
         data['system']['secret_key'] = secret
-        with open(DATASETS_FILE, 'w') as f:
+
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(DATASETS_FILE)), suffix='.tmp')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp_path, DATASETS_FILE)
     except Exception as e:
         print(f"Error saving secret: {e}")
-    
+
     return secret
 
 app.secret_key = os.environ.get("RDS_SECRET", get_or_create_secret())
@@ -514,8 +520,86 @@ monitor_data = {
     "pin_str": ""
 }
 
+# --- DATE / TIME PLACEHOLDERS ---
+# Tokens usable in PS, Long PS, RT, eRT, PTYN and RT message content.
+# Longest tokens must come first so \YY\ never eats part of \YYYY\ etc.
+# NOTE: \MN\ is MINUTE (kept for backwards compatibility) - the month is \MO\.
+TIME_PLACEHOLDERS = (
+    ("\\YYYY\\", lambda n: f"{n.year:04d}"),          # 2026
+    ("\\YY\\",   lambda n: f"{n.year % 100:02d}"),    # 26
+    ("\\MMMM\\", lambda n: n.strftime("%B")),         # February
+    ("\\MMM\\",  lambda n: n.strftime("%b")),         # Feb
+    ("\\MO\\",   lambda n: f"{n.month:02d}"),         # 02
+    ("\\DDDD\\", lambda n: n.strftime("%A")),         # Wednesday
+    ("\\DDD\\",  lambda n: n.strftime("%a")),         # Wed
+    ("\\DD\\",   lambda n: f"{n.day:02d}"),           # 04
+    ("\\HR\\",   lambda n: f"{n.hour:02d}"),          # 00-23
+    ("\\H12\\",  lambda n: f"{(n.hour % 12) or 12:02d}"),  # 01-12
+    ("\\AP\\",   lambda n: "AM" if n.hour < 12 else "PM"),
+    ("\\MN\\",   lambda n: f"{n.minute:02d}"),        # 00-59
+    ("\\S\\",    lambda n: f"{n.second:02d}"),        # 00-59
+)
+
+def apply_time_placeholders(text, now=None):
+    r"""Substitute date/time tokens (\HR\, \MN\, \S\, \DD\, \MO\, \YYYY\, ...) in text."""
+    if not text or "\\" not in text:
+        return text
+    now = now or datetime.now()
+    for token, fmt in TIME_PLACEHOLDERS:
+        if token in text:
+            try:
+                text = text.replace(token, fmt(now))
+            except Exception:
+                pass  # never let a bad locale/strftime break the encoder
+    return text
+
 # --- RT+ PARSER ---
 import json
+
+def find_enclosed_span(text, open_char, close_char, occurrence=1):
+    """Locate the Nth open/close delimiter pair in text.
+
+    Returns (open_index, close_index) where close_index is the index of the
+    first character of the closing delimiter, or None when no pair is found.
+    Works for symmetric delimiters (" ... ") as well as asymmetric ones ((...)).
+    """
+    if not text or not open_char:
+        return None
+    close_char = close_char or open_char
+    found = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        o = text.find(open_char, i)
+        if o == -1:
+            return None
+        c = text.find(close_char, o + len(open_char))
+        if c == -1:
+            return None
+        found += 1
+        if found >= occurrence:
+            return (o, c)
+        i = c + len(close_char)
+    return None
+
+def policy_condition_matches(condition, pattern, content):
+    """Shared matcher for tagging-policy triggers/conditions (case-insensitive)."""
+    if not pattern:
+        return False
+    try:
+        if condition == "contains":
+            return pattern.lower() in content.lower()
+        if condition == "starts_with":
+            return content.lower().startswith(pattern.lower())
+        if condition == "ends_with":
+            return content.lower().endswith(pattern.lower())
+        if condition == "equals":
+            return content.lower() == pattern.lower()
+        if condition == "regex":
+            return bool(re.search(pattern, content, re.IGNORECASE))
+    except Exception:
+        pass
+    return False
 
 class RTPlusParser:
     @staticmethod
@@ -827,13 +911,20 @@ def load_config():
     auto_start_was_missing = False
     try:
         if os.path.exists(DATASETS_FILE):
-            with open(DATASETS_FILE, 'r') as f:
+            with open(DATASETS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                
-                # Load current dataset
-                current_dataset_str = str(data.get('current', 1))
-                current_dataset = int(current_dataset_str)
-                
+
+                # Load current dataset. load_datasets() ran first and may have
+                # corrected 'current' (e.g. it pointed at a deleted slot), so
+                # prefer its value when the file's own pointer is unusable.
+                current_dataset_str = str(data.get('current', current_dataset))
+                if datasets and current_dataset_str not in datasets:
+                    current_dataset_str = str(current_dataset)
+                try:
+                    current_dataset = int(current_dataset_str)
+                except (TypeError, ValueError):
+                    current_dataset_str, current_dataset = '1', 1
+
                 if 'datasets' in data and current_dataset_str in data['datasets']:
                     dataset_state = data['datasets'][current_dataset_str].get('state', {})
                     # Remove auto_start and http_port from state if they exist (they should only be at root level)
@@ -1023,6 +1114,9 @@ def _atomic_write_json(filepath, data):
 
 def save_config():
     """Save configuration to datasets.json."""
+    if not datasets_file_ready():
+        print("⚠ Skipping config save — datasets.json is still unreadable.")
+        return
     try:
         # Load existing data
         data = {}
@@ -1057,6 +1151,13 @@ def save_config():
         if 'auth' not in data:
             data['auth'] = {}
         
+        # Carry over any dataset that exists in memory but not in the file (e.g. one
+        # created since the last save_datasets()), so this save can never drop it.
+        for ds_key, ds_value in datasets.items():
+            if ds_key not in data['datasets']:
+                data['datasets'][ds_key] = {'name': ds_value.get('name', f'Dataset {ds_key}'),
+                                            'state': dict(ds_value.get('state', {}))}
+
         # Get current dataset — use in-memory variable, NOT what's in the file
         # The file's 'current' may be stale (race with save_datasets, or deleted dataset)
         current = str(current_dataset)
@@ -1068,10 +1169,17 @@ def save_config():
         data['datasets'][current]['state'] = dict(state)
 
         # CRITICAL: Also update the in-memory datasets dictionary to prevent data bleeding
-        # when switching between datasets
-        if current in datasets:
-            datasets[current]['state'] = dict(state)
-        
+        # when switching between datasets. The slot must be *created* if it is missing,
+        # otherwise the in-memory list silently lags the file and the next
+        # save_datasets() writes stale (or empty) data over it.
+        if current not in datasets:
+            datasets[current] = {'name': data['datasets'][current].get('name', f'Dataset {current}'),
+                                 'state': {}}
+        datasets[current]['state'] = dict(state)
+
+        # Keep 'current' in the file — save_datasets() is not the only writer
+        data['current'] = current_dataset
+
         # Always save current auth credentials
         data['auth'] = {
             'user': auth_config.get('user', 'admin'),
@@ -1109,33 +1217,113 @@ auto_start = True  # Global setting, not per-dataset
 site_name = "Where am I"  # Global setting for UI branding
 http_port = 5000  # Global setting for HTTP port, not per-dataset
 
-def load_datasets():
-    global datasets, current_dataset
+# False when datasets.json exists but could not be *opened* (locked, permissions).
+# While False every writer skips the file, so a transient I/O problem can never
+# silently destroy the user's datasets. Invalid JSON is handled differently: the
+# bad file is copied aside and the app starts fresh, so it stays recoverable.
+datasets_load_ok = True
+
+def _backup_unreadable_datasets_file(reason):
+    """Copy an unparseable datasets.json aside so nothing is lost when we reset."""
+    backup = f"{DATASETS_FILE}.corrupted-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     try:
-        if os.path.exists(DATASETS_FILE):
-            with open(DATASETS_FILE, 'r') as f:
-                data = json.load(f)
-                datasets = data.get('datasets', {})
-                # Clean up auto_start and http_port from all dataset states
-                for ds_key in datasets:
-                    if 'state' in datasets[ds_key]:
-                        datasets[ds_key]['state'].pop('auto_start', None)
-                        datasets[ds_key]['state'].pop('http_port', None)
-                current_dataset = data.get('current', 1)
-        else:
-            datasets = {'1': {'name': 'Dataset 1', 'state': dict(state)}}
-            current_dataset = 1
-    except:
+        import shutil
+        shutil.copy2(DATASETS_FILE, backup)
+        print(f"⚠ {DATASETS_FILE} is not valid JSON ({reason}). Copied to {backup}; starting a fresh dataset list.")
+    except Exception as copy_err:
+        print(f"⚠ {DATASETS_FILE} is not valid JSON ({reason}) and could not be backed up: {copy_err}")
+
+def load_datasets():
+    global datasets, current_dataset, datasets_load_ok
+
+    data = {}
+    datasets_load_ok = True
+    if os.path.exists(DATASETS_FILE):
+        try:
+            with open(DATASETS_FILE, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+            if content:
+                data = json.loads(content)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # File is readable but garbled — keep a copy and continue with defaults.
+            _backup_unreadable_datasets_file(e)
+            data = {}
+        except OSError as e:
+            # Locked / permission denied. Do NOT fall back to a blank dataset list
+            # and do NOT write anything — that is how the file used to get wiped.
+            datasets_load_ok = False
+            print(f"⚠ Could not open {DATASETS_FILE} ({e}). Datasets will not be written this session.")
+
+    loaded = data.get('datasets') if isinstance(data, dict) else None
+    parsed = {}
+    if isinstance(loaded, dict):
+        for ds_key, ds_value in loaded.items():
+            if not isinstance(ds_value, dict):
+                continue
+            ds_state = ds_value.get('state')
+            ds_state = dict(ds_state) if isinstance(ds_state, dict) else {}
+            # auto_start / http_port are global, never per-dataset
+            ds_state.pop('auto_start', None)
+            ds_state.pop('http_port', None)
+            parsed[str(ds_key)] = {
+                'name': ds_value.get('name', f'Dataset {ds_key}'),
+                'state': ds_state,
+            }
+
+    if parsed:
+        datasets = parsed
+    elif datasets_load_ok:
+        # No datasets on disk yet (fresh install, or a file that only holds the
+        # secret key). Seed slot 1 so the UI always has something to show and
+        # new datasets never collide with it.
         datasets = {'1': {'name': 'Dataset 1', 'state': dict(state)}}
+    else:
+        datasets = {}
+
+    try:
+        current_dataset = int(data.get('current', 1))
+    except (TypeError, ValueError):
         current_dataset = 1
+    if datasets and str(current_dataset) not in datasets:
+        try:
+            current_dataset = int(min(datasets.keys(), key=lambda k: int(k)))
+        except (TypeError, ValueError):
+            current_dataset = 1
+        print(f"⚠ 'current' pointed at a missing dataset; falling back to Dataset {current_dataset}")
+
+def datasets_file_ready():
+    """True when it is safe to write datasets.json.
+
+    When the file could not be opened at startup we block every writer. This
+    re-checks on each save so a transient lock (AV scanner, backup tool) doesn't
+    leave the app unable to persist for the rest of the session.
+    """
+    global datasets_load_ok
+    if datasets_load_ok:
+        return True
+    if not os.path.exists(DATASETS_FILE):
+        datasets_load_ok = True
+        return True
+    try:
+        with open(DATASETS_FILE, 'r', encoding='utf-8') as f:
+            f.read()
+    except OSError:
+        return False
+    # Readable again — pick up what is actually on disk before writing over it.
+    print(f"✓ {DATASETS_FILE} is readable again; reloading datasets before saving.")
+    load_datasets()
+    return datasets_load_ok
 
 def save_datasets():
     """Save datasets along with auth and system settings."""
     global auto_start, http_port
+    if not datasets_file_ready():
+        print("⚠ Skipping dataset save — datasets.json is still unreadable.")
+        return
     try:
-        # Load existing data to preserve auth and system (best-effort — if file is
-        # unreadable/corrupt we start fresh rather than aborting the whole save)
+        # Load existing data to preserve auth and system
         data = {}
+        file_read_ok = True
         if os.path.exists(DATASETS_FILE):
             try:
                 with open(DATASETS_FILE, 'r', encoding='utf-8') as f:
@@ -1143,12 +1331,21 @@ def save_datasets():
                     if content:
                         data = json.loads(content)
             except Exception as read_err:
-                print(f"Warning: could not read {DATASETS_FILE} before save_datasets ({read_err}), continuing with empty base")
-        
+                file_read_ok = False
+                print(f"Warning: could not read {DATASETS_FILE} before save_datasets ({read_err})")
+
+        # SAFETY: never let an empty in-memory dataset list destroy what is already
+        # on disk. This is what used to wipe datasets.json on startup.
+        on_disk = data.get('datasets') if isinstance(data, dict) else None
+        if not datasets and (on_disk or not file_read_ok):
+            print("⚠ Refusing to save an empty dataset list over existing datasets — "
+                  "keeping what is on disk.")
+            return
+
         # Sync live state into current dataset slot before writing
         if str(current_dataset) in datasets:
             datasets[str(current_dataset)]['state'] = dict(state)
-        
+
         # Clean up: remove auto_start and http_port from all dataset states before saving
         datasets_clean = {}
         for ds_key, ds_value in datasets.items():
@@ -1158,7 +1355,7 @@ def save_datasets():
                 state_copy.pop('auto_start', None)  # Ensure auto_start never in state
                 state_copy.pop('http_port', None)  # Ensure http_port never in state
                 datasets_clean[ds_key]['state'] = state_copy
-        
+
         # Update datasets and current
         data['datasets'] = datasets_clean
         data['current'] = current_dataset
@@ -1189,7 +1386,11 @@ def switch_dataset(dataset_num):
     dataset_num = str(dataset_num)
     if dataset_num in datasets:
         # Save current state to the CURRENT dataset before switching
-        datasets[str(current_dataset)]['state'] = dict(state)
+        # (create the slot if it somehow went missing, rather than raising)
+        cur_key = str(current_dataset)
+        if cur_key not in datasets:
+            datasets[cur_key] = {'name': f'Dataset {cur_key}', 'state': {}}
+        datasets[cur_key]['state'] = dict(state)
 
         # Switch to new dataset
         current_dataset = int(dataset_num)
@@ -2238,12 +2439,8 @@ class RDSScheduler:
                 # If stripping left nothing, return cached value or empty
                 result = resolved_cache.get(key, "")
 
-        # Time placeholders: \HR\, \MN\, \S\ for dynamic time in PS/text
-        if "\\" in result:
-            now = datetime.now()
-            result = result.replace("\\HR\\", f"{now.hour:02d}")
-            result = result.replace("\\MN\\", f"{now.minute:02d}")
-            result = result.replace("\\S\\", f"{now.second:02d}")
+        # Date/time placeholders: \HR\, \MN\, \S\, \DD\, \MO\, \YYYY\, \YY\, ...
+        result = apply_time_placeholders(result)
 
         return result
 
@@ -2364,12 +2561,8 @@ class RDSScheduler:
                 max_len=64 if msg.get('trim_max_len') else 0
             )
 
-        # Apply time placeholders: \HR\, \MN\, \S\ for dynamic time display
-        if resolved and "\\" in resolved:
-            now = datetime.now()
-            resolved = resolved.replace("\\HR\\", f"{now.hour:02d}")
-            resolved = resolved.replace("\\MN\\", f"{now.minute:02d}")
-            resolved = resolved.replace("\\S\\", f"{now.second:02d}")
+        # Apply date/time placeholders: \HR\, \MN\, \S\, \DD\, \MO\, \YYYY\, \YY\, ...
+        resolved = apply_time_placeholders(resolved)
 
         return resolved
 
@@ -2508,7 +2701,86 @@ class RDSScheduler:
                         tag1_len = min(len(content), limit - tag1_start)
                         if tag1_start < limit and tag1_len > 0:
                             tags.append((tag1_type, tag1_start, tag1_len))
-            
+
+            elif policy_type == "enclosed":
+                # Enclosed / "between characters" policy.
+                # Tags the text sitting between a pair of delimiter characters
+                # (e.g. the title inside quotes) and the leftover text on the
+                # other side of them (e.g. the artist).
+                #   "Turnstyle" Dermot Kennedy  ->  Title="Turnstyle", Artist="Dermot Kennedy"
+                open_char = settings.get("open_char", '"')
+                close_char = settings.get("close_char", "") or open_char
+                inner_type = int(settings.get("inner_tag_type", -1))
+                outer_type = int(settings.get("outer_tag_type", -1))
+                outer_side = settings.get("outer_side", "auto")   # auto | after | before | none
+                include_delims = bool(settings.get("include_delimiters", False))
+                strip_chars = settings.get("strip_chars", " \t-–—:,")
+                try:
+                    occurrence = max(1, int(settings.get("occurrence", 1)))
+                except (TypeError, ValueError):
+                    occurrence = 1
+
+                if not open_char:
+                    continue
+
+                # Optional pre-condition, same semantics as the sub-tagging trigger
+                trigger_type = settings.get("trigger_type", "none")
+                trigger_pattern = settings.get("trigger_pattern", "")
+                if trigger_type and trigger_type != "none" and trigger_pattern:
+                    if not policy_condition_matches(trigger_type, trigger_pattern, content):
+                        continue
+
+                span = find_enclosed_span(content, open_char, close_char, occurrence)
+                if span is None:
+                    continue  # delimiters absent - leave earlier policies' tags alone
+                open_idx, close_idx = span
+
+                if settings.get("clear_on_match", True):
+                    tags = []
+
+                new_tags = []
+
+                # Inner span (text between the delimiters)
+                inner_start = open_idx if include_delims else open_idx + len(open_char)
+                inner_end = (close_idx + len(close_char)) if include_delims else close_idx
+                inner_text = content[inner_start:inner_end]
+                if inner_type >= 0 and inner_text.strip():
+                    lead = len(inner_text) - len(inner_text.lstrip())
+                    trimmed = inner_text.strip()
+                    start = offset + inner_start + lead
+                    length = min(len(trimmed), limit - start)
+                    if start < limit and length > 0:
+                        new_tags.append((inner_type, start, length))
+
+                # Outer span (whatever is left on the chosen side)
+                if outer_type >= 0 and outer_side != "none":
+                    before_text = content[:open_idx]
+                    after_base = close_idx + len(close_char)
+                    after_text = content[after_base:]
+
+                    if outer_side == "before":
+                        outer_raw, outer_base = before_text, 0
+                    elif outer_side == "after":
+                        outer_raw, outer_base = after_text, after_base
+                    else:  # auto - use whichever side actually carries text
+                        if len(after_text.strip()) >= len(before_text.strip()):
+                            outer_raw, outer_base = after_text, after_base
+                        else:
+                            outer_raw, outer_base = before_text, 0
+
+                    lead = len(outer_raw) - len(outer_raw.lstrip(strip_chars))
+                    outer_text = outer_raw[lead:].rstrip(strip_chars)
+                    if outer_text:
+                        start = offset + outer_base + lead
+                        length = min(len(outer_text), limit - start)
+                        if start < limit and length > 0:
+                            new_tags.append((outer_type, start, length))
+
+                # Keep reading order so previews line up with the text.
+                # RT+ carries at most 2 tags per message.
+                new_tags.sort(key=lambda t: t[1])
+                tags = (tags + new_tags)[:2]
+
             elif policy_type == "sub":
                 # Sub-tagging policy: check trigger and condition, then apply tag
                 trigger_type = settings.get("trigger_type", "none")
@@ -3154,6 +3426,9 @@ class RDSScheduler:
                 trim_at_semicolon=msg.get('trim_at_semicolon', False),
                 max_len=128 if msg.get('trim_max_len') else 0
             )
+
+        # Date/time placeholders: \HR\, \MN\, \S\, \DD\, \MO\, \YYYY\, \YY\, ...
+        result = apply_time_placeholders(result)
         return result
 
     def get_effective_ert_text(self):
@@ -3183,7 +3458,7 @@ class RDSScheduler:
         fallback = state.get("ert_text", "") or ""
         if fallback in ("None", "none"):
             fallback = ""
-        return fallback
+        return apply_time_placeholders(fallback)
 
     def apply_ert_rtplus_formatting(self, msg, content):
         """Apply RT+ formatting (prefix/suffix from first enabled default policy)."""
@@ -5893,11 +6168,58 @@ def get_datasets():
     if not session.get('auth'): return jsonify({'error': 'Not authenticated'}), 401
     return jsonify({'datasets': datasets, 'current': current_dataset})
 
+@app.route('/datasets', methods=['POST'])
+def create_dataset():
+    """Create a new dataset. The server picks the slot so two browsers (or a
+    stale page) can never allocate the same id and overwrite each other."""
+    if not session.get('auth'): return jsonify({'error': 'Not authenticated'}), 401
+    data = request.json or {}
+
+    used = set()
+    for k in datasets.keys():
+        try:
+            used.add(int(k))
+        except (TypeError, ValueError):
+            pass
+    num = 1
+    while num in used:
+        num += 1
+
+    # Seed the new dataset from defaults, carrying over only the hardware bits
+    new_state = dict(default_state)
+    new_state['running'] = False
+    carry_over = data.get('state') or {}
+    for key in ('rds_level', 'device_out_idx', 'device_in_idx', 'output_channel'):
+        if key in carry_over:
+            new_state[key] = carry_over[key]
+        elif key in state:
+            new_state[key] = state[key]
+    new_state.pop('auto_start', None)
+    new_state.pop('http_port', None)
+
+    datasets[str(num)] = {'name': data.get('name') or f'Dataset {num}', 'state': new_state}
+    save_datasets()
+    return jsonify({'success': True, 'num': num, 'name': datasets[str(num)]['name']})
+
 @app.route('/datasets/<int:num>', methods=['PUT'])
 def update_dataset(num):
     if not session.get('auth'): return jsonify({'error': 'Not authenticated'}), 401
-    data = request.json
-    datasets[str(num)] = {'name': data.get('name', f'Dataset {num}'), 'state': data.get('state', dict(state))}
+    data = request.json or {}
+    key = str(num)
+    existing = datasets.get(key)
+
+    if existing:
+        # Updating an existing dataset (rename, or a full write-back). Never let a
+        # missing/empty 'state' in the request blank out a configured dataset.
+        new_state = data.get('state')
+        if not isinstance(new_state, dict) or not new_state:
+            new_state = existing.get('state', {})
+        datasets[key] = {'name': data.get('name', existing.get('name', f'Dataset {num}')),
+                         'state': dict(new_state)}
+    else:
+        datasets[key] = {'name': data.get('name', f'Dataset {num}'),
+                         'state': dict(data.get('state') or state)}
+
     save_datasets()
     return jsonify({'success': True})
 
@@ -6517,6 +6839,15 @@ def import_config():
 
         # Reload config if current dataset was affected
         global current_dataset, state, auth_config, auto_start, site_name, http_port
+
+        # The import wrote straight to disk, so refresh the in-memory dataset list —
+        # otherwise the next save_datasets() would write the stale list back over it.
+        # Importing must not move the user off the dataset they are working on.
+        active_before = current_dataset
+        load_datasets()
+        if str(active_before) in datasets:
+            current_dataset = active_before
+
         if current_dataset in new_dataset_ids or import_global:
             load_config()
             # Emit socket update to refresh all connected clients
@@ -7003,12 +7334,19 @@ UI_HTML = r"""
                     <div class="section-header">Dynamic PS (8-Char)</div>
                     <div class="section-body">
                          <div class="flex justify-between mb-1">
-                             <label>Text Source (Supports \R, \w, 3s:, \HR\, \MN\, \S\)</label>
+                             <label>Text Source (Supports \R, \w, 3s:, date &amp; time placeholders)</label>
                              <div class="flex gap-2 items-center"><label>Centre</label><input type="checkbox" class="toggle-checkbox" id="ps_centered" {% if state.ps_centered %}checked{% endif %} onchange="sync()"></div>
                          </div>
                          <input type="text" id="ps_dynamic" value="{{state.ps_dynamic}}" onchange="sync()">
-                         <div class="text-[9px] text-gray-400 mt-1">
-                             Time placeholders: \HR\ (hour 00-23), \MN\ (minute 00-59), \S\ (second 00-59)
+                         <div class="text-[9px] text-gray-400 mt-1 leading-relaxed">
+                             <div><span class="text-gray-300 font-semibold">Time:</span>
+                                 \HR\ hour 00-23 &bull; \H12\ hour 01-12 &bull; \AP\ AM/PM &bull;
+                                 \MN\ minute &bull; \S\ second</div>
+                             <div><span class="text-gray-300 font-semibold">Date:</span>
+                                 \DD\ day 01-31 &bull; \MO\ month 01-12 &bull; \YYYY\ year 2026 &bull; \YY\ year 26 &bull;
+                                 \MMM\ Feb &bull; \MMMM\ February &bull; \DDD\ Wed &bull; \DDDD\ Wednesday</div>
+                             <div class="text-gray-500">e.g. <span class="font-mono">\DD\/\MO\/\YYYY\</span> or
+                                 <span class="font-mono">\HR\:\MN\</span>. Note \MN\ is the minute; the month is \MO\.</div>
                          </div>
                          <div class="mt-2">
                              <label>PS Group Version</label>
@@ -7244,6 +7582,10 @@ UI_HTML = r"""
                                     <label class="text-xs text-gray-400 mb-1 block">RadioText Content</label>
                                     <input type="text" id="rt_msg_simple_text" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1" placeholder="Enter RadioText message (max 64 chars)" maxlength="64" oninput="updateMsgPreview()">
                                     <div class="text-[10px] text-gray-500 mt-1">Character count: <span id="rt_msg_simple_count">0</span>/64</div>
+                                    <div class="text-[9px] text-gray-500 mt-1">
+                                        Date/time placeholders: \HR\ \MN\ \S\ \H12\ \AP\ &bull; \DD\ \MO\ \YYYY\ \YY\ \MMM\ \MMMM\ \DDD\ \DDDD\
+                                        &nbsp;(\MN\ = minute, \MO\ = month)
+                                    </div>
                                 </div>
                             </div>
 
@@ -7304,6 +7646,7 @@ UI_HTML = r"""
                                                 <select id="policy_type" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-sm" onchange="updatePolicyEditor()">
                                                     <option value="default">Default</option>
                                                     <option value="sub">Sub-tagging</option>
+                                                    <option value="enclosed">Between characters</option>
                                                 </select>
                                             </div>
                                         </div>
@@ -7349,6 +7692,86 @@ UI_HTML = r"""
                                                 <div>
                                                     <label class="text-xs text-gray-400">Suffix</label>
                                                     <input type="text" id="policy_default_suffix" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs" placeholder="Text after">
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- Between-characters (enclosed) Policy Settings -->
+                                        <div id="enclosed_policy_settings" style="display:none" class="space-y-3">
+                                            <div class="text-xs text-amber-400 font-bold">🔠 Between-Characters Tagging</div>
+                                            <div class="bg-[#0a0a0a] border border-amber-900/30 rounded p-2 text-[10px] text-amber-200/80">
+                                                Tags the text sitting <strong>between</strong> a pair of characters, and whatever is left over on the other side.
+                                                Example: <span class="font-mono text-amber-300">&quot;Turnstyle&quot; Dermot Kennedy</span> with open/close <span class="font-mono">&quot;</span>
+                                                gives Title = <em>Turnstyle</em>, Artist = <em>Dermot Kennedy</em>.
+                                            </div>
+                                            <div class="grid grid-cols-4 gap-3">
+                                                <div>
+                                                    <label class="text-xs text-gray-400">Open Char(s)</label>
+                                                    <input type="text" id="policy_enc_open" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs font-mono text-center" value="&quot;" placeholder="&quot;">
+                                                </div>
+                                                <div>
+                                                    <label class="text-xs text-gray-400">Close Char(s)</label>
+                                                    <input type="text" id="policy_enc_close" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs font-mono text-center" value="&quot;" placeholder="same as open">
+                                                </div>
+                                                <div>
+                                                    <label class="text-xs text-gray-400">Which pair</label>
+                                                    <input type="number" id="policy_enc_occurrence" min="1" max="10" value="1" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs">
+                                                </div>
+                                                <div>
+                                                    <label class="text-xs text-gray-400">Leftover text is</label>
+                                                    <select id="policy_enc_outer_side" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs">
+                                                        <option value="auto">Auto (whichever side)</option>
+                                                        <option value="after">After the close char</option>
+                                                        <option value="before">Before the open char</option>
+                                                        <option value="none">Don't tag leftover</option>
+                                                    </select>
+                                                </div>
+                                            </div>
+                                            <div class="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label class="text-xs text-orange-400">Inside Tag Type</label>
+                                                    <select id="policy_enc_inner_tag" class="w-full bg-[#111] border border-orange-900/50 rounded px-2 py-1 text-xs"></select>
+                                                </div>
+                                                <div>
+                                                    <label class="text-xs text-cyan-400">Leftover Tag Type</label>
+                                                    <select id="policy_enc_outer_tag" class="w-full bg-[#111] border border-cyan-900/50 rounded px-2 py-1 text-xs"></select>
+                                                </div>
+                                            </div>
+                                            <div class="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label class="text-xs text-gray-400">Strip these from leftover</label>
+                                                    <input type="text" id="policy_enc_strip" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs font-mono" value=" -–—:,">
+                                                    <div class="text-[9px] text-gray-500 mt-1">Leading/trailing characters removed before tagging (e.g. a &quot; - &quot; separator)</div>
+                                                </div>
+                                                <div class="flex flex-col justify-center gap-2">
+                                                    <label class="flex items-center gap-2 cursor-pointer">
+                                                        <input type="checkbox" id="policy_enc_include_delims" class="accent-amber-600">
+                                                        <span class="text-xs text-gray-300">Include the delimiters in the tag</span>
+                                                    </label>
+                                                    <label class="flex items-center gap-2 cursor-pointer">
+                                                        <input type="checkbox" id="policy_enc_clear" class="accent-amber-600" checked>
+                                                        <span class="text-xs text-gray-300">Replace tags from earlier policies</span>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                            <div class="bg-[#1a1a1a] p-3 rounded border border-cyan-900/30 space-y-2">
+                                                <div class="text-xs text-gray-400">Only apply when the content matches (optional):</div>
+                                                <div class="grid grid-cols-2 gap-3">
+                                                    <div>
+                                                        <label class="text-xs text-gray-400">Trigger Type</label>
+                                                        <select id="policy_enc_trigger_type" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs">
+                                                            <option value="none">No Trigger (Always Apply)</option>
+                                                            <option value="contains">Content contains text</option>
+                                                            <option value="starts_with">Content starts with text</option>
+                                                            <option value="ends_with">Content ends with text</option>
+                                                            <option value="equals">Content exactly equals</option>
+                                                            <option value="regex">Content matches regex</option>
+                                                        </select>
+                                                    </div>
+                                                    <div>
+                                                        <label class="text-xs text-gray-400">Trigger Pattern</label>
+                                                        <input type="text" id="policy_enc_trigger_pattern" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs" placeholder="e.g. Live, News">
+                                                    </div>
                                                 </div>
                                             </div>
                                         </div>
@@ -7808,6 +8231,7 @@ UI_HTML = r"""
                                                  <select id="ert_policy_type" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-sm" onchange="updateERTPolicyEditor()">
                                                      <option value="default">Default</option>
                                                      <option value="sub">Sub-tagging</option>
+                                                     <option value="enclosed">Between characters</option>
                                                  </select>
                                              </div>
                                          </div>
@@ -7839,6 +8263,84 @@ UI_HTML = r"""
                                                  </div>
                                              </div>
                                          </div>
+                                         <!-- Between-characters (enclosed) Policy Settings -->
+                                         <div id="ert_enclosed_policy_settings" style="display:none" class="space-y-3">
+                                             <div class="text-xs text-amber-400 font-bold">🔠 Between-Characters Tagging</div>
+                                             <div class="bg-[#0a0a0a] border border-amber-900/30 rounded p-2 text-[10px] text-amber-200/80">
+                                                 Tags the text <strong>between</strong> a pair of characters plus whatever is left over.
+                                                 e.g. <span class="font-mono text-amber-300">&quot;Turnstyle&quot; Dermot Kennedy</span> → Title / Artist.
+                                             </div>
+                                             <div class="grid grid-cols-4 gap-3">
+                                                 <div>
+                                                     <label class="text-xs text-gray-400">Open Char(s)</label>
+                                                     <input type="text" id="ert_policy_enc_open" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs font-mono text-center" value="&quot;">
+                                                 </div>
+                                                 <div>
+                                                     <label class="text-xs text-gray-400">Close Char(s)</label>
+                                                     <input type="text" id="ert_policy_enc_close" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs font-mono text-center" value="&quot;" placeholder="same as open">
+                                                 </div>
+                                                 <div>
+                                                     <label class="text-xs text-gray-400">Which pair</label>
+                                                     <input type="number" id="ert_policy_enc_occurrence" min="1" max="10" value="1" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs">
+                                                 </div>
+                                                 <div>
+                                                     <label class="text-xs text-gray-400">Leftover text is</label>
+                                                     <select id="ert_policy_enc_outer_side" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs">
+                                                         <option value="auto">Auto (whichever side)</option>
+                                                         <option value="after">After the close char</option>
+                                                         <option value="before">Before the open char</option>
+                                                         <option value="none">Don't tag leftover</option>
+                                                     </select>
+                                                 </div>
+                                             </div>
+                                             <div class="grid grid-cols-2 gap-3">
+                                                 <div>
+                                                     <label class="text-xs text-orange-400">Inside Tag Type</label>
+                                                     <select id="ert_policy_enc_inner_tag" class="w-full bg-[#111] border border-orange-900/50 rounded px-2 py-1 text-xs"></select>
+                                                 </div>
+                                                 <div>
+                                                     <label class="text-xs text-cyan-400">Leftover Tag Type</label>
+                                                     <select id="ert_policy_enc_outer_tag" class="w-full bg-[#111] border border-cyan-900/50 rounded px-2 py-1 text-xs"></select>
+                                                 </div>
+                                             </div>
+                                             <div class="grid grid-cols-2 gap-3">
+                                                 <div>
+                                                     <label class="text-xs text-gray-400">Strip these from leftover</label>
+                                                     <input type="text" id="ert_policy_enc_strip" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs font-mono" value=" -–—:,">
+                                                 </div>
+                                                 <div class="flex flex-col justify-center gap-2">
+                                                     <label class="flex items-center gap-2 cursor-pointer">
+                                                         <input type="checkbox" id="ert_policy_enc_include_delims" class="accent-amber-600">
+                                                         <span class="text-xs text-gray-300">Include the delimiters in the tag</span>
+                                                     </label>
+                                                     <label class="flex items-center gap-2 cursor-pointer">
+                                                         <input type="checkbox" id="ert_policy_enc_clear" class="accent-amber-600" checked>
+                                                         <span class="text-xs text-gray-300">Replace tags from earlier policies</span>
+                                                     </label>
+                                                 </div>
+                                             </div>
+                                             <div class="bg-[#0a0a0a] p-3 rounded border border-cyan-900/30 space-y-2">
+                                                 <div class="text-xs text-gray-400">Only apply when the content matches (optional):</div>
+                                                 <div class="grid grid-cols-2 gap-3">
+                                                     <div>
+                                                         <label class="text-xs text-gray-400">Trigger Type</label>
+                                                         <select id="ert_policy_enc_trigger_type" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs">
+                                                             <option value="none">No Trigger (Always Apply)</option>
+                                                             <option value="contains">Content contains text</option>
+                                                             <option value="starts_with">Content starts with text</option>
+                                                             <option value="ends_with">Content ends with text</option>
+                                                             <option value="equals">Content exactly equals</option>
+                                                             <option value="regex">Content matches regex</option>
+                                                         </select>
+                                                     </div>
+                                                     <div>
+                                                         <label class="text-xs text-gray-400">Trigger Pattern</label>
+                                                         <input type="text" id="ert_policy_enc_trigger_pattern" class="w-full bg-[#111] border border-[#444] rounded px-2 py-1 text-xs" placeholder="e.g. Live, News">
+                                                     </div>
+                                                 </div>
+                                             </div>
+                                         </div>
+
                                          <!-- Sub-tagging Policy Settings -->
                                          <div id="ert_sub_policy_settings" style="display:none" class="space-y-3">
                                              <div class="text-xs text-cyan-400 font-bold">🎯 Content Trigger (Optional)</div>
@@ -10767,6 +11269,138 @@ UI_HTML = r"""
             }
         }
 
+        // --- Between-characters ("enclosed") policy helpers, shared by RT and eRT previews ---
+        function describeEnclosedPolicy(policy) {
+            var s = policy.settings || {};
+            var open = s.open_char !== undefined ? s.open_char : '"';
+            var close = s.close_char || open;
+            var innerName = RTPLUS_TYPES[s.inner_tag_type] ? RTPLUS_TYPES[s.inner_tag_type][0] : 'Unknown';
+            var outerName = RTPLUS_TYPES[s.outer_tag_type] ? RTPLUS_TYPES[s.outer_tag_type][0] : 'Unknown';
+            var desc = 'Inside ' + open + '…' + close + ' → ' + innerName;
+            if (s.outer_side !== 'none') desc += ' • leftover → ' + outerName;
+            return desc;
+        }
+
+        function findEnclosedSpan(text, openChar, closeChar, occurrence) {
+            if (!text || !openChar) return null;
+            closeChar = closeChar || openChar;
+            var found = 0, i = 0;
+            while (i < text.length) {
+                var o = text.indexOf(openChar, i);
+                if (o === -1) return null;
+                var c = text.indexOf(closeChar, o + openChar.length);
+                if (c === -1) return null;
+                found++;
+                if (found >= occurrence) return { open: o, close: c };
+                i = c + closeChar.length;
+            }
+            return null;
+        }
+
+        function stripCharsLeft(str, chars) {
+            var i = 0;
+            while (i < str.length && chars.indexOf(str[i]) !== -1) i++;
+            return i;
+        }
+
+        function stripCharsBoth(str, chars) {
+            var start = stripCharsLeft(str, chars);
+            var end = str.length;
+            while (end > start && chars.indexOf(str[end - 1]) !== -1) end--;
+            return str.substring(start, end);
+        }
+
+        function policyTriggerMatches(type, pattern, content) {
+            if (!pattern) return false;
+            try {
+                switch (type) {
+                    case 'contains': return content.toLowerCase().indexOf(pattern.toLowerCase()) !== -1;
+                    case 'starts_with': return content.toLowerCase().indexOf(pattern.toLowerCase()) === 0;
+                    case 'ends_with': return content.toLowerCase().lastIndexOf(pattern.toLowerCase()) === content.length - pattern.length;
+                    case 'equals': return content.toLowerCase() === pattern.toLowerCase();
+                    case 'regex': return new RegExp(pattern, 'i').test(content);
+                }
+            } catch (e) {}
+            return false;
+        }
+
+        // Mirrors the Python "enclosed" policy so the preview matches what goes on air.
+        // Returns [{type, start, len}, ...] in reading order, or null when it doesn't apply.
+        function computeEnclosedTags(policy, content) {
+            var s = policy.settings || {};
+            var openChar = s.open_char !== undefined ? s.open_char : '"';
+            if (!openChar) return null;
+            var closeChar = s.close_char || openChar;
+            var innerType = parseInt(s.inner_tag_type);
+            var outerType = parseInt(s.outer_tag_type);
+            if (isNaN(innerType)) innerType = -1;
+            if (isNaN(outerType)) outerType = -1;
+            var outerSide = s.outer_side || 'auto';
+            var includeDelims = !!s.include_delimiters;
+            var stripChars = s.strip_chars !== undefined ? s.strip_chars : ' -–—:,';
+            var occurrence = parseInt(s.occurrence) || 1;
+            if (occurrence < 1) occurrence = 1;
+
+            if (s.trigger_type && s.trigger_type !== 'none' && s.trigger_pattern) {
+                if (!policyTriggerMatches(s.trigger_type, s.trigger_pattern, content)) return null;
+            }
+
+            var span = findEnclosedSpan(content, openChar, closeChar, occurrence);
+            if (!span) return null;
+
+            var tags = [];
+            var innerStart = includeDelims ? span.open : span.open + openChar.length;
+            var innerEnd = includeDelims ? span.close + closeChar.length : span.close;
+            var innerText = content.substring(innerStart, innerEnd);
+            if (innerType >= 0 && innerText.trim()) {
+                var lead = innerText.length - innerText.replace(/^\s+/, '').length;
+                var trimmed = innerText.trim();
+                tags.push({ type: innerType, start: innerStart + lead, len: trimmed.length });
+            }
+
+            if (outerType >= 0 && outerSide !== 'none') {
+                var beforeText = content.substring(0, span.open);
+                var afterBase = span.close + closeChar.length;
+                var afterText = content.substring(afterBase);
+                var outerRaw, outerBase;
+                if (outerSide === 'before') {
+                    outerRaw = beforeText; outerBase = 0;
+                } else if (outerSide === 'after') {
+                    outerRaw = afterText; outerBase = afterBase;
+                } else if (afterText.trim().length >= beforeText.trim().length) {
+                    outerRaw = afterText; outerBase = afterBase;
+                } else {
+                    outerRaw = beforeText; outerBase = 0;
+                }
+                var oLead = stripCharsLeft(outerRaw, stripChars);
+                var outerText = stripCharsBoth(outerRaw, stripChars);
+                if (outerText) {
+                    tags.push({ type: outerType, start: outerBase + oLead, len: outerText.length });
+                }
+            }
+
+            tags.sort(function(a, b) { return a.start - b.start; });
+            return tags;
+        }
+
+        function applyEnclosedPolicyToResult(policy, content, result) {
+            var tags = computeEnclosedTags(policy, content);
+            if (!tags) return false;
+            if (policy.settings.clear_on_match !== false) {
+                result.tag1Start = -1; result.tag1Len = 0; result.tag1Type = 0;
+                result.tag2Start = -1; result.tag2Len = 0; result.tag2Type = 0;
+            }
+            for (var i = 0; i < tags.length && i < 2; i++) {
+                if (result.tag1Len === 0) {
+                    result.tag1Type = tags[i].type; result.tag1Start = tags[i].start; result.tag1Len = tags[i].len;
+                } else if (result.tag2Len === 0) {
+                    result.tag2Type = tags[i].type; result.tag2Start = tags[i].start; result.tag2Len = tags[i].len;
+                }
+            }
+            result.appliedPolicy = policy.name;
+            return true;
+        }
+
         function applyTaggingPolicies(content) {
             var result = {
                 text: content,
@@ -10813,6 +11447,9 @@ UI_HTML = r"""
                     }
                     
                     continue; // Default policies don't stop processing
+                } else if (policy.type === 'enclosed') {
+                    applyEnclosedPolicyToResult(policy, content, result);
+                    continue;
                 } else if (policy.type === 'sub') {
                     // Check trigger condition first (if specified)
                     if (policy.settings.trigger_type && policy.settings.trigger_type !== 'none') {
@@ -11119,7 +11756,17 @@ UI_HTML = r"""
                     pattern: '',
                     action: 'tag_all',
                     tag_type: 1,
-                    strip_pattern: false
+                    strip_pattern: false,
+                    // Between-characters (enclosed) settings
+                    open_char: '"',
+                    close_char: '"',
+                    inner_tag_type: 1,
+                    outer_tag_type: 4,
+                    outer_side: 'auto',
+                    occurrence: 1,
+                    include_delimiters: false,
+                    strip_chars: ' -–—:,',
+                    clear_on_match: true
                 }
             };
             taggingPolicies.push(policy);
@@ -11154,7 +11801,22 @@ UI_HTML = r"""
             document.getElementById('policy_sub_pattern').value = policy.settings.pattern || '';
             document.getElementById('policy_sub_action').value = policy.settings.action || 'tag_all';
             document.getElementById('policy_sub_strip_pattern').checked = policy.settings.strip_pattern || false;
-            
+
+            // Between-characters settings
+            populateRTPlusSelect(document.getElementById('policy_enc_inner_tag'),
+                policy.settings.inner_tag_type !== undefined ? policy.settings.inner_tag_type : 1);
+            populateRTPlusSelect(document.getElementById('policy_enc_outer_tag'),
+                policy.settings.outer_tag_type !== undefined ? policy.settings.outer_tag_type : 4);
+            document.getElementById('policy_enc_open').value = policy.settings.open_char !== undefined ? policy.settings.open_char : '"';
+            document.getElementById('policy_enc_close').value = policy.settings.close_char !== undefined ? policy.settings.close_char : '"';
+            document.getElementById('policy_enc_occurrence').value = policy.settings.occurrence || 1;
+            document.getElementById('policy_enc_outer_side').value = policy.settings.outer_side || 'auto';
+            document.getElementById('policy_enc_strip').value = policy.settings.strip_chars !== undefined ? policy.settings.strip_chars : ' -–—:,';
+            document.getElementById('policy_enc_include_delims').checked = policy.settings.include_delimiters || false;
+            document.getElementById('policy_enc_clear').checked = policy.settings.clear_on_match !== false;
+            document.getElementById('policy_enc_trigger_type').value = policy.settings.trigger_type || 'none';
+            document.getElementById('policy_enc_trigger_pattern').value = policy.settings.trigger_pattern || '';
+
             updatePolicyEditor();
             document.getElementById('policy_editor').style.display = 'block';
             document.getElementById('policy_editor_title').textContent = 'Edit Policy: ' + policy.name;
@@ -11162,16 +11824,10 @@ UI_HTML = r"""
 
         function updatePolicyEditor() {
             var type = document.getElementById('policy_type').value;
-            var defaultSettings = document.getElementById('default_policy_settings');
-            var subSettings = document.getElementById('sub_policy_settings');
-            
-            if (type === 'default') {
-                defaultSettings.style.display = 'block';
-                subSettings.style.display = 'none';
-            } else {
-                defaultSettings.style.display = 'none';
-                subSettings.style.display = 'block';
-            }
+            document.getElementById('default_policy_settings').style.display = type === 'default' ? 'block' : 'none';
+            document.getElementById('sub_policy_settings').style.display = type === 'sub' ? 'block' : 'none';
+            var enc = document.getElementById('enclosed_policy_settings');
+            if (enc) enc.style.display = type === 'enclosed' ? 'block' : 'none';
         }
 
         function savePolicyEditor() {
@@ -11190,6 +11846,18 @@ UI_HTML = r"""
                 policy.settings.split_pattern = document.getElementById('policy_default_split').value;
                 policy.settings.prefix = document.getElementById('policy_default_prefix').value;
                 policy.settings.suffix = document.getElementById('policy_default_suffix').value;
+            } else if (policy.type === 'enclosed') {
+                policy.settings.open_char = document.getElementById('policy_enc_open').value;
+                policy.settings.close_char = document.getElementById('policy_enc_close').value;
+                policy.settings.occurrence = parseInt(document.getElementById('policy_enc_occurrence').value) || 1;
+                policy.settings.outer_side = document.getElementById('policy_enc_outer_side').value;
+                policy.settings.inner_tag_type = parseInt(document.getElementById('policy_enc_inner_tag').value);
+                policy.settings.outer_tag_type = parseInt(document.getElementById('policy_enc_outer_tag').value);
+                policy.settings.strip_chars = document.getElementById('policy_enc_strip').value;
+                policy.settings.include_delimiters = document.getElementById('policy_enc_include_delims').checked;
+                policy.settings.clear_on_match = document.getElementById('policy_enc_clear').checked;
+                policy.settings.trigger_type = document.getElementById('policy_enc_trigger_type').value;
+                policy.settings.trigger_pattern = document.getElementById('policy_enc_trigger_pattern').value;
             } else {
                 policy.settings.trigger_type = document.getElementById('policy_sub_trigger_type').value;
                 policy.settings.trigger_pattern = document.getElementById('policy_sub_trigger_pattern').value;
@@ -11256,20 +11924,22 @@ UI_HTML = r"""
             }
 
             taggingPolicies.forEach(function(policy, index) {
-                var typeIcon = policy.type === 'default' ? '📍' : '⚡';
-                var typeColor = policy.type === 'default' ? 'green' : 'purple';
-                var typeText = policy.type === 'default' ? 'Default' : 'Sub-tagging';
-                
+                var typeIcon = policy.type === 'default' ? '📍' : (policy.type === 'enclosed' ? '🔠' : '⚡');
+                var typeColor = policy.type === 'default' ? 'green' : (policy.type === 'enclosed' ? 'amber' : 'purple');
+                var typeText = policy.type === 'default' ? 'Default' : (policy.type === 'enclosed' ? 'Between characters' : 'Sub-tagging');
+
                 var description = '';
                 if (policy.type === 'default') {
                     var tag1Name = RTPLUS_TYPES[policy.settings.tag1_type] ? RTPLUS_TYPES[policy.settings.tag1_type][0] : 'Unknown';
                     var tag2Name = RTPLUS_TYPES[policy.settings.tag2_type] ? RTPLUS_TYPES[policy.settings.tag2_type][0] : 'Unknown';
                     description = tag1Name + ' + ' + tag2Name + ' • Split: "' + (policy.settings.split_pattern || ' - ') + '"';
+                } else if (policy.type === 'enclosed') {
+                    description = describeEnclosedPolicy(policy);
                 } else {
                     var tagName = RTPLUS_TYPES[policy.settings.tag_type] ? RTPLUS_TYPES[policy.settings.tag_type][0] : 'Unknown';
                     description = tagName + ' • ' + policy.settings.condition.replace('_', ' ') + ': "' + policy.settings.pattern + '"';
                 }
-                
+
                 var policyHtml = `
                     <div class="bg-[#1a1a1a] border border-${typeColor}-800/50 rounded p-3">
                         <div class="flex items-center justify-between mb-2">
@@ -12831,11 +13501,12 @@ UI_HTML = r"""
 
         function createDataset() {
             var keys = Object.keys(datasets).map(function(n) { return parseInt(n); });
-            var nextNum = keys.length > 0 ? Math.max.apply(Math, keys) + 1 : 1;
-            var name = prompt('Enter dataset name:', 'Dataset ' + nextNum);
+            var suggested = keys.length > 0 ? Math.max.apply(Math, keys) + 1 : 1;
+            var name = prompt('Enter dataset name:', 'Dataset ' + suggested);
             if (!name) return;
 
-            // Copy RDS volume and soundcard from current dataset
+            // Copy RDS volume and soundcard from current dataset. The server picks
+            // the actual slot number so a stale page can't overwrite a dataset.
             var newState = {};
             if (datasets[currentDataset] && datasets[currentDataset].state) {
                 var currentState = datasets[currentDataset].state;
@@ -12847,16 +13518,16 @@ UI_HTML = r"""
                 }
             }
 
-            fetch('/datasets/' + nextNum, {
-                method: 'PUT',
+            fetch('/datasets', {
+                method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: name, state: newState })
             })
                 .then(function(res) {
-                    if (res.ok) {
-                        loadDatasets();
-                    }
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    return res.json();
                 })
+                .then(function() { loadDatasets(); })
                 .catch(function(e) { alert('Failed to create dataset'); });
         }
 
@@ -16214,6 +16885,9 @@ UI_HTML = r"""
                         result.tag1Len = content.length;
                     }
                     continue;
+                } else if (policy.type === 'enclosed') {
+                    applyEnclosedPolicyToResult(policy, content, result);
+                    continue;
                 } else if (policy.type === 'sub') {
                     if (policy.settings.trigger_type && policy.settings.trigger_type !== 'none') {
                         var tpat = policy.settings.trigger_pattern || '';
@@ -16275,7 +16949,10 @@ UI_HTML = r"""
             var policy = { id: Date.now(), name: 'New Policy', type: 'default', enabled: true,
                 settings: { tag1_type: 4, tag2_type: 1, split_pattern: ' - ', prefix: '', suffix: '',
                              trigger_type: 'none', trigger_pattern: '', condition: 'starts_with',
-                             pattern: '', action: 'tag_all', tag_type: 1, strip_pattern: false } };
+                             pattern: '', action: 'tag_all', tag_type: 1, strip_pattern: false,
+                             open_char: '"', close_char: '"', inner_tag_type: 1, outer_tag_type: 4,
+                             outer_side: 'auto', occurrence: 1, include_delimiters: false,
+                             strip_chars: ' -–—:,', clear_on_match: true } };
             ertTaggingPolicies.push(policy);
             renderERTTaggingPolicies();
             editERTTaggingPolicy(policy.id);
@@ -16299,6 +16976,19 @@ UI_HTML = r"""
             document.getElementById('ert_policy_sub_pattern').value = policy.settings.pattern || '';
             document.getElementById('ert_policy_sub_action').value = policy.settings.action || 'tag_all';
             document.getElementById('ert_policy_sub_strip_pattern').checked = policy.settings.strip_pattern || false;
+            populateRTPlusSelect(document.getElementById('ert_policy_enc_inner_tag'),
+                policy.settings.inner_tag_type !== undefined ? policy.settings.inner_tag_type : 1);
+            populateRTPlusSelect(document.getElementById('ert_policy_enc_outer_tag'),
+                policy.settings.outer_tag_type !== undefined ? policy.settings.outer_tag_type : 4);
+            document.getElementById('ert_policy_enc_open').value = policy.settings.open_char !== undefined ? policy.settings.open_char : '"';
+            document.getElementById('ert_policy_enc_close').value = policy.settings.close_char !== undefined ? policy.settings.close_char : '"';
+            document.getElementById('ert_policy_enc_occurrence').value = policy.settings.occurrence || 1;
+            document.getElementById('ert_policy_enc_outer_side').value = policy.settings.outer_side || 'auto';
+            document.getElementById('ert_policy_enc_strip').value = policy.settings.strip_chars !== undefined ? policy.settings.strip_chars : ' -–—:,';
+            document.getElementById('ert_policy_enc_include_delims').checked = policy.settings.include_delimiters || false;
+            document.getElementById('ert_policy_enc_clear').checked = policy.settings.clear_on_match !== false;
+            document.getElementById('ert_policy_enc_trigger_type').value = policy.settings.trigger_type || 'none';
+            document.getElementById('ert_policy_enc_trigger_pattern').value = policy.settings.trigger_pattern || '';
             updateERTPolicyEditor();
             document.getElementById('ert_policy_editor').style.display = 'block';
             document.getElementById('ert_policy_editor_title').textContent = 'Edit Policy: ' + policy.name;
@@ -16308,6 +16998,8 @@ UI_HTML = r"""
             var type = document.getElementById('ert_policy_type').value;
             document.getElementById('ert_default_policy_settings').style.display = type === 'default' ? 'block' : 'none';
             document.getElementById('ert_sub_policy_settings').style.display = type === 'sub' ? 'block' : 'none';
+            var enc = document.getElementById('ert_enclosed_policy_settings');
+            if (enc) enc.style.display = type === 'enclosed' ? 'block' : 'none';
         }
 
         function saveERTPolicyEditor() {
@@ -16322,6 +17014,18 @@ UI_HTML = r"""
                 policy.settings.split_pattern = document.getElementById('ert_policy_default_split').value;
                 policy.settings.prefix = document.getElementById('ert_policy_default_prefix').value;
                 policy.settings.suffix = document.getElementById('ert_policy_default_suffix').value;
+            } else if (policy.type === 'enclosed') {
+                policy.settings.open_char = document.getElementById('ert_policy_enc_open').value;
+                policy.settings.close_char = document.getElementById('ert_policy_enc_close').value;
+                policy.settings.occurrence = parseInt(document.getElementById('ert_policy_enc_occurrence').value) || 1;
+                policy.settings.outer_side = document.getElementById('ert_policy_enc_outer_side').value;
+                policy.settings.inner_tag_type = parseInt(document.getElementById('ert_policy_enc_inner_tag').value);
+                policy.settings.outer_tag_type = parseInt(document.getElementById('ert_policy_enc_outer_tag').value);
+                policy.settings.strip_chars = document.getElementById('ert_policy_enc_strip').value;
+                policy.settings.include_delimiters = document.getElementById('ert_policy_enc_include_delims').checked;
+                policy.settings.clear_on_match = document.getElementById('ert_policy_enc_clear').checked;
+                policy.settings.trigger_type = document.getElementById('ert_policy_enc_trigger_type').value;
+                policy.settings.trigger_pattern = document.getElementById('ert_policy_enc_trigger_pattern').value;
             } else {
                 policy.settings.trigger_type = document.getElementById('ert_policy_sub_trigger_type').value;
                 policy.settings.trigger_pattern = document.getElementById('ert_policy_sub_trigger_pattern').value;
@@ -16374,14 +17078,16 @@ UI_HTML = r"""
                 return;
             }
             ertTaggingPolicies.forEach(function(policy, index) {
-                var typeIcon = policy.type === 'default' ? '📍' : '⚡';
-                var typeColor = policy.type === 'default' ? 'green' : 'purple';
-                var typeText = policy.type === 'default' ? 'Default' : 'Sub-tagging';
+                var typeIcon = policy.type === 'default' ? '📍' : (policy.type === 'enclosed' ? '🔠' : '⚡');
+                var typeColor = policy.type === 'default' ? 'green' : (policy.type === 'enclosed' ? 'amber' : 'purple');
+                var typeText = policy.type === 'default' ? 'Default' : (policy.type === 'enclosed' ? 'Between characters' : 'Sub-tagging');
                 var description = '';
                 if (policy.type === 'default') {
                     var t1n = RTPLUS_TYPES[policy.settings.tag1_type] ? RTPLUS_TYPES[policy.settings.tag1_type][0] : 'Unknown';
                     var t2n = RTPLUS_TYPES[policy.settings.tag2_type] ? RTPLUS_TYPES[policy.settings.tag2_type][0] : 'Unknown';
                     description = t1n + ' + ' + t2n + ' • Split: "' + (policy.settings.split_pattern || ' - ') + '"';
+                } else if (policy.type === 'enclosed') {
+                    description = describeEnclosedPolicy(policy);
                 } else {
                     var ttn = RTPLUS_TYPES[policy.settings.tag_type] ? RTPLUS_TYPES[policy.settings.tag_type][0] : 'Unknown';
                     description = ttn + ' • ' + (policy.settings.condition || '').replace('_', ' ') + ': "' + (policy.settings.pattern || '') + '"';
