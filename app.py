@@ -55,7 +55,7 @@ except ImportError:
     print("[Updater] updater.py not found - update functionality disabled")
 
 # --- VERSION ---
-VERSION = "v1.4"
+VERSION = "v1.5"
 
 # --- SETTINGS ---
 # Host API filtering: auto-detect based on OS, can be overridden via RDS_HOSTAPI env var
