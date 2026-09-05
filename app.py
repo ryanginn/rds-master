@@ -1,6 +1,6 @@
 """
     RDS Master Open Source RDS Encoder
-    Copyright (C) 2026 Rían Mac Guinneál (FMDX.ie)
+    Copyright (C) 2026 Rían Mac Fhionnghaile (FMDX.ie)
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -380,7 +380,7 @@ default_state = {
     "pi": "2FFF", "pty": 0, "rbds": False, "tp": 1, "ta": 0, "ms": 1,
     "di_stereo": 1, "di_head": 0, "di_comp": 1, "di_dyn": 0,
     "en_af": 1, "af_list": "87.6, 87.7", "af_method": "A", "af_pairs": "[]",
-    "en_eon": 0, "eon_services": "[]",
+    "en_eon": 0, "eon_services": "[]", "eon_ta_burst": 8,
     
     # Text
     "ps_dynamic": "RDSMASTR", "ps_centered": False, "ps_group_version": "0A",
@@ -408,6 +408,8 @@ default_state = {
     "ecc": "E3", "lic": "09", "tz_offset": 0.0, "en_ct": 1, "en_id": 1,
     "en_pin": 0, "pin_day": 0, "pin_hour": 0, "pin_minute": 0,
     "ps_long_32": f"RDS MASTER {VERSION}", "en_lps": 1, "lps_centered": False, "lps_cr": True,
+    # Group 15B - fast basic tuning and switching information (off by default)
+    "en_fast_tuning": 0, "fast_tuning_rate": 2, "fast_tuning_ta_burst": 8,
     "ptyn": "RDSMASTR", "en_ptyn": 1, "ptyn_centered": False,
     "en_dab": 0, "dab_channel": "12C", "dab_eid": "2E01", "dab_mode": 1, "dab_es_flag": 0,
     "dab_sid": "0000", "dab_variant": 0,
@@ -1113,10 +1115,10 @@ def _atomic_write_json(filepath, data):
         raise
 
 def save_config():
-    """Save configuration to datasets.json."""
+    """Save configuration to datasets.json. Returns True when it reached disk."""
     if not datasets_file_ready():
         print("⚠ Skipping config save — datasets.json is still unreadable.")
-        return
+        return False
     try:
         # Load existing data
         data = {}
@@ -1200,14 +1202,16 @@ def save_config():
             json.dumps(data)
         except (TypeError, ValueError) as e:
             print(f"Error: State contains non-serializable data: {e}")
-            return
-        
+            return False
+
         # Save atomically (temp file + rename) so file is never left corrupted
         _atomic_write_json(DATASETS_FILE, data)
+        return True
     except Exception as e:
         print(f"Error saving config: {e}")
         import traceback
         traceback.print_exc()
+        return False
 
 # --- DATASETS ---
 # DATASETS_FILE already defined above near CONFIG_FILE
@@ -1582,6 +1586,7 @@ def monitor_pusher_loop():
             monitor_data["di_head"] = state.get("di_head", 0)
             monitor_data["di_comp"] = state.get("di_comp", 1)
             monitor_data["di_dyn"] = state.get("di_dyn", 0)
+            monitor_data["en_fast_tuning"] = bool(state.get("en_fast_tuning", 0))
             monitor_data["rbds"] = state.get("rbds", False)
             
             # EON networks list
@@ -1675,6 +1680,7 @@ def monitor_pusher_loop():
                  "pilot_generated": False,
                  "tp": 0, "ta": 0, "ms": 0,
                  "di_stereo": 0, "di_head": 0, "di_comp": 0, "di_dyn": 0,
+                 "en_fast_tuning": False,
                  "rbds": False, "eon_networks": [],
                  "rds2_enabled": False, "rds2_carrier_count": 0, "rds2_logo_filename": "", "rds2_carrier_levels": [0, 0, 0],
                  "en_ari": False, "ari_region": "", "ari_bk_freq": 0, "ari_announcement": False, "ari_announcement_mode": "manual"
@@ -1872,7 +1878,19 @@ def dynamic_control_loop():
                                 continue
 
                     # Apply the new value to state
-                    if new_value is not None and rds_param in state:
+                    is_eon_param = rds_param.startswith("eon_ta:") or rds_param.startswith("eon_pin:")
+                    if new_value is not None and (rds_param in state or is_eon_param):
+                        # Per-service EON overrides are keyed by PI(ON), not by a state key
+                        if is_eon_param:
+                            if rds_param.startswith("eon_ta:"):
+                                try:
+                                    new_value = 1 if int(new_value) else 0
+                                except (TypeError, ValueError):
+                                    new_value = 1 if str(new_value).strip().lower() in (
+                                        "true", "yes", "on") else 0
+                            dynamic_overrides[rds_param] = new_value
+                            continue
+
                         # Special handling for certain parameters
                         if rds_param in ["ms", "tp", "ta"]:
                             new_value = int(new_value) if isinstance(new_value, (int, float, bool)) else 0
@@ -1976,12 +1994,17 @@ class RDSHelper:
             reg = (reg << 1) & 0x3FFFFFF
         return ((reg >> 16) & 0x3FF) ^ offset
 
+    # Sentinel for b4_val meaning "block 4 repeats block 2 verbatim" (group 15B).
+    MIRROR_BLOCK2 = object()
+
     @staticmethod
     def get_group_bits(g_type, ver, b2_tail, b3_val, b4_val):
         try: pi_v = int(get_effective_value("pi"), 16)
         except: pi_v = 0x0000
         b1 = (pi_v << 10) | RDSHelper.crc(pi_v, OFFSETS['A'])
         b2_v = (int(g_type) << 12) | (int(ver) << 11) | (int(get_effective_value("tp")) << 10) | (int(get_effective_value("pty")) << 5) | (int(b2_tail) & 0x1F)
+        if b4_val is RDSHelper.MIRROR_BLOCK2:
+            b4_val = b2_v  # guarantees blocks 2 and 4 are identical, even if state changes
         b2 = (b2_v << 10) | RDSHelper.crc(b2_v, OFFSETS['B'])
         b3 = (int(b3_val) << 10) | RDSHelper.crc(b3_val, OFFSETS['Cp'] if ver else OFFSETS['C'])
         b4 = (int(b4_val) << 10) | RDSHelper.crc(b4_val, OFFSETS['D'])
@@ -1996,6 +2019,8 @@ class RDSHelper:
         try: pi_v = int(get_effective_value("pi"), 16)
         except: pi_v = 0x0000
         b2_v = (int(g_type) << 12) | (int(ver) << 11) | (int(get_effective_value("tp")) << 10) | (int(get_effective_value("pty")) << 5) | (int(b2_tail) & 0x1F)
+        if b4_val is RDSHelper.MIRROR_BLOCK2:
+            b4_val = b2_v
         return (pi_v & 0xFFFF, b2_v & 0xFFFF, int(b3_val) & 0xFFFF, int(b4_val) & 0xFFFF)
     
     @staticmethod
@@ -2353,6 +2378,12 @@ class PCStatusMonitor:
 class RDSScheduler:
     def __init__(self):
         self.ps_ptr, self.rt_ptr, self.ptyn_ptr, self.lps_ptr, self.af_ptr = 0, 0, 0, 0, 0
+        self.ft_ptr = 0  # Group 15B DI segment pointer (C1/C0 address, 0-3)
+        self.ft_ta_burst = 0  # Remaining 15B groups to send after a TA change
+        self.eon_b_idx = 0      # Group 14B service pointer (separate from the 14A machine)
+        self.eon_b_burst = 0    # Remaining 14B groups to send after a TA(ON) change
+        self._last_eon_ta_sig = None
+        self._last_ta_state = int(state.get("ta", 0) or 0)
         self.start_time = time.time()
         self.ct_min_lock = -1
         self.last_rt_content = ""
@@ -2420,6 +2451,151 @@ class RDSScheduler:
 
         # Cache for last generated raw blocks (for serial output)
         self.last_raw_blocks = (0, 0, 0, 0)
+
+    def current_ps_frame(self):
+        """The 8-character PS frame that should be on air right now, taken from the
+        parsed timed sequence. Filler groups use this so the raw source - with its
+        "Ns:" timing syntax and unresolved placeholders - can never reach the air."""
+        if not self.ps_sequence:
+            raw = self.get_text("ps_dynamic")
+            self.ps_sequence = self.parse_smart(raw, 8, state.get('ps_centered', False))
+        if not self.ps_sequence:
+            return "RDS_PRO "
+        txt = self.ps_sequence[self.ps_seq_idx % len(self.ps_sequence)][1]
+        return (txt or "RDS_PRO ").ljust(8)[:8]
+
+    def emit_fast_tuning_group(self):
+        """Group 15B - "fast basic tuning and switching information".
+
+        Carries no text: it repeats the tuning flags a receiver needs to lock on, so
+        acquisition is quicker than waiting for the 0A/0B rotation.
+          Block 1: PI code
+          Block 2: group type / TP / PTY / TA / M/S / DI bit / C1-C0
+          Block 3: PI code again (version B group, offset C')
+          Block 4: identical to block 2
+        The DI bits are sent one at a time, addressed by C1/C0 exactly as in group 0:
+        00 -> d3, 01 -> d2, 10 -> d1, 11 -> d0. Every field is read fresh from state,
+        so a burst always carries the latest information.
+        """
+        seg = self.ft_ptr % 4
+        self.ft_ptr += 1
+        di_bit = [state['di_dyn'], state['di_comp'], state['di_head'], state['di_stereo']][seg]
+        tail = (get_effective_value("ta") << 4) | (get_effective_value("ms") << 3) | (di_bit << 2) | seg
+        try:
+            pi_v = int(get_effective_value("pi"), 16)
+        except (ValueError, TypeError):
+            pi_v = 0x0000
+        monitor_data["fast_tuning_seg"] = seg
+        # MIRROR_BLOCK2 makes block 4 an exact copy of block 2, per the 15B spec
+        return self._get_group(15, 1, tail, pi_v, RDSHelper.MIRROR_BLOCK2)
+
+    def eon_service_list(self):
+        """Parsed EON service list, or [] when unset/unparseable."""
+        try:
+            raw = state.get("eon_services", "[]")
+            svcs = json.loads(raw) if isinstance(raw, str) else raw
+            return svcs if isinstance(svcs, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def eon_service_value(svc, key, default=0):
+        """Per-service EON value, honouring a Dynamic Control override.
+
+        Overrides are keyed by PI(ON) rather than list position, so reordering or
+        editing the service list never points a rule at the wrong station:
+            eon_ta:2202     -> TA(ON) for the service whose PI(ON) is 2202
+            eon_pin:2202    -> PIN(ON) for that service (as "day,hour,minute" or an int)
+        """
+        pi = str(svc.get('pi_on', '')).strip().upper()
+        if pi:
+            ov = dynamic_overrides.get(f"eon_{key}:{pi}")
+            if ov is not None:
+                return ov
+        return svc.get(key, default)
+
+    def eon_service_pin(self, svc):
+        """16-bit PIN(ON) for a service: [day:5][hour:5][minute:6], or None if unset."""
+        ov = self.eon_service_value(svc, 'pin', None)
+        if ov is not None and not isinstance(ov, dict):
+            # A rule may deliver "day,hour,minute" or a ready-made 16-bit number
+            try:
+                if isinstance(ov, str) and ',' in ov:
+                    d, h, m = [int(x.strip()) for x in ov.split(',')[:3]]
+                    return ((d & 0x1F) << 11) | ((h & 0x1F) << 6) | (m & 0x3F)
+                return int(ov) & 0xFFFF
+            except (TypeError, ValueError):
+                pass
+        if not svc.get('en_pin'):
+            return None
+        try:
+            day = int(svc.get('pin_day', 0)) & 0x1F
+            hour = int(svc.get('pin_hour', 0)) & 0x1F
+            minute = int(svc.get('pin_minute', 0)) & 0x3F
+        except (TypeError, ValueError):
+            return None
+        return (day << 11) | (hour << 6) | minute
+
+    def _eon_next_service(self, service_count):
+        """Finish this service's variant cycle and start the next one on PS."""
+        self.eon_service_idx += 1
+        if self.eon_service_idx >= max(1, service_count):
+            self.eon_service_idx = 0
+        self.eon_variant = 0
+        self.eon_ps_seg = 0
+        self.eon_af_idx = -1
+        self.eon_mapped_idx = 0
+
+    def _eon_ta_signature(self):
+        """TA(ON) flags across the configured services, for change detection."""
+        return tuple(int(self.eon_service_value(s, 'ta', 0) or 0) & 1
+                     for s in self.eon_service_list() if isinstance(s, dict))
+
+    def emit_eon_14b_group(self):
+        """Group 14B - EON traffic-announcement switching (EN 50067 3.2.1.8).
+
+          Block 1: PI of this station (tuned network)
+          Block 2: group type 14 / version B / TP / PTY, then
+                   TP(ON) in b4, TA(ON) in b3, b2-b0 unused (sent as 0)
+          Block 3: PI of the tuned network again (version B group, offset C')
+          Block 4: PI(ON) - the other network's PI code
+
+        Carries no variant data, so it walks the service list on its own pointer and
+        never disturbs the 14A variant state machine. Returns None when no EON
+        services are configured, so callers can fall back.
+        """
+        eon_services = [s for s in self.eon_service_list() if isinstance(s, dict)]
+        if not eon_services:
+            return None
+        svc = eon_services[self.eon_b_idx % len(eon_services)]
+        self.eon_b_idx += 1
+        try:
+            pi_on = int(svc.get('pi_on', 'C000'), 16) & 0xFFFF
+        except (ValueError, TypeError):
+            pi_on = 0xC000
+        try:
+            pi_tn = int(get_effective_value("pi"), 16) & 0xFFFF
+        except (ValueError, TypeError):
+            pi_tn = 0x0000
+        ta_on = int(self.eon_service_value(svc, 'ta', 0) or 0) & 1
+        b2_tail = ((int(svc.get('tp', 0) or 0) & 1) << 4) | (ta_on << 3)
+        monitor_data["eon_14b"] = f"{pi_on:04X} TP={(b2_tail >> 4) & 1} TA={(b2_tail >> 3) & 1}"
+        return self._get_group(14, 1, b2_tail, pi_tn, pi_on)
+
+    def ps_filler_group(self, reason=""):
+        """Emit a normal 0A PS group in place of a group we cannot produce, so the
+        slot carries valid PS instead of nothing."""
+        if reason:
+            if not hasattr(self, '_filler_warned'):
+                self._filler_warned = set()
+            if reason not in self._filler_warned:
+                self._filler_warned.add(reason)
+                print(f"[Scheduler] {reason} - sending PS instead", flush=True)
+        txt_bytes = text_to_rds_bytes(self.current_ps_frame())
+        seg = self.ps_ptr % 4
+        self.ps_ptr += 1
+        tail = (get_effective_value("ta")<<4)|(get_effective_value("ms")<<3)|([state['di_dyn'],state['di_comp'],state['di_head'],state['di_stereo']][seg]<<2)|seg
+        return self._get_group(0, 0, tail, 0xE0E0, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
 
     def _get_group(self, g_type, ver, b2_tail, b3_val, b4_val):
         """Helper to get group bits and cache raw blocks for serial output"""
@@ -3554,14 +3730,23 @@ class RDSScheduler:
             frames.append(pad(curr))
         return frames
 
+    # A "/" separates sequence entries when it has whitespace around it, when the next
+    # entry opens with a timing token, or when it sits between two non-digits. A bare
+    # slash between digits belongs to the text - a date such as 05/09/2026 must survive
+    # intact rather than being chopped into three separate frames.
+    SEQ_SPLIT_RE = re.compile(r"\s+/\s+|\s*/(?=\s*\d+(?:\.\d+)?s:)|(?<!\d)\s*/\s*(?!\d)")
+    TIMED_ENTRY_RE = re.compile(r"\s*(\d+(?:\.\d+)?)s:(.*)")
+
     def parse_smart(self, raw, width, center):
         seq = []
-        if re.match(r"\s*\d+(?:\.\d+)?s:", raw):
-            # Only treat timed syntax when the string starts with Ns: or N.Ns: tokens.
-            # Split on whitespace-delimited slashes so literal slashes remain intact.
-            for p in re.split(r"\s*/\s*", raw):
+        parts = self.SEQ_SPLIT_RE.split(raw) if raw else []
+        # Treat this as a timed sequence when ANY entry carries a timing token, not just
+        # the first. Anchoring on the first entry meant a leading date or plain-text entry
+        # hid the "Ns:" on every later entry, which then went to air literally.
+        if any(self.TIMED_ENTRY_RE.match(p) for p in parts):
+            for p in parts:
                 # Preserve trailing spaces in content; allow leading spaces before the number
-                m = re.match(r"\s*(\d+(?:\.\d+)?)s:(.*)", p)
+                m = self.TIMED_ENTRY_RE.match(p)
                 if m:
                     content = m.group(2)
                     # Skip entries with blank/empty content (e.g., from empty file reads)
@@ -3622,11 +3807,26 @@ class RDSScheduler:
                 if eon_services:  # Only add if services exist
                     for _ in range(4):  # Send 4 Group 14A (~15% overall)
                         optional_groups.append((14,0))
+                    # 14B is not optional when EON is in use: it is what actually
+                    # signals TP(ON)/TA(ON) to receivers. One per cycle per service,
+                    # capped so a long EON list can't crowd out PS and RadioText.
+                    for _ in range(min(len(eon_services), 4)):
+                        optional_groups.append((14,1))
             except:
                 pass  # Skip EON if parsing fails
 
         if state["en_ptyn"]: optional_groups.append((10,0))  # +4% (single group)
         if state["en_id"]: optional_groups.append((1,0))
+
+        # Group 15B - fast basic tuning. Repeated a few times per cycle since its
+        # whole purpose is to shorten a receiver's acquisition time.
+        if state.get("en_fast_tuning"):
+            try:
+                ft_rate = max(1, min(8, int(state.get("fast_tuning_rate", 2))))
+            except (TypeError, ValueError):
+                ft_rate = 2
+            for _ in range(ft_rate):
+                optional_groups.append((15, 1))
 
         # Transparent Data Channels
         if state.get("en_tdc_5a"): optional_groups.append((5,0))  # Group 5A
@@ -3748,11 +3948,58 @@ class RDSScheduler:
             b4 = ((now.hour & 0x0F) << 12) | (now.minute << 6) | ((1 if total_offset<0 else 0) << 5) | int(abs(total_offset)*2)
             return self._get_group(4, 0, (mjd>>15)&3, ((mjd&0x7FFF)<<1)|((now.hour>>4)&1), b4)
 
+        # Group 15B burst on a TA change. Fast tuning exists to shorten acquisition, and a
+        # traffic announcement starting is exactly when receivers need to be told quickly -
+        # so jump the queue and fire a burst carrying the current flags.
+        if state.get("en_fast_tuning"):
+            ta_now = 1 if get_effective_value("ta") else 0
+            if ta_now != self._last_ta_state:
+                self._last_ta_state = ta_now
+                if ta_now:
+                    try:
+                        self.ft_ta_burst = max(0, min(64, int(state.get("fast_tuning_ta_burst", 8))))
+                    except (TypeError, ValueError):
+                        self.ft_ta_burst = 8
+                    # Restart the DI address so the burst delivers a complete d3..d0 set
+                    self.ft_ptr = 0
+            if self.ft_ta_burst > 0:
+                self.ft_ta_burst -= 1
+                return self.emit_fast_tuning_group()
+        else:
+            # Keep tracking TA while disabled so enabling it later doesn't fire a stale burst
+            self._last_ta_state = 1 if get_effective_value("ta") else 0
+            self.ft_ta_burst = 0
+
+        # Group 14B burst when a TA(ON) flag changes. Signalling an other-network traffic
+        # announcement is the whole job of 14B, so get it out immediately rather than
+        # waiting for the slot to come round.
+        if state.get("en_eon"):
+            ta_on_sig = self._eon_ta_signature()
+            if ta_on_sig != self._last_eon_ta_sig:
+                # Burst on BOTH edges: a receiver that switched away for a traffic
+                # announcement needs to be told when it ends, not just when it starts.
+                if self._last_eon_ta_sig is not None:
+                    try:
+                        self.eon_b_burst = max(0, min(64, int(state.get("eon_ta_burst", 8))))
+                    except (TypeError, ValueError):
+                        self.eon_b_burst = 8
+                self._last_eon_ta_sig = ta_on_sig
+            if self.eon_b_burst > 0:
+                self.eon_b_burst -= 1
+                grp = self.emit_eon_14b_group()
+                if grp is not None:
+                    return grp
+                self.eon_b_burst = 0
+        else:
+            self._last_eon_ta_sig = None
+            self.eon_b_burst = 0
+
         if state["scheduler_auto"]:
             # Recompute schedule only when relevant state changes or at the start of each cycle.
             sched_sig = (state["en_lps"], state.get("en_eon"), state["en_ptyn"], state["en_id"],
                          state.get("en_dab"), state["en_rt_plus"], state.get("en_tdc_5a"),
                          state.get("en_tdc_5b"), state.get("en_ert"), state.get("en_ert_rtplus"),
+                         state.get("en_fast_tuning"), state.get("fast_tuning_rate"),
                          self._custom_groups_cache_str)
             cached = getattr(self, '_auto_schedule_cache', None)
             if (cached is None or self._auto_schedule_sig != sched_sig or
@@ -3868,11 +4115,29 @@ class RDSScheduler:
         if g_type == 0:
             raw = self.get_text("ps_dynamic")
             sig = f"{raw}_{state['ps_centered']}"
+            # Track the UNRESOLVED source separately. When only a date/time placeholder
+            # ticks over, the sequence must be refreshed in place - restarting it would
+            # park a PS containing \MN\ or \S\ on the first entry forever and cut every
+            # frame short, because the text changes faster than one frame is sent.
+            src_sig = f"{state.get('ps_dynamic', '')}_{state['ps_centered']}"
             if sig != self.last_ps_content:
-                self.last_ps_content, self.ps_ptr = sig, 0
-                if state["scheduler_auto"]: self.burst_counter = 16 
-                self.ps_sequence = self.parse_smart(raw, 8, state['ps_centered'])
-                self.ps_seq_idx, self.ps_seq_start_time = 0, time.time()
+                structure_changed = src_sig != getattr(self, 'last_ps_src', None)
+                self.last_ps_content, self.last_ps_src = sig, src_sig
+                new_seq = self.parse_smart(raw, 8, state['ps_centered'])
+                if structure_changed or not self.ps_sequence:
+                    # The operator (or a file/URL source) actually changed the PS
+                    self.ps_ptr = 0
+                    if state["scheduler_auto"]: self.burst_counter = 16
+                    self.ps_sequence = new_seq
+                    self.ps_seq_idx, self.ps_seq_start_time = 0, time.time()
+                else:
+                    # Same PS, new placeholder values: keep our position in the sequence
+                    # and only restart the frame whose text actually changed.
+                    old_txt = self.ps_sequence[self.ps_seq_idx % len(self.ps_sequence)][1]
+                    self.ps_sequence = new_seq
+                    if new_seq[self.ps_seq_idx % len(new_seq)][1] != old_txt:
+                        self.ps_ptr = 0
+
             
             if not self.ps_sequence: self.ps_sequence = [(10, "RDS_PRO ")]
             dur, txt = self.ps_sequence[self.ps_seq_idx % len(self.ps_sequence)]
@@ -3941,9 +4206,11 @@ class RDSScheduler:
                                      if f1 == 205:
                                          print(f"Warning: Skipping invalid AF frequency: {afs[self.af_ptr]}")
                                          self.af_ptr += 1
-                                         # Skip this iteration, try next frequency
-                                         return self.next()
-                                     b3, self.af_ptr = (f1<<8)|f2, (self.af_ptr+2) if self.af_ptr+2 < len(afs) else 0
+                                         # Send the "no AF" filler this tick; re-entering
+                                         # next() here recursed once per bad frequency.
+                                         b3 = 0xE0E0
+                                     else:
+                                         b3, self.af_ptr = (f1<<8)|f2, (self.af_ptr+2) if self.af_ptr+2 < len(afs) else 0
                                  else:
                                      # All frequencies sent, loop back
                                      self.af_ptr = 0
@@ -4032,14 +4299,9 @@ class RDSScheduler:
             rt_text_check = get_effective_value("rt_text") or ""
             rt_messages = self.get_rt_messages()
             if rt_text_check.strip() in ["", "None"] and not rt_messages:
-                # No valid RT - advance schedule and get next group type
-                if state["scheduler_auto"]:
-                    schedule = getattr(self, '_auto_schedule_cache', [(0,0)])
-                else:
-                    schedule = self.parse_schedule_string(state["group_sequence"])
-                g_type, g_ver = schedule[self.schedule_ptr % len(schedule)]
-                self.schedule_ptr += 1
-                return self.next()  # Recursively get next group
+                # Nothing to send. Use the slot for PS rather than re-entering next(),
+                # which recursed until the stack blew on a schedule of nothing but 2A.
+                return self.ps_filler_group("RadioText is scheduled but empty")
 
             # Check for new unified message system first
             if rt_messages:
@@ -4646,17 +4908,10 @@ class RDSScheduler:
                 eon_services = []
 
             if not eon_services:
-                # No services configured - skip Group 14A entirely
-                # Advance schedule pointer and get next group
-                if state["scheduler_auto"]:
-                    schedule = getattr(self, '_auto_schedule_cache', [(0,0)])
-                else:
-                    schedule = self.parse_schedule_string(state["group_sequence"])
-                g_type, g_ver = schedule[self.schedule_ptr % len(schedule)]
-                self.schedule_ptr += 1
-                # Fall through to next group (will be handled by subsequent checks)
-                # Avoid recursion - just return a basic 0A PS group as fallback
-                return self.next()
+                # No services configured, so there is nothing to announce. Send PS in the
+                # slot instead. This used to call self.next(), which recursed until the
+                # stack blew if the schedule contained nothing but group 14.
+                return self.ps_filler_group("EON is enabled but no services are configured")
 
             # Initialize EON state tracking
             if not hasattr(self, 'eon_service_idx'):
@@ -4665,6 +4920,11 @@ class RDSScheduler:
                 self.eon_ps_seg = 0   # PS segment (0-3)
                 self.eon_af_idx = -1  # AF index (-1=count code, 0+=frequencies)
                 self.eon_mapped_idx = 0  # Index for mapped frequency pairs
+
+            if g_ver == 1:
+                grp = self.emit_eon_14b_group()
+                if grp is not None:
+                    return grp
 
             service = eon_services[self.eon_service_idx % len(eon_services)]
 
@@ -4907,19 +5167,33 @@ class RDSScheduler:
             # Variant 13: PTY(ON) + TA
             elif self.eon_variant == 13:
                 b2_tail = (tp_on << 4) | 0x0D  # Variant 13
-                pty_on = service.get('pty', 0) & 0x1F
-                ta_on = service.get('ta', 0) & 1
+                pty_on = int(service.get('pty', 0) or 0) & 0x1F
+                ta_on = int(self.eon_service_value(service, 'ta', 0) or 0) & 1
 
-                b3_val = (pty_on << 11) | (ta_on << 10)
+                # Block 3 layout: PTY(ON) in b15-b11, b10-b1 reserved (zero),
+                # TA(ON) in b0. TA used to be written to b10, so analysers read it
+                # as 0 and the announcement never reached receivers.
+                # Confirmed against an off-air RTE R1 capture: PTY 7 + TA 1 = 0x3801.
+                b3_val = (pty_on << 11) | ta_on
 
-                # After PTY+TA, move to next service or back to PS
-                self.eon_service_idx += 1
-                if self.eon_service_idx >= len(eon_services):
-                    self.eon_service_idx = 0
-                self.eon_variant = 0  # Start with PS for next service
-                self.eon_ps_seg = 0
-                self.eon_af_idx = -1
-                self.eon_mapped_idx = 0
+                # Send PIN(ON) next if this service has one, otherwise move on
+                if self.eon_service_pin(service) is not None:
+                    self.eon_variant = 14
+                else:
+                    self._eon_next_service(len(eon_services))
+
+            # Variant 14: PIN(ON) - Programme Item Number of the other network
+            elif self.eon_variant == 14:
+                b2_tail = (tp_on << 4) | 0x0E  # Variant 14
+                pin_on = self.eon_service_pin(service)
+                if pin_on is None:
+                    # PIN was cleared mid-cycle - skip the slot rather than send zeros
+                    b2_tail = (tp_on << 4) | 0x0D
+                    b3_val = (int(service.get('pty', 0) or 0) & 0x1F) << 11
+                else:
+                    # Same packing as group 1A: [day:5][hour:5][minute:6]
+                    b3_val = pin_on & 0xFFFF
+                self._eon_next_service(len(eon_services))
 
             else:
                 # Invalid variant - reset
@@ -4928,9 +5202,17 @@ class RDSScheduler:
                 self.eon_variant = 0
                 self.eon_ps_seg = 0
 
-            # Regular EON uses 14A format (variants 0-13)
-            # 14B is only used for TA burst
+            # Variants 0-13 are carried in 14A; 14B is handled above
             return self._get_group(14, 0, b2_tail, b3_val, pi_on)  # 14A format
+
+        elif g_type == 4:
+            # Clock Time is emitted by the minute-boundary block at the top of next().
+            # A 4A sent at any other moment would carry a time that is not aligned to
+            # second 0 and would set receiver clocks wrong, so use the slot for PS.
+            return self.ps_filler_group()
+
+        elif g_type == 15 and g_ver == 1 and (not state["scheduler_auto"] or state.get("en_fast_tuning")):
+            return self.emit_fast_tuning_group()
 
         elif g_type == 15 and (not state["scheduler_auto"] or state["en_lps"]):
             raw = self.get_text("ps_long_32")
@@ -4965,7 +5247,9 @@ class RDSScheduler:
             # Pad segment data if needed
             while len(lps_txt) < (seg + 1) * 4:
                 lps_txt += b'\x00'
-            return self._get_group(15, g_ver, seg, (lps_txt[seg*4]<<8)|lps_txt[seg*4+1], (lps_txt[seg*4+2]<<8)|lps_txt[seg*4+3])
+            # Long PS is always a version A group - blocks 3 and 4 both carry text,
+            # so it must never be emitted as 15B (which is the fast-tuning group).
+            return self._get_group(15, 0, seg, (lps_txt[seg*4]<<8)|lps_txt[seg*4+1], (lps_txt[seg*4+2]<<8)|lps_txt[seg*4+3])
 
         elif g_type == 10 and (not state["scheduler_auto"] or state["en_ptyn"]):
             raw = self.get_text("ptyn")
@@ -5091,23 +5375,10 @@ class RDSScheduler:
         elif g_type == 8:
             # Group 8A: Traffic Message Channel (TMC) - not implemented
             # Send PS group instead of TMC to prevent blanks (TMC requires complex message structure)
-            raw = self.get_text("ps_dynamic") or "RDS_PRO "
-            txt = raw.ljust(8)[:8]
-            txt_bytes = text_to_rds_bytes(txt)
-            seg = self.ps_ptr % 4
-            self.ps_ptr += 1
-            tail = (get_effective_value("ta")<<4)|(get_effective_value("ms")<<3)|([state['di_dyn'],state['di_comp'],state['di_head'],state['di_stereo']][seg]<<2)|seg
-            return self._get_group(0, 0, tail, 0xE0E0, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
+            return self.ps_filler_group("Group 8A (TMC) is not implemented")
 
-        # Group not implemented - send PS group to prevent recursion and blanks
-        # NOTE: Pointer was already incremented at line 1295
-        raw = self.get_text("ps_dynamic") or "RDS_PRO "
-        txt = raw.ljust(8)[:8]
-        txt_bytes = text_to_rds_bytes(txt)
-        seg = self.ps_ptr % 4
-        self.ps_ptr += 1
-        tail = (get_effective_value("ta")<<4)|(get_effective_value("ms")<<3)|([state['di_dyn'],state['di_comp'],state['di_head'],state['di_stereo']][seg]<<2)|seg
-        return self._get_group(0, 0, tail, 0xE0E0, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
+        # Group not implemented (or disabled) - send PS to prevent recursion and blanks
+        return self.ps_filler_group(f"Group {g_type}{'B' if g_ver else 'A'} produced nothing")
 
 # --- RDS2 DATA GENERATOR ---
 class RDS2Generator:
@@ -6409,6 +6680,21 @@ def import_custom_groups():
         if not isinstance(custom_groups, list):
             return jsonify({'error': 'Invalid format: must be array'}), 400
 
+        # A parse that yielded nothing must never be allowed to replace a working set.
+        # This is how an unrecognised paste used to silently wipe every custom group
+        # while still reporting "imported".
+        if not custom_groups:
+            hint = {
+                'text': "Expected 'TYPE VERSION B2 B3 B4 [ENABLED]' (e.g. 8 0 1F CAFE BEEF 1) "
+                        "or 'B2 B3 B4' (e.g. E0 594C 6201), one group per line.",
+                'rdsspy': "No groups recognised in the RDS Spy log.",
+                'url': "The URL returned nothing that parsed as custom groups.",
+                'json': "The JSON contained no groups.",
+            }.get(source_type, "No groups were recognised.")
+            print(f"[IMPORT] Nothing parsed from {source_type} input - refusing to overwrite", flush=True)
+            return jsonify({'error': f'No custom groups found. {hint} '
+                                     f'Existing groups were left untouched.'}), 400
+
         # Merge or replace
         mode = data.get('mode', 'replace')  # 'replace' or 'merge'
         print(f"[IMPORT] Mode: {mode}, Groups to process: {len(custom_groups)}", flush=True)
@@ -6419,12 +6705,21 @@ def import_custom_groups():
             custom_groups = existing
 
         print(f"[IMPORT] Saving {len(custom_groups)} total groups to state", flush=True)
+        previous = state.get("custom_groups", "[]")
         state["custom_groups"] = json.dumps(custom_groups)
-        save_config()
+        if not save_config():
+            # Don't report success for something that never reached disk
+            state["custom_groups"] = previous
+            print("[IMPORT] FAILED - could not write datasets.json", flush=True)
+            return jsonify({'error': 'Groups were accepted but could not be written to '
+                                     'datasets.json. Check the file is not locked or read-only.'}), 500
         # Emit socket update to refresh all connected clients
         socketio.emit('state_update', {'custom_groups': state["custom_groups"]})
         print(f"[IMPORT] Success! Returning count={len(custom_groups)}", flush=True)
-        return jsonify({'success': True, 'count': len(custom_groups)})
+        # Return the stored value so the client replaces its own copy rather than
+        # re-reading a stale hidden field and later syncing it back over the import.
+        return jsonify({'success': True, 'count': len(custom_groups),
+                        'custom_groups': state["custom_groups"]})
     except Exception as e:
         return jsonify({'error': f'Import failed: {str(e)}'}), 500
 
@@ -7245,6 +7540,10 @@ UI_HTML = r"""
                                              <span class="inline-block w-2 h-2 rounded-full" id="ms_indicator"></span>
                                              <span>M/S</span>
                                          </span>
+                                         <span class="flex items-center gap-1" title="Group 15B fast basic tuning">
+                                             <span class="inline-block w-2 h-2 rounded-full" id="fast_tuning_indicator"></span>
+                                             <span>15B</span>
+                                         </span>
                                      </div>
                                  </div>
                              </div>
@@ -7967,6 +8266,26 @@ UI_HTML = r"""
                         <div class="flex flex-col items-center"><label>Artificial Head</label><input type="checkbox" class="toggle-checkbox" id="di_head" {% if state.di_head %}checked{% endif %} onchange="sync()"></div>
                         <div class="flex flex-col items-center"><label>Compressed</label><input type="checkbox" class="toggle-checkbox" id="di_comp" {% if state.di_comp %}checked{% endif %} onchange="sync()"></div>
                         <div class="flex flex-col items-center"><label>Dynamic PTY</label><input type="checkbox" class="toggle-checkbox" id="di_dyn" {% if state.di_dyn %}checked{% endif %} onchange="sync()"></div>
+                        <div class="flex flex-col items-center"><label>Fast Tuning</label><input type="checkbox" class="toggle-checkbox" id="en_fast_tuning" {% if state.en_fast_tuning %}checked{% endif %} onchange="updateFastTuningUI(); sync()"></div>
+                    </div>
+                    <div id="fast_tuning_opts" class="px-3 pb-3" style="display: {% if state.en_fast_tuning %}block{% else %}none{% endif %};">
+                        <div class="bg-[#1a1a1a] border border-[#333] rounded p-3">
+                            <div class="flex items-center gap-3">
+                                <label class="text-xs text-gray-400 whitespace-nowrap">Group 15B rate</label>
+                                <select id="fast_tuning_rate" class="flex-1" onchange="sync()">
+                                    <option value="1" {% if state.fast_tuning_rate == 1 %}selected{% endif %}>Low - 1 group per cycle</option>
+                                    <option value="2" {% if state.fast_tuning_rate == 2 %}selected{% endif %}>Normal - 2 groups per cycle</option>
+                                    <option value="4" {% if state.fast_tuning_rate == 4 %}selected{% endif %}>High - 4 groups per cycle</option>
+                                    <option value="8" {% if state.fast_tuning_rate == 8 %}selected{% endif %}>Maximum - 8 groups per cycle</option>
+                                </select>
+                            </div>
+                            <div class="text-[10px] text-gray-500 mt-2 leading-relaxed">
+                                Group 15B repeats TP, PTY, TA, M/S and the DI bits with no text payload, so a receiver
+                                locks on faster than waiting for the 0A/0B rotation. Blocks 2 and 4 are identical and
+                                block 3 repeats the PI code. Higher rates speed up acquisition but take airtime from
+                                PS, RadioText and the other groups.
+                            </div>
+                        </div>
                     </div>
                 </div>
                 
@@ -9924,10 +10243,44 @@ UI_HTML = r"""
                         <div class="text-[10px] text-gray-500 mt-1">One pair per line: tuned, other (max 4 pairs). 87.6-107.9 MHz</div>
                     </div>
 
-                    <div>
+                    <div class="space-y-2">
                         <div class="flex items-center justify-between bg-black p-2 rounded">
-                            <label class="text-xs text-gray-400">TP (ON)</label>
+                            <div>
+                                <label class="text-xs text-gray-400">TP (ON)</label>
+                                <div class="text-[10px] text-gray-500">Other network carries traffic programmes</div>
+                            </div>
                             <input type="checkbox" class="toggle-checkbox" id="eon_tp">
+                        </div>
+                        <div class="flex items-center justify-between bg-black p-2 rounded">
+                            <div>
+                                <label class="text-xs text-gray-400">TA (ON)</label>
+                                <div class="text-[10px] text-gray-500">Traffic announcement on air now - sent in Group 14B (and 14A variant 13)</div>
+                            </div>
+                            <input type="checkbox" class="toggle-checkbox" id="eon_ta">
+                        </div>
+                    </div>
+
+                    <div class="border-t border-gray-700 pt-3">
+                        <div class="flex items-center justify-between bg-black p-2 rounded mb-2">
+                            <div>
+                                <label class="text-xs text-gray-400">PIN (ON)</label>
+                                <div class="text-[10px] text-gray-500">Programme Item Number of the other network - sent as Group 14A variant 14</div>
+                            </div>
+                            <input type="checkbox" class="toggle-checkbox" id="eon_en_pin" onchange="updateEONPinUI()">
+                        </div>
+                        <div id="eon_pin_fields" class="grid grid-cols-3 gap-2" style="display:none">
+                            <div>
+                                <label class="text-[10px] text-gray-400 mb-1 block">Day (1-31)</label>
+                                <input type="number" id="eon_pin_day" min="0" max="31" value="0" class="w-full bg-black border border-gray-600 rounded px-2 py-1">
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-gray-400 mb-1 block">Hour (0-23)</label>
+                                <input type="number" id="eon_pin_hour" min="0" max="23" value="0" class="w-full bg-black border border-gray-600 rounded px-2 py-1">
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-gray-400 mb-1 block">Minute (0-59)</label>
+                                <input type="number" id="eon_pin_minute" min="0" max="59" value="0" class="w-full bg-black border border-gray-600 rounded px-2 py-1">
+                            </div>
                         </div>
                     </div>
 
@@ -12992,6 +13345,7 @@ UI_HTML = r"""
             setIndicator('tp_indicator', data.tp);
             setIndicator('ta_indicator', data.ta);
             setIndicator('ms_indicator', data.ms);
+            setIndicator('fast_tuning_indicator', data.en_fast_tuning);
             
             // Alternative Frequencies - format based on method
             let afDisplay = "None";
@@ -13125,6 +13479,9 @@ UI_HTML = r"""
                     loadCustomODAList();
                 }
             }
+            if (data.custom_groups !== undefined) {
+                applyCustomGroupsFromServer(data.custom_groups);
+            }
         });
 
         // Legacy functions - kept for backward compatibility but now no-ops
@@ -13252,6 +13609,7 @@ UI_HTML = r"""
                 output_channel: getVal('output_channel'),
                 pi: getVal('pi'), pty: getVal('pty'), rbds: getVal('rbds'), tp: getVal('tp'), ta: getVal('ta'), ms: getVal('ms'),
                 di_stereo: getVal('di_stereo'), di_head: getVal('di_head'), di_comp: getVal('di_comp'), di_dyn: getVal('di_dyn'),
+                en_fast_tuning: getVal('en_fast_tuning'), fast_tuning_rate: getVal('fast_tuning_rate'),
                 en_af: getVal('en_af'), af_list: getVal('af_list'), af_method: getVal('af_method'),
                 ps_dynamic: getVal('ps_dynamic'), ps_centered: getVal('ps_centered'), ps_group_version: getVal('ps_group_version'),
                 rt_text: getVal('rt_text'),
@@ -13669,7 +14027,18 @@ UI_HTML = r"""
                     if (afInfo.length > 0) {
                         html += '<div class="text-xs text-gray-500 break-words">' + afInfo.join(' | ') + '</div>';
                     }
-                    
+
+                    // Line 4: TP(ON) / TA(ON) - what Group 14B actually signals
+                    html += '<div class="flex gap-2 mt-1 text-[10px]">';
+                    html += '<span class="px-1.5 py-0.5 rounded ' + (svc.tp ? 'bg-green-900 text-green-300' : 'bg-gray-800 text-gray-500') + '">TP</span>';
+                    html += '<span class="px-1.5 py-0.5 rounded ' + (svc.ta ? 'bg-amber-900 text-amber-300' : 'bg-gray-800 text-gray-500') + '">TA</span>';
+                    if (svc.en_pin) {
+                        html += '<span class="px-1.5 py-0.5 rounded bg-blue-900 text-blue-300">PIN ' +
+                                (svc.pin_day || 0) + 'd ' + String(svc.pin_hour || 0).padStart(2, '0') + ':' +
+                                String(svc.pin_minute || 0).padStart(2, '0') + '</span>';
+                    }
+                    html += '</div>';
+
                     html += '</div>';
                 }
                 html += '</div>';
@@ -13777,6 +14146,12 @@ UI_HTML = r"""
             document.getElementById('eon_af').value = '';
             document.getElementById('eon_mapped').value = '';
             document.getElementById('eon_tp').checked = false;
+            document.getElementById('eon_ta').checked = false;
+            document.getElementById('eon_en_pin').checked = false;
+            document.getElementById('eon_pin_day').value = '0';
+            document.getElementById('eon_pin_hour').value = '0';
+            document.getElementById('eon_pin_minute').value = '0';
+            updateEONPinUI();
             document.getElementById('eon_uecp_psn').value = '0';
             document.getElementById('eon_modal_title').textContent = 'Add EON Service';
             document.getElementById('eon_edit_form').style.display = 'block';
@@ -13800,6 +14175,12 @@ UI_HTML = r"""
             document.getElementById('eon_mapped').value = mappedText;
 
             document.getElementById('eon_tp').checked = svc.tp || false;
+            document.getElementById('eon_ta').checked = svc.ta || false;
+            document.getElementById('eon_en_pin').checked = svc.en_pin || false;
+            document.getElementById('eon_pin_day').value = svc.pin_day || 0;
+            document.getElementById('eon_pin_hour').value = svc.pin_hour || 0;
+            document.getElementById('eon_pin_minute').value = svc.pin_minute || 0;
+            updateEONPinUI();
             document.getElementById('eon_uecp_psn').value = svc.uecp_psn || 0;
             document.getElementById('eon_modal_title').textContent = 'Edit EON Service';
             document.getElementById('eon_edit_form').style.display = 'block';
@@ -13816,6 +14197,12 @@ UI_HTML = r"""
         function cancelEONEdit() {
             document.getElementById('eon_edit_form').style.display = 'none';
             document.getElementById('eon_modal_title').textContent = 'Manage EON Services';
+        }
+
+        function updateEONPinUI() {
+            var cb = document.getElementById('eon_en_pin');
+            var fields = document.getElementById('eon_pin_fields');
+            if (cb && fields) fields.style.display = cb.checked ? 'grid' : 'none';
         }
 
         function saveEONService() {
@@ -13844,6 +14231,11 @@ UI_HTML = r"""
                 af_list: document.getElementById('eon_af').value || '',
                 mapped_freqs: mappedFreqs,
                 tp: document.getElementById('eon_tp').checked ? 1 : 0,
+                ta: document.getElementById('eon_ta').checked ? 1 : 0,
+                en_pin: document.getElementById('eon_en_pin').checked ? 1 : 0,
+                pin_day: parseInt(document.getElementById('eon_pin_day').value) || 0,
+                pin_hour: parseInt(document.getElementById('eon_pin_hour').value) || 0,
+                pin_minute: parseInt(document.getElementById('eon_pin_minute').value) || 0,
                 uecp_psn: parseInt(document.getElementById('eon_uecp_psn').value) || 0
             };
 
@@ -13888,8 +14280,43 @@ UI_HTML = r"""
             }
         }
 
+        // Add one TA(ON) / PIN(ON) entry per configured EON service. Built from the
+        // service list as it was when the page loaded, so add a service then reload
+        // the page to see it here.
+        function populateEONControlParams() {
+            var sel = document.getElementById('dc_rds_param');
+            if (!sel) return;
+            var existing = sel.querySelector('optgroup[data-eon="1"]');
+            if (existing) existing.remove();
+
+            var svcs = [];
+            try {
+                svcs = JSON.parse((document.getElementById('eon_services') || {}).value || '[]') || [];
+            } catch (e) {
+                svcs = [];
+            }
+            if (!svcs.length) return;
+
+            var group = document.createElement('optgroup');
+            group.label = 'EON — per service';
+            group.setAttribute('data-eon', '1');
+            svcs.forEach(function(svc) {
+                var pi = String(svc.pi_on || '').toUpperCase();
+                if (!pi) return;
+                var name = (svc.ps || '').trim() || pi;
+                [['ta', 'TA (ON)'], ['pin', 'PIN (ON)']].forEach(function(pair) {
+                    var opt = document.createElement('option');
+                    opt.value = 'eon_' + pair[0] + ':' + pi;
+                    opt.textContent = pair[1] + ' — ' + name + ' (' + pi + ')';
+                    group.appendChild(opt);
+                });
+            });
+            sel.appendChild(group);
+        }
+
         function openDynamicControlModal() {
             loadDynamicControlRules();
+            populateEONControlParams();
             renderDynamicControlRuleList();
             document.getElementById('dynamic_control_modal').style.display = 'flex';
             document.getElementById('dynamic_control_edit_form').style.display = 'none';
@@ -14289,6 +14716,12 @@ UI_HTML = r"""
                     'ta': 'TA',
                     'pi': 'PI'
                 }[rule.rds_param] || rule.rds_param;
+
+                if (typeof rule.rds_param === 'string' && rule.rds_param.indexOf('eon_') === 0) {
+                    var bits = rule.rds_param.split(':');
+                    rdsParamDisplay = 'EON ' + (bits[0] === 'eon_ta' ? 'TA(ON)' : 'PIN(ON)') +
+                                      ' → ' + (bits[1] || '?');
+                }
                 
                 var mappingInfo = rule.mapping_type;
                 if (rule.mapping_type === 'conditional') {
@@ -15519,6 +15952,23 @@ UI_HTML = r"""
             cancelCustomGroupEdit();
         }
 
+        // Adopt the server's copy of the custom groups. The import endpoint saves
+        // straight to state, so the hidden field must be refreshed too - otherwise the
+        // next sync() posts the stale field back and silently undoes the import.
+        function applyCustomGroupsFromServer(json) {
+            if (json === undefined || json === null) return false;
+            var hiddenInput = document.getElementById('custom_groups');
+            if (hiddenInput) hiddenInput.value = json;
+            try {
+                customGroups = JSON.parse(json) || [];
+            } catch (e) {
+                customGroups = [];
+            }
+            if (document.getElementById('custom_groups_list')) renderCustomGroupsList();
+            updateCustomGroupsDisplay();
+            return true;
+        }
+
         function syncCustomGroups() {
             var hiddenInput = document.getElementById('custom_groups');
             if (hiddenInput) {
@@ -15959,9 +16409,11 @@ UI_HTML = r"""
                 console.log('Backend response:', data);
                 if (data.success) {
                     alert('Imported ' + data.count + ' custom group(s)');
-                    loadCustomGroups();
-                    renderCustomGroupsList();
-                    updateCustomGroupsDisplay();
+                    if (!applyCustomGroupsFromServer(data.custom_groups)) {
+                        loadCustomGroups();
+                        renderCustomGroupsList();
+                        updateCustomGroupsDisplay();
+                    }
                     closeImportDialog();
                 } else {
                     alert('Import failed: ' + (data.error || 'Unknown error'));
@@ -16185,9 +16637,11 @@ UI_HTML = r"""
                 console.log('New Preview: Backend response for confirmRdsSpyImport:', data);
                 if (data.success) {
                     alert('Imported ' + selectedGroups.length + ' custom group(s)');
-                    loadCustomGroups();
-                    renderCustomGroupsList();
-                    updateCustomGroupsDisplay();
+                    if (!applyCustomGroupsFromServer(data.custom_groups)) {
+                        loadCustomGroups();
+                        renderCustomGroupsList();
+                        updateCustomGroupsDisplay();
+                    }
                     document.getElementById('rdsspy_preview_modal').style.display = 'none';
                 } else {
                     alert('Import failed: ' + (data.error || 'Unknown error'));
@@ -16280,6 +16734,12 @@ UI_HTML = r"""
         // === AF PAIR FUNCTIONS ===
         var afPairs = [];
         var pendingNewAFPair = null;
+
+        function updateFastTuningUI() {
+            var cb = document.getElementById('en_fast_tuning');
+            var opts = document.getElementById('fast_tuning_opts');
+            if (cb && opts) opts.style.display = cb.checked ? 'block' : 'none';
+        }
 
         function updateAFMethodUI() {
             var method = document.getElementById('af_method').value;
@@ -17226,7 +17686,8 @@ UI_HTML = r"""
         // Parameter categories mapping
         // Export parameter categories (for export feature)
         const PARAM_CATEGORIES = {
-            'basic': ['pi', 'pty', 'rbds', 'tp', 'ta', 'ms', 'di_stereo', 'di_head', 'di_comp', 'di_dyn'],
+            'basic': ['pi', 'pty', 'rbds', 'tp', 'ta', 'ms', 'di_stereo', 'di_head', 'di_comp', 'di_dyn',
+                      'en_fast_tuning', 'fast_tuning_rate'],
             'station': ['ps_dynamic', 'ps_centered', 'ps_group_version', 'rt_text', 'rt_a', 'rt_b', 'rt_manual_buffers',
                         'rt_cycle_ab', 'rt_cr', 'rt_centered', 'rt_disable_0d', 'rt_mode', 'rt_cycle', 'rt_cycle_time',
                         'rt_messages', 'en_rt_plus', 'rt_plus_mode', 'rt_plus_format_a', 'rt_plus_format_b',
@@ -17254,7 +17715,8 @@ UI_HTML = r"""
 
         // Import feature mapping (granular control for imports)
         const IMPORT_FEATURES = {
-            'basic': ['pi', 'pty', 'rbds', 'tp', 'ta', 'ms', 'di_stereo', 'di_head', 'di_comp', 'di_dyn'],
+            'basic': ['pi', 'pty', 'rbds', 'tp', 'ta', 'ms', 'di_stereo', 'di_head', 'di_comp', 'di_dyn',
+                      'en_fast_tuning', 'fast_tuning_rate'],
             'ps': ['ps_dynamic', 'ps_centered', 'ps_group_version'],
             'rt': ['rt_text', 'rt_a', 'rt_b', 'rt_manual_buffers', 'rt_cycle_ab', 'rt_cr', 'rt_centered',
                    'rt_disable_0d', 'rt_mode', 'rt_cycle', 'rt_cycle_time', 'rt_messages', 'rt_active_buffer',
