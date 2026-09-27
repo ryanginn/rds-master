@@ -440,6 +440,17 @@ default_state = {
     # transmits a time the source has sent, "local" uses this machine's clock
     # the way the internal coder does, "off" never sends 4A at all.
     "uecp_ct_mode": "source",
+    # Programme services entered here rather than received, per data set:
+    # {"<dsn>": [{psn, role, pi, ps, ...}, ...]}. Each is the main service, an
+    # other network, or neither.
+    "uecp_local_services": "{}",
+    # Which message commands a source may use. Empty means all of them.
+    # This is the encoder-wide default; a connection may narrow it further.
+    "uecp_mec_allowed": "",
+    # Every connection this profile listens on or dials out to, as a JSON list
+    # of {name, kind, enabled, host, port, url, mec_allowed, timeout}. Real
+    # coders take several at once, each with its own access rights.
+    "uecp_links": "[]",
 
     # Enhanced RadioText (eRT) - ODA Application
     "en_ert": False,  # Enable eRT transmission
@@ -5114,7 +5125,8 @@ class RDSScheduler:
                         self.eon_variant = 4  # AF list (Method A)
                         self.eon_af_idx = -1
                     else:
-                        self.eon_variant = 13  # Skip to PTY+TA if no AF data
+                        # Linkage first if this service has any, then PTY+TA.
+                        self.eon_variant = 12 if service.get('linkage') else 13
 
             # Variants 5-8: Mapped Frequency Pairs (same band)
             # Variant 5 = 1st pair, 6 = 2nd pair, 7 = 3rd pair, 8 = 4th pair
@@ -5194,7 +5206,7 @@ class RDSScheduler:
                             self.eon_variant = 4
                             self.eon_af_idx = -1
                         else:
-                            self.eon_variant = 13
+                            self.eon_variant = 12 if service.get('linkage') else 13
                 else:
                     # No more mapped pairs - skip to next variant
                     lf_mf_mapped = service.get('lf_mf_mapped', [])
@@ -5210,6 +5222,10 @@ class RDSScheduler:
                         self.eon_variant = 4
                         self.eon_af_idx = -1
                         b2_tail = (tp_on << 4) | 0x04
+                        b3_val = 0xE0E0
+                    elif service.get('linkage'):
+                        self.eon_variant = 12
+                        b2_tail = (tp_on << 4) | 0x0C
                         b3_val = 0xE0E0
                     else:
                         self.eon_variant = 13
@@ -5261,6 +5277,10 @@ class RDSScheduler:
                         self.eon_af_idx = -1
                         b2_tail = (tp_on << 4) | 0x04
                         b3_val = 0xE0E0
+                    elif service.get('linkage'):
+                        self.eon_variant = 12
+                        b2_tail = (tp_on << 4) | 0x0C
+                        b3_val = 0xE0E0
                     else:
                         self.eon_variant = 13
                         b2_tail = (tp_on << 4) | 0x0D
@@ -5304,6 +5324,15 @@ class RDSScheduler:
                         self.eon_variant = 13
 
             # Variant 13: PTY(ON) + TA
+            # Variant 12: Linkage information for the other network.
+            # Block 3 carries the linkage word whole: the Linkage Actuator in
+            # b15, the Extended Generic indicator in b14, the International
+            # Linkage Set in b12 and the Linkage Set Number in b11-b0.
+            elif self.eon_variant == 12:
+                b2_tail = (tp_on << 4) | 0x0C
+                b3_val = int(service.get('linkage', 0) or 0) & 0xFFFF
+                self.eon_variant = 13
+
             elif self.eon_variant == 13:
                 b2_tail = (tp_on << 4) | 0x0D  # Variant 13
                 pty_on = int(service.get('pty', 0) or 0) & 0x1F
@@ -5436,6 +5465,12 @@ class RDSScheduler:
                     block3 = (variant_code << 12) | ecc_lic_value
                 else:
                     block3 = 0
+
+                # The Linkage Actuator is b15 of block 3 in group 1A as well as
+                # in 14A variant 12, so a station in a linkage set says so in
+                # both places.
+                if int(state.get("linkage_word", 0) or 0) & 0x8000:
+                    block3 |= 0x8000
 
                 # Block 4: PIN if enabled, otherwise 0
                 block4 = 0
@@ -6243,6 +6278,7 @@ def index():
     return render_template_string(UI_HTML, inputs=inputs, outputs=outputs,
                                   hostapi_filtered=hostapi_filter_active(),
                                   profile_mode=profile_mode(),
+                                  mec_catalogue=mec_catalogue(),
                                   profile_modes=list(PROFILE_MODES), state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, http_port=http_port, version=VERSION, SERIAL_AVAILABLE=SERIAL_AVAILABLE)
 
 @app.route('/devices')
@@ -7064,6 +7100,8 @@ if UPDATER_AVAILABLE:
 _uecp_store = None
 _uecp_tcp = None
 _uecp_ws = None
+# Every transport currently running, one per enabled connection.
+_uecp_transports = []
 _uecp_dirty = threading.Event()
 
 
@@ -7077,6 +7115,72 @@ def uecp_store():
             encoder=int(state.get("uecp_encoder_address", 0) or 0),
         )
     return _uecp_store
+
+
+def uecp_links():
+    """Every configured connection, as a list of dicts.
+
+    The first time this is asked for, the single TCP listener and WebSocket
+    client an older profile holds are turned into the first two entries, so
+    nothing an operator already set up disappears.
+    """
+    try:
+        links = json.loads(state.get("uecp_links") or "[]")
+    except (ValueError, TypeError):
+        links = []
+    if isinstance(links, list) and links:
+        return [x for x in links if isinstance(x, dict)]
+    return [
+        {"name": "TCP 1", "kind": "tcp",
+         "enabled": bool(state.get("uecp_tcp_enabled", True)),
+         "host": str(state.get("uecp_host", "0.0.0.0")),
+         "port": int(state.get("uecp_port", 4001) or 4001),
+         "url": "", "mec_allowed": None, "timeout": 0},
+        {"name": "WebSocket 1", "kind": "ws",
+         "enabled": bool(state.get("uecp_ws_enabled", False)),
+         "host": "", "port": 0,
+         "url": str(state.get("uecp_ws_url", "")),
+         "mec_allowed": None, "timeout": 0},
+    ]
+
+
+def link_allowed_mecs(link):
+    """The commands one connection may use, or None for all of them."""
+    codes = link.get("mec_allowed")
+    if codes is None:
+        return allowed_mecs()          # fall back to the encoder-wide setting
+    try:
+        return {int(c) & 0xFF for c in codes}
+    except (TypeError, ValueError):
+        return None
+
+
+def mec_catalogue():
+    """Every command this encoder understands, for the access rights list."""
+    try:
+        import uecp
+    except Exception:
+        return []
+    return [{"code": code, "hex": f"0x{code:02X}", "name": spec.name}
+            for code, spec in sorted(uecp.MEC_TABLE.items())]
+
+
+def allowed_mecs():
+    """The set of MECs a source may use, or None for all of them."""
+    raw = str(state.get("uecp_mec_allowed", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        codes = json.loads(raw)
+        return {int(c) & 0xFF for c in codes}
+    except (ValueError, TypeError):
+        return None
+
+
+def apply_mec_rights():
+    """Push the access rights at the live store, if there is one."""
+    if _uecp_store is not None:
+        _uecp_store.allowed_mecs = allowed_mecs()
 
 
 def _uecp_changed():
@@ -7137,13 +7241,13 @@ def uecp_take_group(g_type, g_ver):
 
 
 def stop_uecp():
-    global _uecp_tcp, _uecp_ws
-    for obj in (_uecp_tcp, _uecp_ws):
-        if obj is not None:
-            try:
-                obj.stop()
-            except Exception as exc:
-                print(f"[UECP] stop: {exc}", flush=True)
+    global _uecp_tcp, _uecp_ws, _uecp_transports
+    for obj in list(_uecp_transports):
+        try:
+            obj.stop()
+        except Exception as exc:
+            print(f"[UECP] stop: {exc}", flush=True)
+    _uecp_transports = []
     _uecp_tcp = _uecp_ws = None
 
 
@@ -7161,17 +7265,40 @@ def start_uecp():
 
     _uecp_store = None                      # rebuild with this profile's address
     store = uecp_store()
+    store.allowed_mecs = allowed_mecs()
 
-    if state.get("uecp_tcp_enabled", True):
-        _uecp_tcp = uecp.TcpListener(
-            str(state.get("uecp_host", "0.0.0.0")),
-            int(state.get("uecp_port", 4001) or 4001),
-            store, _uecp_changed)
-        _uecp_tcp.start()
-    if state.get("uecp_ws_enabled", False):
-        _uecp_ws = uecp.WebSocketClient(
-            str(state.get("uecp_ws_url", "")), store, _uecp_changed)
-        _uecp_ws.start()
+    global _uecp_transports
+    _uecp_transports = []
+    for link in uecp_links():
+        if not link.get("enabled"):
+            continue
+        name = str(link.get("name") or "")
+        allowed = link_allowed_mecs(link)
+        try:
+            if link.get("kind") == "ws":
+                url = str(link.get("url") or "").strip()
+                if not url:
+                    continue
+                obj = uecp.WebSocketClient(url, store, _uecp_changed,
+                                           allowed=allowed, name=name)
+            else:
+                port = int(link.get("port") or 0)
+                if not port:            # port 0 deactivates it, as on a coder
+                    continue
+                obj = uecp.TcpListener(str(link.get("host") or "0.0.0.0"), port,
+                                       store, _uecp_changed,
+                                       allowed=allowed, name=name)
+        except Exception as exc:
+            print(f"[UECP] {name}: {exc}", flush=True)
+            continue
+        obj.start()
+        _uecp_transports.append(obj)
+        # Keep the first of each kind under the old names, so everything that
+        # already reports on them carries on working.
+        if link.get("kind") == "ws" and _uecp_ws is None:
+            _uecp_ws = obj
+        elif link.get("kind") != "ws" and _uecp_tcp is None:
+            _uecp_tcp = obj
 
     # Suppress the internal-coder defaults straight away rather than waiting for
     # the first frame - a source that never connects must not leave ECC, CT and
@@ -7225,6 +7352,13 @@ def uecp_status():
         'sequence_override': state.get("uecp_group_sequence", ""),
         'sequence_overrides': uecp.sequence_overrides(state),
         'ct_mode': state.get("uecp_ct_mode", "source"),
+        'local_services': _local_service_table(),
+        'mec_allowed': (None if store.allowed_mecs is None
+                        else sorted(store.allowed_mecs)),
+        'links': _link_status(),
+        'ih': {k: state.get(k) for k in (
+            'en_ih', 'ih_channel', 'en_ih_station_id', 'ih_frequency',
+            'ih_site_code', 'ih_first_start_date')},
         'ct_sending': bool(state.get("en_ct")),
         'ct_from_source': bool(store.ct_on and store.clock.valid),
         'ct_clock': str(store.clock),
@@ -7274,6 +7408,357 @@ def parse_group_sequence(text):
     return out
 
 
+def _link_status():
+    """Each connection with what it is doing, for the monitor."""
+    out = []
+    for index, link in enumerate(uecp_links()):
+        row = {
+            "index": index,
+            "name": link.get("name") or f"Link {index + 1}",
+            "kind": link.get("kind", "tcp"),
+            "enabled": bool(link.get("enabled")),
+            "host": link.get("host", ""),
+            "port": link.get("port", 0),
+            "url": link.get("url", ""),
+            "timeout": link.get("timeout", 0),
+            "mec_allowed": link.get("mec_allowed"),
+            "state": "off",
+            "clients": 0,
+            "error": "",
+        }
+        for transport in _uecp_transports:
+            if getattr(transport, "name", "") != row["name"]:
+                continue
+            row["error"] = getattr(transport, "last_error", "")
+            if getattr(transport, "connected", None) is True:
+                row["state"] = "connected"
+            elif transport.running:
+                row["state"] = "listening" if row["kind"] != "ws" else "connecting"
+            else:
+                row["state"] = "stopped"
+            row["clients"] = getattr(transport, "clients", 0)
+            break
+        out.append(row)
+    return out
+
+
+def _clean_link(row, index):
+    """Validate one connection definition."""
+    if not isinstance(row, dict):
+        raise ValueError("each connection must be an object")
+    kind = str(row.get("kind", "tcp")).strip().lower()
+    if kind not in ("tcp", "ws"):
+        raise ValueError(f"{kind!r} is not a connection type - use tcp or ws")
+    name = str(row.get("name", "") or f"Link {index + 1}")[:40].strip()
+    out = {"name": name or f"Link {index + 1}", "kind": kind,
+           "enabled": bool(row.get("enabled", True)),
+           "host": "", "port": 0, "url": ""}
+    if kind == "ws":
+        url = str(row.get("url", "") or "").strip()
+        if out["enabled"] and not url:
+            raise ValueError(f"{out['name']} needs a ws:// or wss:// address")
+        if url and not url.lower().startswith(("ws://", "wss://")):
+            raise ValueError(f"{url!r} must start with ws:// or wss://")
+        out["url"] = url
+    else:
+        try:
+            port = int(row.get("port", 0) or 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"{out['name']}: the port must be a number")
+        if port and not 1 <= port <= 65535:
+            raise ValueError(f"port {port} is out of range - use 1 to 65535")
+        out["port"] = port          # 0 deactivates it, as on a hardware coder
+        out["host"] = str(row.get("host", "0.0.0.0") or "0.0.0.0").strip()
+    try:
+        timeout = int(row.get("timeout", 0) or 0)
+    except (TypeError, ValueError):
+        raise ValueError(f"{out['name']}: the timeout must be a number")
+    if not 0 <= timeout <= 86400:
+        raise ValueError("a timeout must be 0 (inactive) to 86400 seconds")
+    out["timeout"] = timeout
+
+    codes = row.get("mec_allowed")
+    if codes is None:
+        out["mec_allowed"] = None
+    else:
+        import uecp
+        if not isinstance(codes, list):
+            raise ValueError("mec_allowed must be a list or null")
+        clean = set()
+        for code in codes:
+            try:
+                value = int(code)
+            except (TypeError, ValueError):
+                raise ValueError(f"{code!r} is not a MEC code")
+            if value not in uecp.MEC_TABLE:
+                raise ValueError(f"0x{value:02X} is not a known command")
+            clean.add(value)
+        out["mec_allowed"] = sorted(clean)
+    return out
+
+
+@app.route('/uecp/links', methods=['POST'])
+def uecp_links_route():
+    """Replace the list of connections.
+
+    A hardware coder takes several at once - a couple of TCP ports and a serial
+    link, say - each with its own access rights, so this is a list rather than
+    the single listener and client it used to be.
+    """
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    if not is_uecp_mode():
+        return jsonify({'error': 'This profile is not a UECP input'}), 400
+    rows = (request.json or {}).get("links")
+    if not isinstance(rows, list):
+        return jsonify({'error': 'links must be a list'}), 400
+    if len(rows) > 16:
+        return jsonify({'error': 'at most 16 connections'}), 400
+    cleaned, names, ports = [], set(), set()
+    for index, row in enumerate(rows):
+        try:
+            link = _clean_link(row, index)
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+        if link["name"] in names:
+            return jsonify({'error': f'two connections are both called '
+                                     f'{link["name"]!r}'}), 400
+        names.add(link["name"])
+        if link["kind"] == "tcp" and link["port"]:
+            key = (link["host"], link["port"])
+            if key in ports:
+                return jsonify({'error': f'two connections both listen on '
+                                         f'{link["host"]}:{link["port"]}'}), 400
+            ports.add(key)
+        cleaned.append(link)
+    state["uecp_links"] = json.dumps(cleaned)
+    save_config()
+    start_uecp()
+    return jsonify({'success': True, 'links': cleaned})
+
+
+def _local_service_table():
+    """Hand-entered programme services, as {"<dsn>": [service, ...]}."""
+    try:
+        table = json.loads(state.get("uecp_local_services") or "{}")
+        return table if isinstance(table, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _clean_service(row):
+    """Validate one hand-entered programme service.
+
+    Raises ValueError naming the problem: these are typed by hand, and a bad PI
+    would otherwise reach the air as 0000.
+    """
+    import uecp
+    if not isinstance(row, dict):
+        raise ValueError("each service must be an object")
+    try:
+        psn = int(row.get("psn", 0))
+    except (TypeError, ValueError):
+        raise ValueError("PSN must be a number")
+    if not 1 <= psn <= 255:
+        raise ValueError(f"PSN {psn} is out of range - use 1 to 255")
+
+    role = str(row.get("role", uecp.bridge.ROLE_EON)).strip().lower()
+    if role not in uecp.ROLES:
+        raise ValueError(f"{role!r} is not a role - use main, eon or off")
+
+    pi = str(row.get("pi", "")).strip().upper()
+    if pi:
+        if len(pi) != 4 or any(c not in "0123456789ABCDEF" for c in pi):
+            raise ValueError(f"PI {pi!r} must be four hex digits, like D391")
+        if pi[0] == "0":
+            raise ValueError("a PI code may not start with 0")
+    elif role != "off":
+        raise ValueError(f"PSN {psn} needs a PI to be transmitted")
+
+    try:
+        pty = int(row.get("pty", 0) or 0)
+    except (TypeError, ValueError):
+        raise ValueError("PTY must be a number")
+    if not 0 <= pty <= 31:
+        raise ValueError(f"PTY {pty} is out of range - use 0 to 31")
+
+    out = {
+        "psn": psn, "role": role, "pi": pi,
+        "ps": str(row.get("ps", ""))[:8],
+        "pty": pty,
+        "ptyn": str(row.get("ptyn", "") or "")[:8],
+        "tp": 1 if row.get("tp") else 0,
+        "ta": 1 if row.get("ta") else 0,
+        "af_list": str(row.get("af_list", "") or "").strip(),
+        "enabled": bool(row.get("enabled", True)),
+    }
+
+    # Linkage information, carried in group 14A variant 12. The Linkage
+    # Actuator is also the top bit of the linkage word and goes out in 1A.
+    link = row.get("linkage")
+    if isinstance(link, dict) and (link.get("la") or link.get("eg")
+                                   or link.get("ils") or link.get("lsn")):
+        lsn_text = str(link.get("lsn", "") or "0").strip() or "0"
+        try:
+            lsn = int(lsn_text, 16)
+        except ValueError:
+            raise ValueError(f"linkage set number {lsn_text!r} must be hex")
+        if not 0 <= lsn <= 0xFFF:
+            raise ValueError("linkage set number must be 000 to FFF")
+        out["linkage"] = {
+            "la": 1 if link.get("la") else 0,
+            "eg": 1 if link.get("eg") else 0,
+            "ils": 1 if link.get("ils") else 0,
+            "lsn": f"{lsn:03X}",
+        }
+
+    # Mapped frequency pairs for an other network: tuning frequency on this
+    # transmitter, matching frequency on the other one. Groups 14A variants 5-8.
+    pairs = row.get("mapped_freqs")
+    if isinstance(pairs, list) and pairs:
+        clean_pairs = []
+        for pair in pairs:
+            if isinstance(pair, dict):
+                pair = (pair.get("tuned"), pair.get("other"))
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError("a mapped pair needs a tuning and an other-network frequency")
+            try:
+                tuning, other = float(pair[0]), float(pair[1])
+            except (TypeError, ValueError):
+                raise ValueError(f"{pair!r} is not a pair of frequencies in MHz")
+            for mhz in (tuning, other):
+                if not 87.5 <= mhz <= 108.0:
+                    raise ValueError(f"{mhz} MHz is outside the FM band")
+            # The generator reads these as {'tuned': ..., 'other': ...}.
+            clean_pairs.append({"tuned": f"{tuning:.1f}", "other": f"{other:.1f}"})
+        out["mapped_freqs"] = clean_pairs
+    if row.get("en_pin"):
+        for key, top in (("pin_day", 31), ("pin_hour", 23), ("pin_minute", 59)):
+            try:
+                value = int(row.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                raise ValueError(f"{key.replace('_', ' ')} must be a number")
+            if not 0 <= value <= top:
+                raise ValueError(f"{key.replace('_', ' ')} must be 0 to {top}")
+            out[key] = value
+        out["en_pin"] = 1
+    return out
+
+
+@app.route('/uecp/services', methods=['POST'])
+def uecp_services():
+    """Replace one data set's hand-entered programme services.
+
+    EON is described per data set - the other networks are further PSNs within
+    it, with one of them the main service - so the list belongs to a DSN, the
+    way a UECP coder keeps it.
+    """
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    if not is_uecp_mode():
+        return jsonify({'error': 'This profile is not a UECP input'}), 400
+    data = request.json or {}
+    try:
+        dsn = int(data.get("dsn", 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Bad data set number'}), 400
+    if not 1 <= dsn <= 253:
+        return jsonify({'error': 'Data set number must be 1 to 253'}), 400
+
+    rows = data.get("services")
+    if not isinstance(rows, list):
+        return jsonify({'error': 'services must be a list'}), 400
+
+    cleaned, seen, mains = [], set(), []
+    for row in rows:
+        try:
+            svc = _clean_service(row)
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
+        if svc["psn"] in seen:
+            return jsonify({'error': f'PSN {svc["psn"]} is listed twice'}), 400
+        seen.add(svc["psn"])
+        if svc["role"] == "main":
+            mains.append(svc["psn"])
+        cleaned.append(svc)
+    if len(mains) > 1:
+        return jsonify({'error': 'only one service can be the main one, '
+                                 f'but PSNs {mains} are all marked as it'}), 400
+
+    table = _local_service_table()
+    if cleaned:
+        table[str(dsn)] = cleaned
+    else:
+        table.pop(str(dsn), None)
+    state["uecp_local_services"] = json.dumps(table, sort_keys=True)
+    save_config()
+    _uecp_dirty.set()
+    return jsonify({'success': True, 'dsn': dsn, 'services': cleaned})
+
+
+@app.route('/uecp/active-dsn', methods=['POST'])
+def uecp_active_dsn():
+    """Put a data set on air now.
+
+    MEC 0x1C is the source's way of choosing, and it still wins: this only
+    moves the encoder onto a data set so it can be checked before the source
+    selects it. The next 0x1C changes it again.
+    """
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    if not is_uecp_mode():
+        return jsonify({'error': 'This profile is not a UECP input'}), 400
+    try:
+        dsn = int((request.json or {}).get("dsn", 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Bad data set number'}), 400
+    if not 1 <= dsn <= 253:
+        return jsonify({'error': 'Data set number must be 1 to 253'}), 400
+    store = uecp_store()
+    store.data_set(dsn)                     # make sure it exists to switch to
+    store.current = dsn
+    store.note(f"data set {dsn} selected here")
+    _uecp_dirty.set()
+    return jsonify({'success': True, 'current': dsn})
+
+
+@app.route('/uecp/mec-rights', methods=['POST'])
+def uecp_mec_rights():
+    """Set which message commands a source is allowed to use.
+
+    Every encoder of this class has this. A studio link that can reach the port
+    should not necessarily be able to rewrite the PI or the AF list, so a
+    command that is not allowed is counted and logged rather than acted on.
+    """
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    if not is_uecp_mode():
+        return jsonify({'error': 'This profile is not a UECP input'}), 400
+    import uecp
+    data = request.json or {}
+    if data.get("all"):
+        state["uecp_mec_allowed"] = ""
+    else:
+        codes = data.get("allowed")
+        if not isinstance(codes, list):
+            return jsonify({'error': 'allowed must be a list of MEC codes'}), 400
+        clean = set()
+        for code in codes:
+            try:
+                value = int(code)
+            except (TypeError, ValueError):
+                return jsonify({'error': f'{code!r} is not a MEC code'}), 400
+            if value not in uecp.MEC_TABLE:
+                return jsonify({'error': f'0x{value:02X} is not a known command'}), 400
+            clean.add(value)
+        state["uecp_mec_allowed"] = json.dumps(sorted(clean))
+    save_config()
+    apply_mec_rights()
+    current = allowed_mecs()
+    return jsonify({'success': True,
+                    'allowed': None if current is None else sorted(current)})
+
+
 @app.route('/uecp/sequence', methods=['POST'])
 def uecp_sequence():
     """Set or clear one data set's group sequence.
@@ -7321,10 +7806,15 @@ def uecp_settings():
     import uecp
     data = request.json or {}
     before = [state.get(k) for k in TRANSPORT_KEYS]
-    state["uecp_tcp_enabled"] = bool(data.get("uecp_tcp_enabled", True))
-    state["uecp_ws_enabled"] = bool(data.get("uecp_ws_enabled", False))
-    state["uecp_host"] = str(data.get("uecp_host", "0.0.0.0")).strip() or "0.0.0.0"
-    state["uecp_ws_url"] = str(data.get("uecp_ws_url", "")).strip()
+    # These moved into the connections list; they are still accepted so an
+    # older client or a script that sets them carries on working.
+    for key, default in (("uecp_tcp_enabled", True), ("uecp_ws_enabled", False)):
+        if key in data:
+            state[key] = bool(data.get(key, default))
+    if "uecp_host" in data:
+        state["uecp_host"] = str(data.get("uecp_host") or "0.0.0.0").strip() or "0.0.0.0"
+    if "uecp_ws_url" in data:
+        state["uecp_ws_url"] = str(data.get("uecp_ws_url", "")).strip()
     # MEC 0x16 addresses a data set, so a hand-set sequence belongs to one too:
     # it is filed under whichever data set is live when it is entered.
     import uecp
@@ -7347,6 +7837,8 @@ def uecp_settings():
     for key, lo, hi, fallback in (("uecp_port", 1, 65535, 4001),
                                   ("uecp_site_address", 0, 1023, 0),
                                   ("uecp_encoder_address", 0, 63, 0)):
+        if key not in data:
+            continue
         try:
             state[key] = max(lo, min(hi, int(data.get(key, fallback))))
         except (TypeError, ValueError):
@@ -10394,38 +10886,20 @@ UI_HTML = r"""
                             the wire. To edit RDS by hand, switch to an Internal RDS coder profile.
                         </p>
                         <div class="grid grid-cols-2 gap-4 mb-3">
-                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3">
-                                <label class="flex items-center justify-between cursor-pointer mb-2">
-                                    <span class="text-xs text-gray-300 font-bold">TCP listener</span>
-                                    <input type="checkbox" class="toggle-checkbox" id="uecp_tcp_enabled"
-                                           {% if state.uecp_tcp_enabled %}checked{% endif %}>
-                                </label>
-                                <div class="grid grid-cols-3 gap-2">
-                                    <div class="col-span-2">
-                                        <label class="text-[10px] text-gray-500">Bind address</label>
-                                        <input type="text" id="uecp_host"
-                                               value="{{ state.uecp_host or '0.0.0.0' }}" placeholder="0.0.0.0">
-                                    </div>
-                                    <div>
-                                        <label class="text-[10px] text-gray-500">Port</label>
-                                        <input type="number" id="uecp_port" min="1" max="65535"
-                                               value="{{ state.uecp_port or 4001 }}">
-                                    </div>
+                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3 col-span-2">
+                                <div class="flex items-center gap-3 mb-1">
+                                    <span class="text-xs text-gray-300 font-bold">Connections</span>
+                                    <button class="btn" onclick="addUecpLink('tcp')">Add TCP</button>
+                                    <button class="btn" onclick="addUecpLink('ws')">Add WebSocket</button>
+                                    <button class="btn" onclick="saveUecpLinks()">Save</button>
+                                    <span id="uecp_links_msg" class="text-[10px] text-gray-500"></span>
                                 </div>
-                            </div>
-                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3">
-                                <label class="flex items-center justify-between cursor-pointer mb-2">
-                                    <span class="text-xs text-gray-300 font-bold">WebSocket source</span>
-                                    <input type="checkbox" class="toggle-checkbox" id="uecp_ws_enabled"
-                                           {% if state.uecp_ws_enabled %}checked{% endif %}>
-                                </label>
-                                <label class="text-[10px] text-gray-500">Server URL</label>
-                                <input type="text" id="uecp_ws_url"
-                                       placeholder="wss://host/uecpserver/name"
-                                       value="{{ state.uecp_ws_url or '' }}">
-                                <div class="text-[10px] text-gray-500 mt-1">
-                                    ws:// or wss://. Text frames may be base64; both are handled.
+                                <div class="text-[10px] text-gray-500 mb-2">
+                                    Several at once, as a hardware coder does. A TCP port of 0
+                                    deactivates that connection. Each one can be given its own
+                                    access rights below.
                                 </div>
+                                <div id="uecp_links"></div>
                             </div>
                             <div class="bg-[#1a1a1a] border border-[#333] rounded p-3 col-span-2">
                                 <label class="text-[10px] text-gray-500">Group sequence for the data set on air</label>
@@ -10470,6 +10944,63 @@ UI_HTML = r"""
                                 <div class="text-[11px] mt-2">
                                     <span class="text-gray-400">Status:</span>
                                     <span id="uecp_ct_status" class="text-gray-200">-</span>
+                                </div>
+                            </div>
+
+                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3 col-span-2">
+                                <div class="flex items-center gap-3">
+                                    <label class="text-[10px] text-gray-500">In-House (group 6A)</label>
+                                    <input type="checkbox" class="toggle-checkbox" id="uecp_en_ih"
+                                           onchange="saveUecpIH()">
+                                    <label class="text-[10px] text-gray-500">First start date</label>
+                                    <input type="text" id="uecp_ih_first_start_date" style="width:8rem"
+                                           placeholder="YYYY-MM-DD" onchange="saveUecpIH()">
+                                    <label class="text-[10px] text-gray-500">Station ID</label>
+                                    <input type="checkbox" class="toggle-checkbox" id="uecp_en_ih_station_id"
+                                           onchange="saveUecpIH()">
+                                    <label class="text-[10px] text-gray-500">Frequency</label>
+                                    <input type="text" id="uecp_ih_frequency" style="width:5rem"
+                                           placeholder="99.7" onchange="saveUecpIH()">
+                                    <label class="text-[10px] text-gray-500">Site</label>
+                                    <input type="text" id="uecp_ih_site_code" style="width:5rem"
+                                           placeholder="CA5B" onchange="saveUecpIH()">
+                                </div>
+                                <div class="text-[10px] text-gray-500 mt-1">
+                                    The same in-house data the internal coder sends, with the same
+                                    fields behind it. It belongs to the transmitter site rather than
+                                    to a programme service, so like Clock Time it applies to every
+                                    data set. A UECP source cannot send it.
+                                </div>
+                            </div>
+
+                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3 col-span-2">
+                                <div class="flex items-center gap-3">
+                                    <label class="text-[10px] text-gray-500">MEC access rights for</label>
+                                    <select id="uecp_mec_scope" style="width:14rem"
+                                            onchange="uecpMecTouched = false; uecpMecScopeSig = null;">
+                                        <option value="-1">every connection (default)</option>
+                                    </select>
+                                    <button class="btn" onclick="setUecpMecAll(true)">Allow all</button>
+                                    <button class="btn" onclick="setUecpMecAll(false)">Allow none</button>
+                                    <button class="btn" onclick="saveUecpMecRights()">Save</button>
+                                    <span id="uecp_mec_msg" class="text-[10px] text-gray-500"></span>
+                                </div>
+                                <div class="text-[10px] text-gray-500 mt-1">
+                                    Which commands a source may use. One that is not allowed is
+                                    counted and logged rather than acted on, so it is obvious from
+                                    the monitor why its data is not appearing.
+                                </div>
+                                <div id="uecp_mec_list"
+                                     class="mt-2 grid grid-cols-3 gap-x-4 gap-y-0.5 text-[11px]"
+                                     style="max-height:15rem; overflow:auto;"
+                                     onchange="uecpMecTouched = true;">
+                                    {% for m in mec_catalogue %}
+                                    <label class="flex items-center gap-2 text-gray-300">
+                                        <input type="checkbox" class="uecp-mec" value="{{ m.code }}" checked>
+                                        <span class="font-mono text-gray-500">{{ m.hex }}</span>
+                                        <span>{{ m.name }}</span>
+                                    </label>
+                                    {% endfor %}
                                 </div>
                             </div>
 
@@ -17469,18 +18000,34 @@ UI_HTML = r"""
         // Polled rather than pushed: the store changes far faster than anyone can
         // read, and polling keeps the transport threads out of the socket layer.
         var uecpSelected = null;          // "dsn/psn" of the row being shown
+        // Set once the operator ticks anything in the access rights list, so the
+        // next poll does not undo edits that have not been saved yet.
+        var uecpMecTouched = false;
+        // The last thing /uecp/status returned. The service editor redraws
+        // itself from this after every keystroke, so it needs it to hand.
+        var uecpLastStatus = {};
+        // What the right-hand pane currently shows. It is only rebuilt when
+        // this changes, so an <input> being typed into is never replaced.
+        var uecpPaneKey = null;
+        var uecpTreeSig = null;
+        // Which data sets are expanded in the tree.
+        var uecpOpenSets = {};
+        var uecpPsnTab = 'general';
+        // True once the service form has been edited, so a poll cannot redraw
+        // over changes that have not been saved yet.
+        var uecpPaneDirty = false;
+        var uecpClipboard = null;
+        var NL_CHAR = String.fromCharCode(10);
+        var UECP_PTY = {{ pty_list_rds|tojson }};
         var uecpTimer = null;
 
         function saveUecpTransport() {
             fetch('/uecp/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
+                // The connections themselves are saved through /uecp/links;
+                // what is left here is addressing and the clock.
                 body: JSON.stringify({
-                    uecp_tcp_enabled: document.getElementById('uecp_tcp_enabled').checked,
-                    uecp_ws_enabled: document.getElementById('uecp_ws_enabled').checked,
-                    uecp_host: document.getElementById('uecp_host').value,
-                    uecp_port: parseInt(document.getElementById('uecp_port').value, 10) || 4001,
-                    uecp_ws_url: document.getElementById('uecp_ws_url').value,
                     uecp_site_address: parseInt(document.getElementById('uecp_site_address').value, 10) || 0,
                     uecp_encoder_address: parseInt(document.getElementById('uecp_encoder_address').value, 10) || 0,
                     uecp_group_sequence: document.getElementById('uecp_group_sequence').value,
@@ -17499,13 +18046,52 @@ UI_HTML = r"""
             return Math.round(secs / 3600) + 'h ago';
         }
 
+        // ------------------------------------------------------------------
+        // The tree, and the right-hand pane that edits whatever is selected.
+        //
+        // Both are redrawn only when what they show actually changes. The pane
+        // holds live <input> elements, so rebuilding it on every poll - or, as
+        // it used to, on every keystroke - would throw away what is being typed
+        // and make the whole thing feel broken.
+        // ------------------------------------------------------------------
+
+        function uecpTreeSignature(data) {
+            var parts = [String(data.current), uecpSelected || ''];
+            (data.tree || []).forEach(function(ds) {
+                parts.push('d' + ds.dsn + ':' + ds.main_psn
+                           + ':' + (uecpOpenSets['d' + ds.dsn] ? 1 : 0));
+                ds.services.forEach(function(svc) {
+                    if (svc.empty) return;
+                    parts.push(svc.psn + ':' + (svc.pi || '') + ':'
+                               + (svc.ps || '') + ':' + (svc.enabled ? 1 : 0));
+                });
+            });
+            var local = data.local_services || {};
+            Object.keys(local).sort().forEach(function(dsn) {
+                (local[dsn] || []).forEach(function(r) {
+                    parts.push('L' + dsn + ':' + r.psn + ':' + (r.pi || '')
+                               + ':' + (r.ps || '') + ':' + r.role);
+                });
+            });
+            return parts.join('|');
+        }
+
+        function uecpLocalRow(data, dsn, psn) {
+            var rows = (data.local_services || {})[String(dsn)] || [];
+            for (var i = 0; i < rows.length; i++) {
+                if (rows[i].psn === psn) return rows[i];
+            }
+            return null;
+        }
+
         function renderUecpTree(data) {
             var el = document.getElementById('uecp_tree');
             if (!el) return;
-            // Every data set and service is listed, whether or not the source
-            // has sent anything for it, so the structure is visible. Empty ones
-            // are dimmed and collapsed until the operator opens them.
-            var tree = data.tree || data.data_sets || [];
+            var sig = uecpTreeSignature(data);
+            if (sig === uecpTreeSig) return;          // nothing has changed
+            uecpTreeSig = sig;
+
+            var tree = data.tree || [];
             if (!tree.length) {
                 el.innerHTML = '<span class="text-gray-500">No data sets received yet.</span>';
                 return;
@@ -17514,32 +18100,48 @@ UI_HTML = r"""
             tree.forEach(function(ds) {
                 var live = ds.dsn === data.current;
                 var used = ds.services.filter(function(s) { return !s.empty; });
-                var open = live || used.length > 0 || uecpOpenSets['d' + ds.dsn];
+                var localRows = (data.local_services || {})[String(ds.dsn)] || [];
+                var open = live || used.length > 0 || localRows.length > 0
+                           || uecpOpenSets['d' + ds.dsn];
                 var head = live ? 'text-pink-400 font-bold'
-                                : (used.length ? 'text-gray-300' : 'text-gray-600');
-                html += '<div class="mb-2">';
+                                : ((used.length || localRows.length) ? 'text-gray-300'
+                                                                     : 'text-gray-600');
                 var sel = (uecpSelected === ds.dsn + '/') ? ' bg-pink-900 text-white' : '';
-                html += '<div class="cursor-pointer rounded ' + head + sel + '" '
-                      + 'onclick="selectUecpSet(' + ds.dsn + ')">'
-                      + (open ? '▾ ' : '▸ ')
-                      + 'Data Set ' + ds.dsn + (live ? ' (on air)' : '')
-                      + (used.length ? '' : ' <span class="text-[9px] text-gray-600">empty</span>')
+                html += '<div class="mb-2">';
+                html += '<div class="cursor-pointer rounded px-1 ' + head + sel + '" '
+                      + 'onclick="selectUecpSet(' + ds.dsn + ')" '
+                      + 'oncontextmenu="return uecpMenu(event,' + ds.dsn + ',null)" '
+                      + 'title="Right-click for data set actions">'
+                      + (open ? '\u25be ' : '\u25b8 ')
+                      + 'DSN ' + ds.dsn
+                      + (live ? ' (on air)' : '')
                       + '</div>';
                 if (open) {
                     ds.services.forEach(function(svc) {
+                        var row = null;
+                        for (var i = 0; i < localRows.length; i++) {
+                            if (localRows[i].psn === svc.psn) row = localRows[i];
+                        }
+                        var known = !svc.empty || row !== null;
                         var key = ds.dsn + '/' + svc.psn;
-                        var isMain = svc.psn === ds.main_psn;
-                        var cls = (uecpSelected === key) ? 'bg-pink-900 text-white' : 'hover:bg-gray-700';
-                        html += '<div class="pl-3 py-0.5 cursor-pointer rounded ' + cls
-                              + (svc.empty ? ' text-gray-600' : '') + '" '
-                              + 'onclick="selectUecp(&quot;' + key + '&quot;)">'
+                        var cls = (uecpSelected === key) ? 'bg-pink-900 text-white'
+                                                         : 'hover:bg-gray-700';
+                        var pi = svc.pi || (row ? row.pi : '');
+                        var ps = (svc.ps || (row ? row.ps : '') || '').trim();
+                        var role = svc.psn === ds.main_psn ? 'MAIN'
+                                 : (row && row.role === 'main') ? 'MAIN'
+                                 : (row && row.role === 'off') ? 'OFF' : 'EON';
+                        html += '<div class="pl-3 py-0.5 px-1 cursor-pointer rounded ' + cls
+                              + (known ? '' : ' text-gray-600') + '" '
+                              + 'onclick="selectUecpPsn(' + ds.dsn + ',' + svc.psn + ')" '
+                              + 'oncontextmenu="return uecpMenu(event,' + ds.dsn + ',' + svc.psn + ')">'
                               + 'PSN ' + svc.psn
-                              + (svc.ps ? ' - ' + escapeHtml(svc.ps.trim()) : '')
-                              + (svc.pi ? ' (' + svc.pi + ')' : '')
-                              + (svc.empty ? ' <span class="text-[9px] text-gray-600">-</span>'
-                                 : isMain ? ' <span class="text-[9px] text-green-400">MAIN</span>'
-                                          : ' <span class="text-[9px] text-gray-500">EON</span>')
-                              + (svc.enabled ? '' : ' <span class="text-[9px] text-red-400">OFF</span>')
+                              + (ps ? ' - "' + escapeHtml(ps) + '"' : '')
+                              + (pi ? ' (' + escapeHtml(pi) + ')' : '')
+                              + (known ? ' <span class="text-[9px] '
+                                 + (role === 'MAIN' ? 'text-green-400'
+                                    : role === 'OFF' ? 'text-gray-500' : 'text-gray-400')
+                                 + '">' + role + '</span>' : '')
                               + '</div>';
                     });
                 }
@@ -17548,25 +18150,188 @@ UI_HTML = r"""
             el.innerHTML = html;
         }
 
-        var uecpOpenSets = {};
+        // ---- selection ---------------------------------------------------
 
         function selectUecpSet(dsn) {
-            // Selecting a data set shows its own settings, the way selecting a
-            // service shows that service's. Clicking the one already selected
-            // folds it away again.
+            uecpPaneDirty = false;
             if (uecpSelected === dsn + '/') {
                 uecpOpenSets['d' + dsn] = !uecpOpenSets['d' + dsn];
             } else {
                 uecpSelected = dsn + '/';
                 uecpOpenSets['d' + dsn] = true;
             }
+            uecpPaneKey = null;
+            uecpTreeSig = null;
             pollUecp();
         }
 
-        function selectUecp(key) {
-            uecpSelected = key;
+        function selectUecpPsn(dsn, psn) {
+            uecpSelected = dsn + '/' + psn;
+            uecpPaneKey = null;
+            uecpPaneDirty = false;
+            uecpTreeSig = null;
             pollUecp();
         }
+
+        function selectUecp(key) {          // kept for older callers
+            uecpSelected = key;
+            uecpPaneKey = null;
+            uecpTreeSig = null;
+            pollUecp();
+        }
+
+        // ---- the right-click menu -----------------------------------------
+
+        function uecpCloseMenu() {
+            var m = document.getElementById('uecp_ctx');
+            if (m) m.remove();
+        }
+
+        function uecpMenu(ev, dsn, psn) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            uecpCloseMenu();
+            var data = uecpLastStatus;
+            var items;
+            if (psn === null) {
+                items = [
+                    ['Add PSN\u2026', 'uecpAddPsn(' + dsn + ')', true],
+                    ['Delete', '', false],
+                    ['Set as Active DSN', 'uecpSetActive(' + dsn + ')',
+                     dsn !== data.current],
+                    ['Copy', 'uecpCopy(' + dsn + ',null)', true],
+                    ['Paste as new\u2026', 'uecpPaste(' + dsn + ')',
+                     uecpClipboard !== null]
+                ];
+            } else {
+                var row = uecpLocalRow(data, dsn, psn);
+                items = [
+                    ['Edit', 'selectUecpPsn(' + dsn + ',' + psn + ')', true],
+                    ['Delete', 'uecpDeletePsn(' + dsn + ',' + psn + ')', row !== null],
+                    ['Copy', 'uecpCopy(' + dsn + ',' + psn + ')', row !== null],
+                    ['Paste as new\u2026', 'uecpPaste(' + dsn + ')',
+                     uecpClipboard !== null]
+                ];
+            }
+            var html = items.map(function(it) {
+                return it[2]
+                    ? '<div class="px-3 py-1 cursor-pointer hover:bg-pink-900" '
+                      + 'onclick="uecpCloseMenu(); ' + it[1] + '">' + it[0] + '</div>'
+                    : '<div class="px-3 py-1 text-gray-600">' + it[0] + '</div>';
+            }).join('');
+            var m = document.createElement('div');
+            m.id = 'uecp_ctx';
+            m.className = 'fixed bg-[#222] border border-[#555] rounded text-[12px] '
+                        + 'text-gray-200 shadow-lg z-50';
+            m.style.left = ev.clientX + 'px';
+            m.style.top = ev.clientY + 'px';
+            m.innerHTML = html;
+            document.body.appendChild(m);
+            return false;
+        }
+
+        document.addEventListener('click', uecpCloseMenu);
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') uecpCloseMenu();
+        });
+
+        function uecpAddPsn(dsn) {
+            var psn = prompt('Programme service number to add (1-255):',
+                             String(uecpNextFreePsn(dsn)));
+            if (psn === null) return;
+            psn = parseInt(psn, 10);
+            if (!(psn >= 1 && psn <= 255)) {
+                alert('A programme service number must be 1 to 255.');
+                return;
+            }
+            if (uecpLocalRow(uecpLastStatus, dsn, psn)) {
+                selectUecpPsn(dsn, psn);
+                return;
+            }
+            uecpSaveServices(dsn, uecpLocalRows(dsn).concat([{
+                psn: psn, role: 'eon', pi: '', ps: '', pty: 0,
+                tp: 0, ta: 0, af_list: '', enabled: true
+            }]), function() { selectUecpPsn(dsn, psn); }, true);
+        }
+
+        function uecpNextFreePsn(dsn) {
+            var used = {};
+            uecpLocalRows(dsn).forEach(function(r) { used[r.psn] = true; });
+            ((uecpLastStatus.tree || []).filter(function(d) { return d.dsn === dsn; })[0]
+             || {services: []}).services.forEach(function(svc) {
+                if (!svc.empty) used[svc.psn] = true;
+            });
+            var n = 1;
+            while (used[n] && n < 255) n++;
+            return n;
+        }
+
+        function uecpLocalRows(dsn) {
+            var rows = (uecpLastStatus.local_services || {})[String(dsn)] || [];
+            return rows.map(function(r) { return Object.assign({}, r); });
+        }
+
+        function uecpDeletePsn(dsn, psn) {
+            uecpSaveServices(dsn, uecpLocalRows(dsn).filter(function(r) {
+                return r.psn !== psn;
+            }), function() { selectUecpSet(dsn); });
+        }
+
+        function uecpCopy(dsn, psn) {
+            uecpClipboard = (psn === null)
+                ? {kind: 'dsn', rows: uecpLocalRows(dsn)}
+                : {kind: 'psn', rows: uecpLocalRows(dsn).filter(function(r) {
+                      return r.psn === psn;
+                  })};
+        }
+
+        function uecpPaste(dsn) {
+            if (!uecpClipboard) return;
+            var rows = uecpLocalRows(dsn);
+            var used = {};
+            rows.forEach(function(r) { used[r.psn] = true; });
+            uecpClipboard.rows.forEach(function(src) {
+                var copy = Object.assign({}, src);
+                var n = copy.psn;
+                while (used[n] && n < 255) n++;
+                copy.psn = n;
+                copy.role = copy.role === 'main' ? 'eon' : copy.role;  // one main only
+                used[n] = true;
+                rows.push(copy);
+            });
+            uecpSaveServices(dsn, rows, function() { selectUecpSet(dsn); });
+        }
+
+        function uecpSetActive(dsn) {
+            fetch('/uecp/active-dsn', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({dsn: dsn})
+            }).then(function() { uecpTreeSig = null; pollUecp(); });
+        }
+
+        function uecpSaveServices(dsn, rows, done, quiet) {
+            fetch('/uecp/services', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({dsn: dsn, services: rows})
+            }).then(function(r) { return r.json().then(function(j) { return [r.ok, j]; }); })
+              .then(function(p) {
+                  var msg = document.getElementById('uecp_form_msg');
+                  if (msg && !(quiet && p[0])) {
+                      msg.textContent = p[0] ? 'Saved.' : (p[1].error || 'Could not save');
+                      msg.className = 'text-[10px] ' + (p[0] ? 'text-green-400' : 'text-red-400');
+                  }
+                  if (p[0]) {
+                      uecpTreeSig = null;
+                      uecpPaneKey = null;
+                      if (done) done();
+                      else pollUecp();
+                  }
+              });
+        }
+
+        // ---- the data set pane ---------------------------------------------
 
         function groupNames(list) {
             return (list || []).map(function(b) {
@@ -17575,18 +18340,15 @@ UI_HTML = r"""
         }
 
         function renderUecpSetDetail(data, ds) {
-            // A data set's own settings. The RDS data itself belongs to the
-            // services underneath it and to the source; what an operator sets
-            // here is the group sequence, which MEC 0x16 addresses per data set.
             var live = ds.dsn === data.current;
             var fromSource = groupNames(ds.group_sequence);
             var override = (data.sequence_overrides || {})[String(ds.dsn)] || '';
             var used = ds.services.filter(function(s) { return !s.empty; });
+            var localRows = (data.local_services || {})[String(ds.dsn)] || [];
 
             var html = '<div class="text-pink-400 mb-2">Data Set ' + ds.dsn
                      + (live ? ' <span class="text-[10px] text-green-400">ON AIR</span>' : '')
                      + '</div>';
-
             html += '<label class="text-[10px] text-gray-500">Group sequence'
                   + ' for this data set</label>'
                   + '<div class="flex items-center gap-2 mt-1">'
@@ -17602,29 +18364,23 @@ UI_HTML = r"""
                          + 'it replaces whatever is set here.'
                        : 'Leave blank for automatic. Groups are written like 0A 2A 0A 8A.')
                   + '</div>';
-
             if (live) {
                 html += '<div class="text-[11px] mt-2"><span class="text-gray-400">In use:</span> '
                       + '<span class="text-gray-200 font-mono">'
                       + escapeHtml(data.group_sequence || '-') + '</span> '
-                      + '<span class="text-gray-500">(' + escapeHtml(data.sequence_origin || '') + ')</span></div>';
+                      + '<span class="text-gray-500">(' + escapeHtml(data.sequence_origin || '')
+                      + ')</span></div>';
             }
-
             var rows = [
-                ['Main service', 'PSN ' + ds.main_psn
-                    + (used.length ? '' : ' (nothing received yet)')],
-                ['Other networks', used.filter(function(x) { return x.psn !== ds.main_psn; }).length],
+                ['Main service', 'PSN ' + ds.main_psn],
+                ['Services received', used.length],
+                ['Services set here', localRows.length],
                 ['From the source', fromSource.length ? fromSource.join(' ') : 'no MEC 0x16 sent']
             ];
             var slc = ds.slc || {};
             if (Object.keys(slc).length) {
                 rows.push(['Slow labelling', Object.keys(slc).map(function(v) {
                     return 'variant ' + v + ' = 0x' + slc[v].toString(16).toUpperCase();
-                }).join(', ')]);
-            }
-            if (live && (data.queued_groups || []).length) {
-                rows.push(['Raw groups waiting', (data.queued_groups || []).map(function(q) {
-                    return q.group + ' x' + q.waiting;
                 }).join(', ')]);
             }
             html += '<table class="w-full text-xs mt-3">';
@@ -17635,10 +18391,471 @@ UI_HTML = r"""
             });
             html += '</table>';
             html += '<div class="text-[10px] text-gray-500 mt-3">'
-                  + 'This profile is a UECP input, so the RDS data below a data set is '
-                  + 'whatever the source sends and is shown read-only. Pick a PSN to see it.'
-                  + '</div>';
+                  + 'Right-click this data set in the tree to add a programme service, '
+                  + 'or click one to edit it.</div>'
+                  + '<div id="uecp_form_msg" class="text-[10px] mt-1"></div>';
             document.getElementById('uecp_detail').innerHTML = html;
+        }
+
+        // ---- the programme service form -------------------------------------
+
+        function uecpPsnData(data, ds, psn) {
+            // What to show: the operator's own entry where there is one, the
+            // source's data otherwise, and the two merged where each has part
+            // of it. A field the source sends is shown read-only, since in UECP
+            // mode it would be overwritten within a cycle or two anyway.
+            var row = uecpLocalRow(data, ds.dsn, psn) || {};
+            var recv = null;
+            ds.services.forEach(function(svc) {
+                if (svc.psn === psn && !svc.empty) recv = svc;
+            });
+            var isMain = (psn === ds.main_psn) || row.role === 'main';
+            // A Programme Item Number arrives packed the way group 1A carries
+            // it: five bits of day, five of hour, six of minute.
+            var pin = recv && recv.pin ? recv.pin : 0;
+            var hasPin = row.en_pin !== undefined ? !!row.en_pin : pin > 0;
+            return {
+                row: row, recv: recv, isMain: isMain,
+                role: row.role || (recv ? (isMain ? 'main' : 'eon') : 'eon'),
+                pi: row.pi || (recv && recv.pi) || '',
+                ps: (row.ps !== undefined && row.ps !== '' ? row.ps
+                     : (recv && recv.ps) || ''),
+                pty: (row.pty ? row.pty : (recv && recv.pty) || 0),
+                ptyn: (row.ptyn ? row.ptyn : (recv && recv.ptyn) || ''),
+                tp: row.tp !== undefined ? row.tp : (recv && recv.tp ? 1 : 0),
+                ta: row.ta !== undefined ? row.ta : (recv && recv.ta ? 1 : 0),
+                af_list: row.af_list || '',
+                mapped: row.mapped_freqs || [],
+                en_pin: hasPin ? 1 : 0,
+                pin_day: row.pin_day !== undefined ? row.pin_day : (pin >> 11) & 0x1F,
+                pin_hour: row.pin_hour !== undefined ? row.pin_hour : (pin >> 6) & 0x1F,
+                pin_minute: row.pin_minute !== undefined ? row.pin_minute : pin & 0x3F,
+                linkage: row.linkage || {},
+                enabled: row.enabled === undefined ? true : !!row.enabled
+            };
+        }
+
+        function uecpTabBar(dsn, psn, isMain) {
+            // AF List belongs to the main service and EON-AF List to an other
+            // network, so each is only offered where it means something.
+            var tabs = [
+                ['general', 'General', true],
+                ['af', 'AF List', isMain],
+                ['eonaf', 'EON-AF List', !isMain]
+            ];
+            return '<div class="flex gap-1 mb-2 border-b border-[#333]">'
+                 + tabs.map(function(t) {
+                     if (!t[2]) {
+                         return '<div class="px-3 py-1 text-[11px] text-gray-600" '
+                              + 'title="Not used for this service">' + t[1] + '</div>';
+                     }
+                     var on = uecpPsnTab === t[0];
+                     return '<div class="px-3 py-1 text-[11px] cursor-pointer rounded-t '
+                          + (on ? 'bg-[#2a2a2a] text-pink-400' : 'text-gray-400 hover:text-gray-200')
+                          + '" onclick="uecpSetPsnTab(&quot;' + t[0] + '&quot;)">'
+                          + t[1] + '</div>';
+                 }).join('') + '</div>';
+        }
+
+        function uecpSetPsnTab(tab) {
+            uecpPsnTab = tab;
+            uecpPaneKey = null;
+            uecpPaneDirty = false;
+            renderUecpDetail(uecpLastStatus);
+        }
+
+        function uecpPaneHasFocus() {
+            var busy = document.activeElement;
+            return !!(busy && busy.closest && busy.closest('#uecp_detail'));
+        }
+
+        function renderUecpPsnForm(data, ds, psn) {
+            var d = uecpPsnData(data, ds, psn);
+            if (uecpPsnTab === 'af' && !d.isMain) uecpPsnTab = 'general';
+            if (uecpPsnTab === 'eonaf' && d.isMain) uecpPsnTab = 'general';
+
+            var html = '<div class="flex items-center justify-between mb-1">'
+                     + '<div class="text-pink-400">Data Set ' + ds.dsn + ' / PSN ' + psn
+                     + (d.recv ? ' <span class="text-[10px] text-gray-500">'
+                                 + 'receiving from the source</span>' : '')
+                     + '</div>'
+                     + '<label class="text-[11px] text-gray-400 flex items-center gap-2">Enabled'
+                     + '<input type="checkbox" id="f_enabled"' + (d.enabled ? ' checked' : '')
+                     + '></label></div>';
+            html += uecpTabBar(ds.dsn, psn, d.isMain);
+            html += '<div id="uecp_psn_body" oninput="uecpPaneDirty = true;" '
+                  + 'onchange="uecpPaneDirty = true;">';
+            if (uecpPsnTab === 'general') html += uecpPsnGeneral(d, psn, ds);
+            else if (uecpPsnTab === 'af') html += uecpPsnAfList(d);
+            else html += uecpPsnEonAf(d);
+            html += '</div>';
+            html += '<div class="flex items-center gap-2 mt-3">'
+                  + '<button class="btn" onclick="saveUecpPsn(' + ds.dsn + ',' + psn + ')">Save</button>'
+                  + '<button class="btn" onclick="selectUecpPsn(' + ds.dsn + ',' + psn + ')">Revert</button>'
+                  + '<span id="uecp_form_msg" class="text-[10px] text-gray-500"></span></div>';
+            document.getElementById('uecp_detail').innerHTML = html;
+        }
+
+        function uecpField(id, label, value, width, type) {
+            return '<label class="text-[10px] text-gray-500">' + label + '</label>'
+                 + '<input type="' + (type || 'text') + '" id="' + id + '" style="width:'
+                 + (width || '6rem') + '" value="'
+                 + escapeHtml(String(value === undefined || value === null ? '' : value))
+                 + '">';
+        }
+
+        function uecpCheck(id, label, on, disabled) {
+            return '<label class="text-[11px] text-gray-400 flex items-center gap-1">'
+                 + '<input type="checkbox" id="' + id + '"' + (on ? ' checked' : '')
+                 + (disabled ? ' disabled' : '') + '>' + label + '</label>';
+        }
+
+        function uecpPsnGeneral(d, psn, ds) {
+            var ptyOptions = '';
+            for (var i = 0; i < UECP_PTY.length; i++) {
+                ptyOptions += '<option value="' + i + '"'
+                            + (Number(d.pty) === i ? ' selected' : '') + '>'
+                            + i + ' - ' + escapeHtml(UECP_PTY[i]) + '</option>';
+            }
+            var html = '<div class="flex items-center gap-4 mb-2">'
+                     + uecpCheck('f_eon', 'Add to EON', d.role === 'eon')
+                     // A service cannot be an other network and the station at
+                     // the same time, so Main is only offered while EON is off.
+                     + uecpCheck('f_main', 'Use as main', d.role === 'main', d.role === 'eon')
+                     + '</div>';
+            html += '<div class="flex items-end gap-3 mb-2">'
+                  + '<div>' + uecpField('f_pi', 'PI', d.pi, '5rem') + '</div>'
+                  + '<div>' + uecpField('f_ps', 'PS', d.ps, '8rem') + '</div>'
+                  + '<div><label class="text-[10px] text-gray-500">PTY</label>'
+                  + '<select id="f_pty" style="width:13rem">' + ptyOptions + '</select></div>'
+                  + '<div>' + uecpField('f_ptyn', 'PTYN', d.ptyn, '8rem') + '</div>'
+                  + '</div>';
+            html += '<div class="flex items-center gap-4 mb-3">'
+                  + uecpCheck('f_tp', 'TP - Traffic Programme', d.tp)
+                  + uecpCheck('f_ta', 'TA - Traffic Announcement', d.ta)
+                  + '</div>';
+
+            html += '<div class="border border-[#333] rounded p-2 mb-2">'
+                  + '<div class="text-[10px] text-gray-500 mb-1">Linkage</div>'
+                  + '<div class="flex items-center gap-4">'
+                  + uecpCheck('f_la', 'LA - Linkage Actuator', d.linkage.la)
+                  + uecpCheck('f_eg', 'EG - Extended Generic', d.linkage.eg)
+                  + uecpCheck('f_ils', 'ILS - International Linkage Set', d.linkage.ils)
+                  + '<div>' + uecpField('f_lsn', 'Linkage Set Number (hex)',
+                                        d.linkage.lsn || '', '5rem') + '</div>'
+                  + '</div></div>';
+
+            html += '<div class="border border-[#333] rounded p-2 mb-2">'
+                  + '<div class="flex items-center gap-3">'
+                  + uecpCheck('f_en_pin', 'PIN', d.en_pin)
+                  + '<div>' + uecpField('f_pin_day', 'Day', d.pin_day, '3.5rem', 'number') + '</div>'
+                  + '<div>' + uecpField('f_pin_hour', 'Hour', d.pin_hour, '3.5rem', 'number') + '</div>'
+                  + '<div>' + uecpField('f_pin_minute', 'Minute', d.pin_minute, '3.5rem', 'number') + '</div>'
+                  + '</div></div>';
+
+            if (d.isMain && d.recv) {
+                html += '<div class="text-[10px] text-gray-500">DI 0x'
+                      + (d.recv.di || 0).toString(16).toUpperCase()
+                      + ' &middot; ' + (d.recv.ms ? 'Music' : 'Speech')
+                      + ' &middot; RadioText: '
+                      + escapeHtml((d.recv.rt || '-')) + '</div>';
+            }
+            if (d.recv) {
+                html += '<div class="text-[10px] text-gray-500 mt-2">'
+                      + 'This service is being received. Anything the source sends replaces '
+                      + 'what is set here, so a field it fills is its own.</div>';
+            }
+            return html;
+        }
+
+        function uecpPsnAfList(d) {
+            return '<div class="text-[10px] text-gray-500 mb-1">'
+                 + 'Alternative frequencies for this service, in MHz, separated by commas. '
+                 + 'They go out in group 0A.</div>'
+                 + '<textarea id="f_af_list" rows="3" class="w-full font-mono text-[12px]">'
+                 + escapeHtml(d.af_list) + '</textarea>';
+        }
+
+        function uecpPsnEonAf(d) {
+            var text = (d.mapped || []).map(function(p) {
+                return (p.tuned || p[0]) + ' -> ' + (p.other || p[1]);
+            }).join(NL_CHAR);
+            return '<div class="text-[10px] text-gray-500 mb-1">'
+                 + 'Other-network frequencies, carried in group 14A. The plain list goes out '
+                 + 'as variant 4; a mapped pair as variants 5 to 8.</div>'
+                 + '<label class="text-[10px] text-gray-500">AF list (MHz, comma separated)</label>'
+                 + '<input type="text" id="f_af_list" class="w-full font-mono text-[12px]" value="'
+                 + escapeHtml(d.af_list) + '">'
+                 + '<label class="text-[10px] text-gray-500 mt-2 block">Mapped pairs, one per '
+                 + 'line, written as <span class="font-mono">tuning -&gt; other network</span></label>'
+                 + '<textarea id="f_mapped" rows="4" class="w-full font-mono text-[12px]">'
+                 + escapeHtml(text) + '</textarea>';
+        }
+
+        function uecpVal(id) {
+            var el = document.getElementById(id);
+            if (!el) return undefined;
+            return el.type === 'checkbox' ? (el.checked ? 1 : 0) : el.value;
+        }
+
+        function saveUecpPsn(dsn, psn) {
+            uecpPaneDirty = false;
+            var rows = uecpLocalRows(dsn);
+            var row = null;
+            rows.forEach(function(r) { if (r.psn === psn) row = r; });
+            if (!row) { row = {psn: psn}; rows.push(row); }
+
+            var eon = uecpVal('f_eon');
+            var main = uecpVal('f_main');
+            if (eon !== undefined) {
+                row.role = eon ? 'eon' : (main ? 'main' : 'off');
+                if (row.role === 'main') {
+                    rows.forEach(function(r) {
+                        if (r !== row && r.role === 'main') r.role = 'off';
+                    });
+                }
+            }
+            var enabled = uecpVal('f_enabled');
+            if (enabled !== undefined) row.enabled = !!enabled;
+
+            [['f_pi', 'pi'], ['f_ps', 'ps'], ['f_pty', 'pty'], ['f_ptyn', 'ptyn'],
+             ['f_tp', 'tp'], ['f_ta', 'ta'], ['f_af_list', 'af_list'],
+             ['f_en_pin', 'en_pin'], ['f_pin_day', 'pin_day'],
+             ['f_pin_hour', 'pin_hour'], ['f_pin_minute', 'pin_minute']
+            ].forEach(function(pair) {
+                var v = uecpVal(pair[0]);
+                if (v !== undefined) row[pair[1]] = v;
+            });
+
+            var la = uecpVal('f_la');
+            if (la !== undefined) {
+                row.linkage = {la: la, eg: uecpVal('f_eg'), ils: uecpVal('f_ils'),
+                               lsn: uecpVal('f_lsn')};
+            }
+            var mapped = uecpVal('f_mapped');
+            if (mapped !== undefined) {
+                row.mapped_freqs = mapped.split(NL_CHAR).map(function(line) {
+                    var bits = line.split('->');
+                    return bits.length === 2
+                        ? {tuned: bits[0].trim(), other: bits[1].trim()} : null;
+                }).filter(function(p) { return p && p.tuned && p.other; });
+            }
+            uecpSaveServices(dsn, rows);
+        }
+
+        function saveUecpIH() {
+            // In-House is an ordinary setting of this encoder, so it is written
+            // through the same inputs and the same sync() the internal coder
+            // uses. Duplicating the state here would only let the two disagree.
+            var pairs = {
+                uecp_en_ih: 'en_ih',
+                uecp_ih_first_start_date: 'ih_first_start_date',
+                uecp_en_ih_station_id: 'en_ih_station_id',
+                uecp_ih_frequency: 'ih_frequency',
+                uecp_ih_site_code: 'ih_site_code'
+            };
+            Object.keys(pairs).forEach(function(from) {
+                var a = document.getElementById(from);
+                var b = document.getElementById(pairs[from]);
+                if (!a || !b) return;
+                if (a.type === 'checkbox') { b.checked = a.checked; }
+                else { b.value = a.value; }
+            });
+            if (typeof sync === 'function') sync();
+        }
+
+        function showUecpIH(ih) {
+            if (!ih) return;
+            var pairs = {
+                uecp_en_ih: 'en_ih',
+                uecp_ih_first_start_date: 'ih_first_start_date',
+                uecp_en_ih_station_id: 'en_ih_station_id',
+                uecp_ih_frequency: 'ih_frequency',
+                uecp_ih_site_code: 'ih_site_code'
+            };
+            Object.keys(pairs).forEach(function(id) {
+                var el = document.getElementById(id);
+                if (!el || document.activeElement === el) return;
+                var v = ih[pairs[id]];
+                if (el.type === 'checkbox') { el.checked = !!v; }
+                else if (el.value !== String(v === undefined || v === null ? '' : v)) {
+                    el.value = (v === undefined || v === null) ? '' : v;
+                }
+            });
+        }
+
+        var uecpLinkDraft = null;
+        var uecpMecScopeSig = null;
+
+        function renderUecpLinks(data) {
+            var el = document.getElementById('uecp_links');
+            if (!el) return;
+            if (uecpLinkDraft === null) uecpLinkDraft = (data.links || []).map(
+                function(l) { return Object.assign({}, l); });
+            var busy = document.activeElement;
+            if (busy && busy.closest && busy.closest('#uecp_links')) return;
+
+            var html = '<table class="w-full text-[11px]"><tr class="text-gray-500">'
+                     + '<td>On</td><td>Name</td><td>Type</td><td>Address</td><td>Port</td>'
+                     + '<td>Access rights</td><td>State</td><td></td></tr>';
+            uecpLinkDraft.forEach(function(l, i) {
+                var live = (data.links || [])[i] || {};
+                var isWs = l.kind === 'ws';
+                html += '<tr>'
+                  + '<td><input type="checkbox"' + (l.enabled ? ' checked' : '')
+                  + ' onchange="uecpLinkField(' + i + ',&quot;enabled&quot;,this)"></td>'
+                  + '<td><input type="text" style="width:7rem" value="' + escapeHtml(l.name || '')
+                  + '" onchange="uecpLinkField(' + i + ',&quot;name&quot;,this)"></td>'
+                  + '<td class="text-gray-400">' + (isWs ? 'WebSocket' : 'TCP') + '</td>'
+                  + '<td><input type="text" style="width:' + (isWs ? '16rem' : '8rem') + '" value="'
+                  + escapeHtml(isWs ? (l.url || '') : (l.host || '0.0.0.0'))
+                  + '" onchange="uecpLinkField(' + i + ',&quot;'
+                  + (isWs ? 'url' : 'host') + '&quot;,this)"></td>'
+                  + '<td>' + (isWs ? '<span class="text-gray-600">-</span>'
+                     : '<input type="number" style="width:5rem" value="' + (l.port || 0)
+                       + '" onchange="uecpLinkField(' + i + ',&quot;port&quot;,this)">') + '</td>'
+                  + '<td class="text-gray-400">'
+                  + (l.mec_allowed === null || l.mec_allowed === undefined
+                     ? 'default' : l.mec_allowed.length + ' allowed') + '</td>'
+                  + '<td class="' + (live.state === 'connected' || live.state === 'listening'
+                                     ? 'text-green-400' : 'text-gray-500') + '">'
+                  + escapeHtml(live.state || 'off')
+                  + (live.clients ? ' (' + live.clients + ')' : '')
+                  + (live.error ? ' <span class="text-red-400">' + escapeHtml(live.error) + '</span>' : '')
+                  + '</td>'
+                  + '<td><button class="btn" onclick="removeUecpLink(' + i + ')">&times;</button></td>'
+                  + '</tr>';
+            });
+            html += '</table>';
+            el.innerHTML = html;
+
+            // Keep the access-rights selector in step with the list.
+            var sel = document.getElementById('uecp_mec_scope');
+            if (sel) {
+                var sig = uecpLinkDraft.map(function(l) { return l.name; }).join('|');
+                if (sig !== uecpMecScopeSig) {
+                    uecpMecScopeSig = sig;
+                    var keep = sel.value;
+                    sel.innerHTML = '<option value="-1">every connection (default)</option>'
+                        + uecpLinkDraft.map(function(l, i) {
+                            return '<option value="' + i + '">' + escapeHtml(l.name || ('Link ' + (i + 1)))
+                                 + '</option>';
+                        }).join('');
+                    sel.value = keep;
+                    if (sel.selectedIndex < 0) sel.value = '-1';
+                }
+            }
+        }
+
+        function uecpLinkField(i, field, el) {
+            var v = el.type === 'checkbox' ? el.checked
+                  : (field === 'port' ? parseInt(el.value, 10) || 0 : el.value);
+            uecpLinkDraft[i][field] = v;
+            if (field === 'name') uecpMecScopeSig = null;
+        }
+
+        function addUecpLink(kind) {
+            if (uecpLinkDraft === null) uecpLinkDraft = [];
+            var n = uecpLinkDraft.length + 1;
+            uecpLinkDraft.push(kind === 'ws'
+                ? {name: 'WebSocket ' + n, kind: 'ws', enabled: false, url: '',
+                   mec_allowed: null, timeout: 0}
+                : {name: 'TCP ' + n, kind: 'tcp', enabled: false, host: '0.0.0.0',
+                   port: 0, mec_allowed: null, timeout: 0});
+            uecpMecScopeSig = null;
+            renderUecpLinks(uecpLastStatus);
+        }
+
+        function removeUecpLink(i) {
+            uecpLinkDraft.splice(i, 1);
+            uecpMecScopeSig = null;
+            renderUecpLinks(uecpLastStatus);
+        }
+
+        function saveUecpLinks() {
+            var msg = document.getElementById('uecp_links_msg');
+            fetch('/uecp/links', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({links: uecpLinkDraft || []})
+            }).then(function(r) { return r.json().then(function(j) { return [r.ok, j]; }); })
+              .then(function(p) {
+                  if (msg) {
+                      msg.textContent = p[0] ? 'Saved - connections restarted.'
+                                             : (p[1].error || 'Could not save');
+                      msg.className = 'text-[10px] ' + (p[0] ? 'text-green-400' : 'text-red-400');
+                  }
+                  if (p[0]) { uecpLinkDraft = null; pollUecp(); }
+              });
+        }
+
+        function setUecpMecAll(on) {
+            document.querySelectorAll('.uecp-mec').forEach(function(box) {
+                box.checked = on;
+            });
+            uecpMecTouched = true;
+        }
+
+        function uecpMecScope() {
+            var sel = document.getElementById('uecp_mec_scope');
+            return sel ? parseInt(sel.value, 10) : -1;
+        }
+
+        function showUecpMecRights(data) {
+            var boxes = document.querySelectorAll('.uecp-mec');
+            if (!boxes.length || uecpMecTouched) return;
+            var scope = uecpMecScope();
+            var allowed = scope < 0
+                ? data.mec_allowed
+                : ((data.links || [])[scope] || {}).mec_allowed;
+            boxes.forEach(function(box) {
+                var code = parseInt(box.value, 10);
+                box.checked = (allowed === null || allowed === undefined)
+                              || allowed.indexOf(code) !== -1;
+            });
+        }
+
+
+
+        function saveUecpMecRights() {
+            var allowed = [];
+            var boxes = document.querySelectorAll('.uecp-mec');
+            boxes.forEach(function(box) {
+                if (box.checked) allowed.push(parseInt(box.value, 10));
+            });
+            var everything = allowed.length === boxes.length;
+            var scope = uecpMecScope();
+            var msg = document.getElementById('uecp_mec_msg');
+            var request;
+            if (scope < 0) {
+                request = fetch('/uecp/mec-rights', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(everything ? {all: true} : {allowed: allowed})
+                });
+            } else {
+                // One connection's own rights live with the connection.
+                var links = (uecpLinkDraft || uecpLastStatus.links || []).map(
+                    function(l) { return Object.assign({}, l); });
+                if (links[scope]) links[scope].mec_allowed = everything ? null : allowed;
+                request = fetch('/uecp/links', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({links: links})
+                });
+                uecpLinkDraft = null;
+            }
+            request.then(function(r) { return r.json().then(function(j) { return [r.ok, j]; }); })
+              .then(function(p) {
+                  uecpMecTouched = false;
+                  if (p[0]) pollUecp();
+                  if (!msg) return;
+                  msg.textContent = p[0]
+                      ? (everything ? 'every command allowed'
+                         : allowed.length + ' of ' + boxes.length + ' allowed')
+                      : (p[1].error || 'could not save');
+                  msg.className = 'text-[10px] ' + (p[0] ? 'text-green-400' : 'text-red-400');
+              });
         }
 
         function saveUecpSetSequence(dsn) {
@@ -17673,74 +18890,47 @@ UI_HTML = r"""
         function renderUecpDetail(data) {
             var el = document.getElementById('uecp_detail');
             if (!el) return;
-            // A data set is selected as "<dsn>/" and a service as "<dsn>/<psn>".
-            if (uecpSelected && uecpSelected.slice(-1) === '/') {
-                var wantDsn = parseInt(uecpSelected, 10);
-                var found = (data.tree || data.data_sets || []).filter(function(ds) {
-                    return ds.dsn === wantDsn;
-                })[0];
-                if (found) {
-                    // Never redraw the field out from under someone typing in it.
-                    var box = document.getElementById('uecp_ds_seq');
-                    if (!box || document.activeElement !== box) {
-                        renderUecpSetDetail(data, found);
-                    }
-                    return;
-                }
-            }
-            var chosen = null, parent = null;
-            (data.tree || data.data_sets || []).forEach(function(ds) {
-                ds.services.forEach(function(svc) {
-                    var key = ds.dsn + '/' + svc.psn;
-                    if (key === uecpSelected) { chosen = svc; parent = ds; }
-                    // Default to the live data set's main service.
-                    if (!uecpSelected && ds.dsn === data.current && svc.psn === ds.main_psn) {
-                        chosen = svc; parent = ds; uecpSelected = key;
+            if (!uecpSelected) {
+                // Start on the live data set's main service.
+                (data.tree || []).forEach(function(ds) {
+                    if (ds.dsn === data.current && !uecpSelected) {
+                        uecpSelected = ds.dsn + '/' + ds.main_psn;
                     }
                 });
-            });
-            if (!chosen) {
-                el.innerHTML = '<span class="text-gray-500">Nothing received yet.</span>';
+            }
+            if (!uecpSelected) return;
+
+            var bits = uecpSelected.split('/');
+            var dsn = parseInt(bits[0], 10);
+            var ds = (data.tree || []).filter(function(d) { return d.dsn === dsn; })[0];
+            if (!ds) return;
+
+            if (bits[1] === '') {
+                if (uecpPaneKey === 'dsn:' + dsn) return;
+                uecpPaneKey = 'dsn:' + dsn;
+                renderUecpSetDetail(data, ds);
                 return;
             }
-            var rows = [
-                ['PI', chosen.pi || '-'],
-                ['PS', chosen.ps || '-'],
-                ['RadioText', chosen.rt || '-'],
-                ['RT messages', chosen.rt_count],
-                ['PTY', chosen.pty === null ? '-' : chosen.pty],
-                ['PTYN', chosen.ptyn || '-'],
-                ['Long PS', chosen.long_ps || '-'],
-                ['TA / TP', (chosen.ta ? 'TA' : '-') + ' / ' + (chosen.tp ? 'TP' : '-')],
-                ['M/S', chosen.ms ? 'Music' : 'Speech'],
-                ['DI', '0x' + (chosen.di || 0).toString(16).toUpperCase()],
-                ['PIN', chosen.pin === null ? '-' : chosen.pin],
-                ['AF bytes', chosen.af_bytes],
-                ['Role', chosen.psn === parent.main_psn ? 'Main service (transmitted)'
-                                                        : 'Other network (EON)'],
-                ['Last update', uecpAge(chosen.updated_at)]
-            ];
-            var html = '<div class="text-pink-400 mb-1">Data Set ' + parent.dsn
-                     + ' / PSN ' + chosen.psn + '</div><table class="w-full text-xs">';
-            rows.forEach(function(r) {
-                html += '<tr><td class="text-gray-400 pr-3 align-top" style="width:9rem">'
-                      + r[0] + '</td><td class="text-gray-200">' + escapeHtml(String(r[1])) + '</td></tr>';
+
+            var psn = parseInt(bits[1], 10);
+            // The key carries what the source has sent for this service, so the
+            // pane follows data arriving after it was opened - PTY, PTYN and a
+            // Programme Item Number all turn up seconds or minutes apart.
+            var recv = null;
+            ds.services.forEach(function(svc) {
+                if (svc.psn === psn && !svc.empty) recv = svc;
             });
-            html += '</table>';
-            if (parent.group_sequence && parent.group_sequence.length) {
-                html += '<div class="mt-2 text-gray-400">Group sequence: <span class="text-gray-200">'
-                      + parent.group_sequence.map(function(b) {
-                            return ((b >> 1) & 0x0F) + (b & 1 ? 'B' : 'A');
-                        }).join(', ') + '</span></div>';
-            }
-            var slc = parent.slc || {};
-            if (Object.keys(slc).length) {
-                html += '<div class="mt-1 text-gray-400">Slow labelling: <span class="text-gray-200">'
-                      + Object.keys(slc).map(function(v) {
-                            return 'variant ' + v + ' = 0x' + slc[v].toString(16).toUpperCase();
-                        }).join(', ') + '</span></div>';
-            }
-            el.innerHTML = html;
+            var stamp = recv
+                ? [recv.pi, recv.ps, recv.pty, recv.ptyn, recv.pin, recv.tp,
+                   recv.ta, recv.di, recv.ms, recv.rt].join('~')
+                : 'none';
+            var key = 'psn:' + dsn + ':' + psn + ':' + uecpPsnTab + ':' + stamp;
+            if (uecpPaneKey === key) return;      // already on screen as it is
+            // Never redraw over someone's work: not while the pane has focus,
+            // and not while it holds edits that have not been saved.
+            if (uecpPaneKey !== null && (uecpPaneDirty || uecpPaneHasFocus())) return;
+            uecpPaneKey = key;
+            renderUecpPsnForm(data, ds, psn);
         }
 
         function renderUecpStatus(data) {
@@ -17801,6 +18991,9 @@ UI_HTML = r"""
                 ctStatus.textContent = text;
                 ctStatus.className = data.ct_sending ? 'text-green-300' : 'text-gray-400';
             }
+            showUecpIH(data.ih);
+            renderUecpLinks(data);
+            showUecpMecRights(data);
             var originEl = document.getElementById('uecp_seq_origin');
             if (originEl) originEl.textContent = data.sequence_origin
                 ? '(' + data.sequence_origin + ')' : '';
@@ -17878,6 +19071,7 @@ UI_HTML = r"""
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
                     if (!data.active) return;
+                    uecpLastStatus = data;
                     renderUecpStatus(data);
                     renderUecpTree(data);
                     renderUecpDetail(data);
