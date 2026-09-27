@@ -39,7 +39,8 @@ from .element import (DSN_ALL, DSN_ALL_OTHER, DSN_CURRENT, PSN_MAIN, Element,
                       ElementError, build, dsn_targets, psn_targets, split)
 from .store import Clock, DataSet, ProgrammeService, RtMessage, Store
 from .handler import apply_element, apply_frame
-from .bridge import af_codes_to_mhz, apply_to_state, sequence_overrides
+from .bridge import (CT_MODES, af_codes_to_mhz, apply_to_state,
+                     clock_time_wanted, sequence_overrides)
 from .transport import TcpListener, WebSocketClient
 
 __all__ = [
@@ -50,6 +51,6 @@ __all__ = [
     "ElementError", "build", "dsn_targets", "psn_targets", "split",
     "Clock", "DataSet", "ProgrammeService", "RtMessage", "Store",
     "apply_element", "apply_frame", "af_codes_to_mhz", "apply_to_state",
-    "sequence_overrides",
+    "sequence_overrides", "CT_MODES", "clock_time_wanted",
     "TcpListener", "WebSocketClient",
 ]

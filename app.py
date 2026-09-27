@@ -436,6 +436,10 @@ default_state = {
     # Blank = automatic: follow the source's own MEC 0x16, or derive a sequence
     # from what it has sent. Set it to force a specific sequence instead.
     "uecp_group_sequence": "",
+    # Clock Time applies to the whole encoder, not to a data set: "source" only
+    # transmits a time the source has sent, "local" uses this machine's clock
+    # the way the internal coder does, "off" never sends 4A at all.
+    "uecp_ct_mode": "source",
 
     # Enhanced RadioText (eRT) - ODA Application
     "en_ert": False,  # Enable eRT transmission
@@ -7220,6 +7224,11 @@ def uecp_status():
         'sequence_origin': state.get("uecp_sequence_origin", "automatic"),
         'sequence_override': state.get("uecp_group_sequence", ""),
         'sequence_overrides': uecp.sequence_overrides(state),
+        'ct_mode': state.get("uecp_ct_mode", "source"),
+        'ct_sending': bool(state.get("en_ct")),
+        'ct_from_source': bool(store.ct_on and store.clock.valid),
+        'ct_clock': str(store.clock),
+        'tz_offset': state.get("tz_offset", 0.0),
         'sequence_dsn': state.get("uecp_sequence_dsn", store.current),
         'tcp': {
             'enabled': bool(state.get("uecp_tcp_enabled", True)),
@@ -7239,6 +7248,12 @@ def uecp_status():
     })
     return jsonify(data)
 
+
+# Restarting the transports drops a connected source, so it only happens when
+# one of these actually changes - not when the operator edits a clock setting.
+TRANSPORT_KEYS = ("uecp_tcp_enabled", "uecp_ws_enabled", "uecp_host",
+                  "uecp_port", "uecp_ws_url", "uecp_site_address",
+                  "uecp_encoder_address")
 
 GROUP_TOKEN = re.compile(r"^(1[0-5]|[0-9])([AB])$", re.I)
 
@@ -7303,7 +7318,9 @@ def uecp_settings():
     """Transport settings for this profile. The RDS data itself stays read-only."""
     if not session.get('auth'):
         return jsonify({'error': 'Not authenticated'}), 401
+    import uecp
     data = request.json or {}
+    before = [state.get(k) for k in TRANSPORT_KEYS]
     state["uecp_tcp_enabled"] = bool(data.get("uecp_tcp_enabled", True))
     state["uecp_ws_enabled"] = bool(data.get("uecp_ws_enabled", False))
     state["uecp_host"] = str(data.get("uecp_host", "0.0.0.0")).strip() or "0.0.0.0"
@@ -7320,6 +7337,13 @@ def uecp_settings():
         overrides.pop(dsn, None)
     state["uecp_group_sequence_by_dsn"] = json.dumps(overrides, sort_keys=True)
     state["uecp_group_sequence"] = seq
+
+    mode = str(data.get("uecp_ct_mode", state.get("uecp_ct_mode", "source"))).strip().lower()
+    state["uecp_ct_mode"] = mode if mode in uecp.CT_MODES else "source"
+    try:
+        state["tz_offset"] = max(-14.0, min(14.0, float(data.get("tz_offset", state.get("tz_offset", 0.0)))))
+    except (TypeError, ValueError):
+        pass
     for key, lo, hi, fallback in (("uecp_port", 1, 65535, 4001),
                                   ("uecp_site_address", 0, 1023, 0),
                                   ("uecp_encoder_address", 0, 63, 0)):
@@ -7328,7 +7352,16 @@ def uecp_settings():
         except (TypeError, ValueError):
             state[key] = fallback
     save_config()
-    start_uecp()
+    if [state.get(k) for k in TRANSPORT_KEYS] != before:
+        start_uecp()            # only when the connection itself changed
+    elif _uecp_store is not None:
+        # A settings change: leave the feed connected, but work out what it
+        # means for the air straight away rather than leaving the operator
+        # looking at a stale panel until the apply loop next ticks.
+        try:
+            uecp.apply_to_state(_uecp_store, state)
+        except Exception as exc:
+            print(f"[UECP] apply after settings change failed: {exc}", flush=True)
     return jsonify({'success': True})
 
 
@@ -10411,6 +10444,32 @@ UI_HTML = r"""
                                     <span class="text-gray-400">In use:</span>
                                     <span id="uecp_seq_live" class="text-gray-200 font-mono">-</span>
                                     <span id="uecp_seq_origin" class="text-gray-500"></span>
+                                </div>
+                            </div>
+
+                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3 col-span-2">
+                                <label class="text-[10px] text-gray-500">Clock Time (group 4A)</label>
+                                <div class="flex items-center gap-3 mt-1">
+                                    <select id="uecp_ct_mode" style="width:20rem" onchange="saveUecpTransport()">
+                                        <option value="source">From the source - only if it sends a time</option>
+                                        <option value="local">From this encoder's clock</option>
+                                        <option value="off">Never send CT</option>
+                                    </select>
+                                    <label class="text-[10px] text-gray-500">UTC offset trim</label>
+                                    <input type="number" id="tz_offset" step="0.5" min="-14" max="14"
+                                           style="width:5.5rem" value="{{ state.tz_offset or 0 }}"
+                                           onchange="saveUecpTransport()">
+                                    <div class="text-[10px] text-gray-500 flex-1">
+                                        There is one clock for the whole encoder, so this applies to
+                                        every data set and service. <b>From this encoder's clock</b>
+                                        behaves exactly like the internal coder: 4A goes out on the
+                                        minute using this machine's time, including its daylight
+                                        saving, plus the trim.
+                                    </div>
+                                </div>
+                                <div class="text-[11px] mt-2">
+                                    <span class="text-gray-400">Status:</span>
+                                    <span id="uecp_ct_status" class="text-gray-200">-</span>
                                 </div>
                             </div>
 
@@ -17424,7 +17483,9 @@ UI_HTML = r"""
                     uecp_ws_url: document.getElementById('uecp_ws_url').value,
                     uecp_site_address: parseInt(document.getElementById('uecp_site_address').value, 10) || 0,
                     uecp_encoder_address: parseInt(document.getElementById('uecp_encoder_address').value, 10) || 0,
-                    uecp_group_sequence: document.getElementById('uecp_group_sequence').value
+                    uecp_group_sequence: document.getElementById('uecp_group_sequence').value,
+                    uecp_ct_mode: document.getElementById('uecp_ct_mode').value,
+                    tz_offset: parseFloat(document.getElementById('tz_offset').value) || 0
                 })
             }).then(function() { pollUecp(); })
               .catch(function(e) { alert('Could not apply UECP settings: ' + e); });
@@ -17713,6 +17774,32 @@ UI_HTML = r"""
                 && data.sequence_override !== undefined
                 && boxEl.value !== data.sequence_override) {
                 boxEl.value = data.sequence_override;
+            }
+            var ctEl = document.getElementById('uecp_ct_mode');
+            if (ctEl && document.activeElement !== ctEl && data.ct_mode
+                && ctEl.value !== data.ct_mode) {
+                ctEl.value = data.ct_mode;
+            }
+            var tzEl = document.getElementById('tz_offset');
+            if (tzEl && document.activeElement !== tzEl && data.tz_offset !== undefined
+                && parseFloat(tzEl.value) !== data.tz_offset) {
+                tzEl.value = data.tz_offset;
+            }
+            var ctStatus = document.getElementById('uecp_ct_status');
+            if (ctStatus) {
+                var text;
+                if (!data.ct_sending) {
+                    text = data.ct_mode === 'off'
+                        ? 'not sent - turned off here'
+                        : 'not sent - the source has not sent a time';
+                } else if (data.ct_mode === 'local') {
+                    text = "sending 4A on the minute from this encoder's clock";
+                } else {
+                    text = 'sending 4A from the source - last time received: '
+                         + (data.ct_clock || 'unknown');
+                }
+                ctStatus.textContent = text;
+                ctStatus.className = data.ct_sending ? 'text-green-300' : 'text-gray-400';
             }
             var originEl = document.getElementById('uecp_seq_origin');
             if (originEl) originEl.textContent = data.sequence_origin

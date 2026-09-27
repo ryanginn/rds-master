@@ -29,6 +29,34 @@ SLC_VARIANT_ECC = 0      # paging + Extended Country Code; ECC is the low byte
 SLC_VARIANT_LIC = 3      # Language Identification Code
 
 
+CT_FROM_SOURCE = "source"     # only when the source has sent a time (default)
+CT_FROM_LOCAL = "local"      # this encoder's own clock, as the internal coder does
+CT_OFF = "off"               # never, whatever the source sends
+CT_MODES = (CT_FROM_SOURCE, CT_FROM_LOCAL, CT_OFF)
+
+
+def clock_time_wanted(store: Store, state: dict) -> bool:
+    """Whether group 4A should be transmitted.
+
+    Clock Time is not a data set's property - there is one clock and it applies
+    to the whole encoder - so this is a global setting rather than something
+    held per DSN.
+
+    By default CT follows the source: the encoder's clock is not the source's,
+    and a time with nothing behind it is exactly the sort of invented content
+    UECP mode must not transmit. An operator whose source sends no clock can
+    set it to run from this machine's clock instead, which is what the internal
+    coder does, or turn it off outright when a source is sending a time that is
+    wrong.
+    """
+    mode = str(state.get("uecp_ct_mode", CT_FROM_SOURCE) or CT_FROM_SOURCE).strip().lower()
+    if mode == CT_FROM_LOCAL:
+        return True
+    if mode == CT_OFF:
+        return False
+    return bool(store.ct_on and store.clock.valid)
+
+
 def sequence_overrides(state: dict) -> dict:
     """The operator's per-data-set group sequences, {"<dsn>": "0A 2A ..."}."""
     try:
@@ -120,6 +148,9 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
         put("uecp_group_sequence", manual)
         state["uecp_sequence_origin"] = "set here" if manual else "automatic"
         state["uecp_sequence_dsn"] = store.current
+        # CT is the encoder's, not a data set's, so an operator who has asked
+        # for it still gets it even before any source has connected.
+        put("en_ct", 1 if clock_time_wanted(store, state) else 0)
         return changed
 
     if main.pi is not None:
@@ -253,10 +284,7 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
     state["uecp_sequence_origin"] = origin
     state["uecp_sequence_dsn"] = ds.dsn
 
-    # Clock Time only goes out once the source has actually sent a time. The
-    # encoder's own clock is not the source's, and CT with nothing behind it is
-    # exactly the sort of default that should not appear in UECP mode.
-    put("en_ct", 1 if (store.ct_on and store.clock.valid) else 0)
+    put("en_ct", 1 if clock_time_wanted(store, state) else 0)
 
     # Group 1A carries ECC and LIC, and both arrive as slow labelling codes:
     # variant 0's low byte is the Extended Country Code, variant 3's is the
@@ -304,8 +332,10 @@ def derive_sequence(store, ds) -> str:
         seq += ["15A", "0A"]
     if [x for x in ds.others if x.enabled and x.pi is not None]:
         seq += ["14A", "0A"]
-    if store.ct_on and store.clock.valid:
-        seq += ["4A", "0A"]
+    # No 4A here. Clock Time is sent by the generator on the minute boundary,
+    # pre-empting the schedule, because a 4A carrying a time that is not aligned
+    # to second zero would set receiver clocks wrong. A 4A slot in the sequence
+    # would only ever be filled with PS.
     # Every group type with raw data waiting gets slots, and a backed-up queue
     # gets more of them. TMC and RT+ both arrive faster than one slot per cycle
     # can carry, and a queue that only grows puts minutes-old data on air. The
