@@ -1,7 +1,27 @@
-numpy
-scipy
-sounddevice
-flask
-flask-socketio
-websocket-client
-pyserial
+# RDS Master Pro - Python dependencies
+#   pip install -r requirements.txt
+#
+# Versions are the ones this has been run against; older ones may well work.
+
+# Web UI and its socket transport
+Flask>=3.0
+flask-socketio>=5.3
+
+# DSP: the MPX generator and the RDS subcarrier
+numpy>=1.24
+scipy>=1.10
+
+# Audio in and out, through PortAudio
+sounddevice>=0.4.6
+
+# UECP over WebSocket. Without it the TCP listener still works and the
+# WebSocket client reports that it is unavailable rather than failing quietly.
+websocket-client>=1.6
+
+# --- Optional -------------------------------------------------------------
+# Serial RDS output to an external encoder. Imported in a try/except: without
+# it the serial options are simply not offered.
+pyserial>=3.5
+
+# CPU and memory figures in the status panel. Also optional.
+psutil>=5.9

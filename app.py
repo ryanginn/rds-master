@@ -16,6 +16,19 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import sys as _sys
+
+# The startup messages contain tick and warning characters, and a Windows
+# console defaults to cp1252, which cannot encode them. Printing one there
+# raised UnicodeEncodeError part-way through loading the configuration and
+# stopped the encoder before it ever started, so the console is put into UTF-8
+# and told to substitute anything it still cannot render.
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 import numpy as np
 import sounddevice as sd
 import threading
@@ -94,79 +107,9 @@ DAB_CHANNELS = {
 }
 
 # --- RDS CHARACTER ENCODING (IEC 62106-4:2018 Table 5) ---
-# RDS uses its own character set, NOT ISO-8859-1/Latin-1
-# This table maps RDS byte codes (0x00-0xFF) to Unicode code points
-RDS_TO_UNICODE = {
-    0x00: 0x0000, 0x01: 0x0001, 0x02: 0x0002, 0x03: 0x0003,
-    0x04: 0x0004, 0x05: 0x0005, 0x06: 0x0006, 0x07: 0x0007,
-    0x08: 0x0008, 0x09: 0x0009, 0x0A: 0x000A, 0x0B: 0x000B,
-    0x0C: 0x000C, 0x0D: 0x000D, 0x0E: 0x000E, 0x0F: 0x000F,
-    0x10: 0x0010, 0x11: 0x0011, 0x12: 0x0012, 0x13: 0x0013,
-    0x14: 0x0014, 0x15: 0x0015, 0x16: 0x0016, 0x17: 0x0017,
-    0x18: 0x0018, 0x19: 0x0019, 0x1A: 0x001A, 0x1B: 0x001B,
-    0x1C: 0x001C, 0x1D: 0x001D, 0x1E: 0x001E, 0x1F: 0x001F,
-    0x20: 0x0020, 0x21: 0x0021, 0x22: 0x0022, 0x23: 0x0023,
-    0x24: 0x00A4, 0x25: 0x0025, 0x26: 0x0026, 0x27: 0x0027,  # 0x24 is ¤ not $
-    0x28: 0x0028, 0x29: 0x0029, 0x2A: 0x002A, 0x2B: 0x002B,
-    0x2C: 0x002C, 0x2D: 0x002D, 0x2E: 0x002E, 0x2F: 0x002F,
-    0x30: 0x0030, 0x31: 0x0031, 0x32: 0x0032, 0x33: 0x0033,
-    0x34: 0x0034, 0x35: 0x0035, 0x36: 0x0036, 0x37: 0x0037,
-    0x38: 0x0038, 0x39: 0x0039, 0x3A: 0x003A, 0x3B: 0x003B,
-    0x3C: 0x003C, 0x3D: 0x003D, 0x3E: 0x003E, 0x3F: 0x003F,
-    0x40: 0x0040, 0x41: 0x0041, 0x42: 0x0042, 0x43: 0x0043,
-    0x44: 0x0044, 0x45: 0x0045, 0x46: 0x0046, 0x47: 0x0047,
-    0x48: 0x0048, 0x49: 0x0049, 0x4A: 0x004A, 0x4B: 0x004B,
-    0x4C: 0x004C, 0x4D: 0x004D, 0x4E: 0x004E, 0x4F: 0x004F,
-    0x50: 0x0050, 0x51: 0x0051, 0x52: 0x0052, 0x53: 0x0053,
-    0x54: 0x0054, 0x55: 0x0055, 0x56: 0x0056, 0x57: 0x0057,
-    0x58: 0x0058, 0x59: 0x0059, 0x5A: 0x005A, 0x5B: 0x005B,
-    0x5C: 0x005C, 0x5D: 0x005D, 0x5E: 0x2015, 0x5F: 0x005F,  # 0x5E is ― not ^
-    0x60: 0x2016, 0x61: 0x0061, 0x62: 0x0062, 0x63: 0x0063,  # 0x60 is ║ not `
-    0x64: 0x0064, 0x65: 0x0065, 0x66: 0x0066, 0x67: 0x0067,
-    0x68: 0x0068, 0x69: 0x0069, 0x6A: 0x006A, 0x6B: 0x006B,
-    0x6C: 0x006C, 0x6D: 0x006D, 0x6E: 0x006E, 0x6F: 0x006F,
-    0x70: 0x0070, 0x71: 0x0071, 0x72: 0x0072, 0x73: 0x0073,
-    0x74: 0x0074, 0x75: 0x0075, 0x76: 0x0076, 0x77: 0x0077,
-    0x78: 0x0078, 0x79: 0x0079, 0x7A: 0x007A, 0x7B: 0x007B,
-    0x7C: 0x007C, 0x7D: 0x007D, 0x7E: 0x203E, 0x7F: 0x007F,  # 0x7E is ¯ not ~
-    0x80: 0x00E1, 0x81: 0x00E0, 0x82: 0x00E9, 0x83: 0x00E8,
-    0x84: 0x00ED, 0x85: 0x00EC, 0x86: 0x00F3, 0x87: 0x00F2,
-    0x88: 0x00FA, 0x89: 0x00F9, 0x8A: 0x00D1, 0x8B: 0x00C7,
-    0x8C: 0x015E, 0x8D: 0x00DF, 0x8E: 0x00A1, 0x8F: 0x0132,
-    0x90: 0x00E2, 0x91: 0x00E4, 0x92: 0x00EA, 0x93: 0x00EB,
-    0x94: 0x00EE, 0x95: 0x00EF, 0x96: 0x00F4, 0x97: 0x00F6,
-    0x98: 0x00FB, 0x99: 0x00FC, 0x9A: 0x00F1, 0x9B: 0x00E7,
-    0x9C: 0x015F, 0x9D: 0x011F, 0x9E: 0x0131, 0x9F: 0x0133,
-    0xA0: 0x00AA, 0xA1: 0x03B1, 0xA2: 0x00A9, 0xA3: 0x2030,
-    0xA4: 0x011E, 0xA5: 0x011B, 0xA6: 0x0148, 0xA7: 0x0151,
-    0xA8: 0x03C0, 0xA9: 0x20AC, 0xAA: 0x00A3, 0xAB: 0x0024,
-    0xAC: 0x2190, 0xAD: 0x2191, 0xAE: 0x2192, 0xAF: 0x2193,
-    0xB0: 0x00BA, 0xB1: 0x00B9, 0xB2: 0x00B2, 0xB3: 0x00B3,
-    0xB4: 0x00B1, 0xB5: 0x0130, 0xB6: 0x0144, 0xB7: 0x0171,
-    0xB8: 0x00B5, 0xB9: 0x00BF, 0xBA: 0x00F7, 0xBB: 0x00B0,
-    0xBC: 0x00BC, 0xBD: 0x00BD, 0xBE: 0x00BE, 0xBF: 0x00A7,
-    0xC0: 0x00C1, 0xC1: 0x00C0, 0xC2: 0x00C9, 0xC3: 0x00C8,
-    0xC4: 0x00CD, 0xC5: 0x00CC, 0xC6: 0x00D3, 0xC7: 0x00D2,
-    0xC8: 0x00DA, 0xC9: 0x00D9, 0xCA: 0x0158, 0xCB: 0x010C,
-    0xCC: 0x0160, 0xCD: 0x017D, 0xCE: 0x00D0, 0xCF: 0x013F,
-    0xD0: 0x00C2, 0xD1: 0x00C4, 0xD2: 0x00CA, 0xD3: 0x00CB,
-    0xD4: 0x00CE, 0xD5: 0x00CF, 0xD6: 0x00D4, 0xD7: 0x00D6,
-    0xD8: 0x00DB, 0xD9: 0x00DC, 0xDA: 0x0159, 0xDB: 0x010D,
-    0xDC: 0x0161, 0xDD: 0x017E, 0xDE: 0x0111, 0xDF: 0x0140,
-    0xE0: 0x00C3, 0xE1: 0x00C5, 0xE2: 0x00C6, 0xE3: 0x0152,
-    0xE4: 0x0177, 0xE5: 0x00DD, 0xE6: 0x00D5, 0xE7: 0x00D8,
-    0xE8: 0x00DE, 0xE9: 0x014A, 0xEA: 0x0154, 0xEB: 0x0106,
-    0xEC: 0x015A, 0xED: 0x0179, 0xEE: 0x0166, 0xEF: 0x00F0,
-    0xF0: 0x00E3, 0xF1: 0x00E5, 0xF2: 0x00E6, 0xF3: 0x0153,
-    0xF4: 0x0175, 0xF5: 0x00FD, 0xF6: 0x00F5, 0xF7: 0x00F8,
-    0xF8: 0x00FE, 0xF9: 0x014B, 0xFA: 0x0155, 0xFB: 0x0107,
-    0xFC: 0x015B, 0xFD: 0x017A, 0xFE: 0x0167, 0xFF: 0x0000,
-}
-
-# Create reverse mapping: Unicode to RDS
-UNICODE_TO_RDS = {v: k for k, v in RDS_TO_UNICODE.items() if v != 0x0000 or k == 0x00}
-# Handle special case: $ (U+0024) should map to 0xAB in RDS, not be missing
-UNICODE_TO_RDS[0x0024] = 0xAB  # Dollar sign at correct position
+# The table lives in rds_charset.py so the uecp package can use the same one.
+from rds_charset import (RDS_TO_UNICODE, UNICODE_TO_RDS,
+                         rds_bytes_to_text, text_to_rds_bytes)
 
 # RDS PTY List (Europe/Rest of World)
 PTY_LIST_RDS = ["None", "News", "Current Affairs", "Information", "Sport", "Education", "Drama", "Culture", "Science", "Varied", "Pop Music", "Rock Music", "Easy Music", "Light Classical", "Serious Classical", "Other Music", "Weather", "Finance", "Children's", "Social Affairs", "Religion", "Phone-In", "Travel", "Leisure", "Jazz", "Country", "National Music", "Oldies", "Folk Music", "Documentary", "Alarm Test", "Alarm"]
@@ -307,7 +250,11 @@ def get_rtplus_type_info(type_code):
 
 app = Flask(__name__)
 CONFIG_FILE = 'config.ini'  # Legacy - deprecated
-DATASETS_FILE = os.path.join(os.path.dirname(__file__), 'datasets.json')
+# Configuration file. RDS_DATASETS_FILE points it elsewhere - used by the test
+# suite so it never touches a live on-air configuration, and handy for running a
+# second instance from the same directory.
+DATASETS_FILE = os.environ.get("RDS_DATASETS_FILE") or os.path.join(
+    os.path.dirname(__file__), 'datasets.json')
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
 
@@ -373,6 +320,7 @@ default_state = {
     # Audio
     "device_out_idx": 0, "device_in_idx": -1,
     "genlock": False, "passthrough": False,
+    "show_all_hostapis": 0,   # Windows: list every host API, not just MME
     "pilot_level": 0.0, "rds_level": 4.5, "genlock_offset": 0.0,
     "output_channel": "both",  # Output routing: "both", "left", "right"
 
@@ -406,6 +354,9 @@ default_state = {
     
     # Expert
     "ecc": "E3", "lic": "09", "tz_offset": 0.0, "en_ct": 1, "en_id": 1,
+    # Sub-flags of en_id. Always on for the internal coder; UECP mode clears
+    # whichever slow labelling variant the source has not sent.
+    "en_ecc": 1, "en_lic": 1,
     "en_pin": 0, "pin_day": 0, "pin_hour": 0, "pin_minute": 0,
     "ps_long_32": f"RDS MASTER {VERSION}", "en_lps": 1, "lps_centered": False, "lps_cr": True,
     # Group 15B - fast basic tuning and switching information (off by default)
@@ -471,13 +422,20 @@ default_state = {
     "scheduler_auto": True,
 
     # UECP server
-    "uecp_enabled": False,
+    # --- UECP input (only meaningful when the profile's mode is "uecp") ------
+    # The old build mapped UECP onto these same flat keys, so DSN/PSN could only
+    # ever be a filter over one PS/RT. The new model keeps received data sets and
+    # programme services in their own store - see the uecp package.
+    "uecp_tcp_enabled": True,
     "uecp_port": 4001,
     "uecp_host": "0.0.0.0",
-    "uecp_psn": 0,   # Programme Service Number filter (0 = accept all)
-    "uecp_dsn": 0,   # Dataset Number filter (0 = accept all)
     "uecp_ws_enabled": False,
     "uecp_ws_url": "ws://127.0.0.1/pacific",
+    "uecp_site_address": 0,      # 0 = answer to every site address
+    "uecp_encoder_address": 0,   # 0 = answer to every encoder address
+    # Blank = automatic: follow the source's own MEC 0x16, or derive a sequence
+    # from what it has sent. Set it to force a specific sequence instead.
+    "uecp_group_sequence": "",
 
     # Enhanced RadioText (eRT) - ODA Application
     "en_ert": False,  # Enable eRT transmission
@@ -792,7 +750,20 @@ class RTPlusParser:
         return msg
 
 # --- DEVICE DISCOVERY ---
-def get_valid_devices():
+def hostapi_filter_active():
+    """True when the device list is being narrowed to one host API.
+
+    Only Windows filters by default (to MME). macOS and Linux never do, so the
+    "show all" toggle is hidden there rather than sitting dead in the UI.
+    """
+    return bool(REQUIRE_HOSTAPI)
+
+
+def get_valid_devices(show_all=None):
+    """Devices usable at our sample rate. By default Windows lists MME only;
+    show_all lifts that so WASAPI / DirectSound / WDM-KS appear as well."""
+    if show_all is None:
+        show_all = bool(state.get("show_all_hostapis", 0))
     valid_inputs = []
     valid_outputs = []
     try:
@@ -800,7 +771,7 @@ def get_valid_devices():
         apis = sd.query_hostapis()
         for i, d in enumerate(devs):
             api_name = apis[d['hostapi']]['name']
-            if REQUIRE_HOSTAPI and REQUIRE_HOSTAPI not in api_name: continue
+            if not show_all and REQUIRE_HOSTAPI and REQUIRE_HOSTAPI not in api_name: continue
             try:
                 if d['max_output_channels'] > 0:
                     sd.check_output_settings(device=i, samplerate=SAMPLE_RATE)
@@ -1157,7 +1128,8 @@ def save_config():
         # created since the last save_datasets()), so this save can never drop it.
         for ds_key, ds_value in datasets.items():
             if ds_key not in data['datasets']:
-                data['datasets'][ds_key] = {'name': ds_value.get('name', f'Dataset {ds_key}'),
+                data['datasets'][ds_key] = {'name': ds_value.get('name', f'Profile {ds_key}'),
+                                            'mode': normalise_mode(ds_value.get('mode')),
                                             'state': dict(ds_value.get('state', {}))}
 
         # Get current dataset — use in-memory variable, NOT what's in the file
@@ -1166,7 +1138,9 @@ def save_config():
 
         # Update current dataset state
         if current not in data['datasets']:
-            data['datasets'][current] = {'name': f'Dataset {current}', 'state': {}}
+            data['datasets'][current] = {'name': f'Profile {current}',
+                                         'mode': profile_mode(current), 'state': {}}
+        data['datasets'][current]['mode'] = profile_mode(current)
 
         data['datasets'][current]['state'] = dict(state)
 
@@ -1175,7 +1149,8 @@ def save_config():
         # otherwise the in-memory list silently lags the file and the next
         # save_datasets() writes stale (or empty) data over it.
         if current not in datasets:
-            datasets[current] = {'name': data['datasets'][current].get('name', f'Dataset {current}'),
+            datasets[current] = {'name': data['datasets'][current].get('name', f'Profile {current}'),
+                                 'mode': normalise_mode(data['datasets'][current].get('mode')),
                                  'state': {}}
         datasets[current]['state'] = dict(state)
 
@@ -1212,6 +1187,32 @@ def save_config():
         import traceback
         traceback.print_exc()
         return False
+
+# --- PROFILES ---
+# A profile is one complete saved configuration. Its mode decides what the
+# encoder does and which parts of the UI are shown:
+#   "internal" - the built-in RDS coder, configured here (the original behaviour)
+#   "uecp"     - RDS data arrives from an external UECP source; the UI only monitors
+PROFILE_MODES = ("internal", "uecp")
+DEFAULT_PROFILE_MODE = "internal"
+
+
+def normalise_mode(value):
+    """Coerce anything stored or posted into a known mode."""
+    mode = str(value or "").strip().lower()
+    return mode if mode in PROFILE_MODES else DEFAULT_PROFILE_MODE
+
+
+def profile_mode(num=None):
+    """Mode of the given profile, or of the live one."""
+    key = str(current_dataset if num is None else num)
+    entry = datasets.get(key) or {}
+    return normalise_mode(entry.get("mode"))
+
+
+def is_uecp_mode():
+    return profile_mode() == "uecp"
+
 
 # --- DATASETS ---
 # DATASETS_FILE already defined above near CONFIG_FILE
@@ -1270,7 +1271,8 @@ def load_datasets():
             ds_state.pop('auto_start', None)
             ds_state.pop('http_port', None)
             parsed[str(ds_key)] = {
-                'name': ds_value.get('name', f'Dataset {ds_key}'),
+                'name': ds_value.get('name', f'Profile {ds_key}'),
+                'mode': normalise_mode(ds_value.get('mode')),
                 'state': ds_state,
             }
 
@@ -1280,7 +1282,8 @@ def load_datasets():
         # No datasets on disk yet (fresh install, or a file that only holds the
         # secret key). Seed slot 1 so the UI always has something to show and
         # new datasets never collide with it.
-        datasets = {'1': {'name': 'Dataset 1', 'state': dict(state)}}
+        datasets = {'1': {'name': 'Profile 1', 'mode': DEFAULT_PROFILE_MODE,
+                          'state': dict(state)}}
     else:
         datasets = {}
 
@@ -1353,7 +1356,8 @@ def save_datasets():
         # Clean up: remove auto_start and http_port from all dataset states before saving
         datasets_clean = {}
         for ds_key, ds_value in datasets.items():
-            datasets_clean[ds_key] = {'name': ds_value.get('name', f'Dataset {ds_key}')}
+            datasets_clean[ds_key] = {'name': ds_value.get('name', f'Profile {ds_key}'),
+                                      'mode': normalise_mode(ds_value.get('mode'))}
             if 'state' in ds_value:
                 state_copy = dict(ds_value['state'])
                 state_copy.pop('auto_start', None)  # Ensure auto_start never in state
@@ -1393,7 +1397,8 @@ def switch_dataset(dataset_num):
         # (create the slot if it somehow went missing, rather than raising)
         cur_key = str(current_dataset)
         if cur_key not in datasets:
-            datasets[cur_key] = {'name': f'Dataset {cur_key}', 'state': {}}
+            datasets[cur_key] = {'name': f'Profile {cur_key}',
+                                 'mode': DEFAULT_PROFILE_MODE, 'state': {}}
         datasets[cur_key]['state'] = dict(state)
 
         # Switch to new dataset
@@ -1419,6 +1424,12 @@ def switch_dataset(dataset_num):
         monitor_data["rt_plus_info"] = ""
         monitor_data["ert_rtplus_info"] = ""
         monitor_data["heartbeat"] = int(time.time() * 1000)
+
+        # A profile switch can change the mode, so the UECP transports follow it.
+        try:
+            start_uecp()
+        except Exception as exc:
+            print(f"[UECP] restart after profile switch failed: {exc}", flush=True)
 
         # Save datasets and current dataset info
         save_datasets()
@@ -1485,25 +1496,6 @@ def apply_text_trim(text, trim_parens=False, trim_brackets=False, trim_at_semico
     return text
 
 
-def text_to_rds_bytes(text):
-    """Convert Unicode text to RDS byte codes (IEC 62106-4:2018).
-
-    Returns a bytes object where each byte is the RDS character code.
-    Characters not in the RDS charset are replaced with space (0x20).
-    """
-    if not text:
-        return b''
-    result = []
-    for char in text:
-        code_point = ord(char)
-        if code_point in UNICODE_TO_RDS:
-            # Valid RDS character - get its RDS byte code
-            rds_code = UNICODE_TO_RDS[code_point]
-            result.append(rds_code)
-        else:
-            # Character not in RDS charset, replace with space
-            result.append(0x20)
-    return bytes(result)
 
 def parse_text_source(text, cached_value=""):
     """Parse text with dynamic sources (file/URL patterns).
@@ -1587,6 +1579,8 @@ def monitor_pusher_loop():
             monitor_data["di_comp"] = state.get("di_comp", 1)
             monitor_data["di_dyn"] = state.get("di_dyn", 0)
             monitor_data["en_fast_tuning"] = bool(state.get("en_fast_tuning", 0))
+            monitor_data.setdefault("audio_ok", False)
+            monitor_data.setdefault("rt_source_ok", True)
             monitor_data["rbds"] = state.get("rbds", False)
             
             # EON networks list
@@ -1680,7 +1674,7 @@ def monitor_pusher_loop():
                  "pilot_generated": False,
                  "tp": 0, "ta": 0, "ms": 0,
                  "di_stereo": 0, "di_head": 0, "di_comp": 0, "di_dyn": 0,
-                 "en_fast_tuning": False,
+                 "en_fast_tuning": False, "audio_ok": False, "rt_source_ok": True,
                  "rbds": False, "eon_networks": [],
                  "rds2_enabled": False, "rds2_carrier_count": 0, "rds2_logo_filename": "", "rds2_carrier_levels": [0, 0, 0],
                  "en_ari": False, "ari_region": "", "ari_bk_freq": 0, "ari_announcement": False, "ari_announcement_mode": "manual"
@@ -2376,8 +2370,11 @@ class PCStatusMonitor:
         return " | ".join(parts) if parts else f"RDS-MASTER {VERSION}"
 
 class RDSScheduler:
+    RT_FETCH_INTERVAL = 4.0   # seconds between attempts on a file/URL/JSON RT source
+
     def __init__(self):
         self.ps_ptr, self.rt_ptr, self.ptyn_ptr, self.lps_ptr, self.af_ptr = 0, 0, 0, 0, 0
+        self._rt_skip_depth = 0  # Guards the empty-message walk in get_current_rt_message
         self.ft_ptr = 0  # Group 15B DI segment pointer (C1/C0 address, 0-3)
         self.ft_ta_burst = 0  # Remaining 15B groups to send after a TA change
         self.eon_b_idx = 0      # Group 14B service pointer (separate from the 14A machine)
@@ -2430,6 +2427,13 @@ class RDSScheduler:
         self.ert_rt_plus_toggle = 0    # Toggle bit for eRT RT+ group
         self._ert_rt_plus_tags_sig = ""  # Change-detection key for toggle
         self._ert_content_new = False  # True while new content hasn't completed one full TX cycle
+        # RadioText source cache. Written only on a successful fetch, so a feed
+        # outage leaves the previous text in place instead of blanking RT.
+        self._rt_content_cache = {}    # {msg_id: last good content}
+        self._rt_fetch_last = {}       # {msg_id: timestamp of last attempt}
+        self._rt_fetch_key = {}        # {msg_id: source identity, for invalidation}
+        self._rt_fetch_failed = set()  # msg_ids currently failing (for one-shot logging)
+        threading.Thread(target=self._rt_content_fetch_loop, daemon=True).start()
         self._ert_content_cache = {}   # Async-updated cache: {msg_id: content_str}
         self._ert_fetch_last = {}      # {msg_id: timestamp} of last successful fetch
         self._ert_fetch_pending = set() # msg_ids currently being fetched in background
@@ -2639,86 +2643,148 @@ class RDSScheduler:
         except:
             return []
 
+    def fetch_msg_raw(self, msg):
+        """Blocking fetch of one message's raw content.
+
+        BACKGROUND THREAD ONLY. Never call this from the audio path: a stalled
+        mobile link parks here for the full socket timeout, which overruns the
+        callback deadline and takes the RDS carrier off air.
+
+        Raises on failure so the caller can keep the last good value rather than
+        replacing perfectly good RadioText with an empty string.
+        """
+        content = msg.get("content", "")
+        source_type = msg.get("source_type", "manual")
+
+        if source_type == "file":
+            with open(content, 'r', encoding='utf-8-sig', errors='replace') as f:
+                return f.read().strip()
+
+        if source_type == "url":
+            req = urllib.request.Request(content, headers={'User-Agent': 'RDS-Encoder/1.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.read().decode('utf-8', errors='replace').strip()
+
+        if source_type == "json":
+            field1_path = msg.get("json_field1", "")
+            field2_path = msg.get("json_field2", "")
+            delimiter = msg.get("split_delimiter", " - ")
+            hide_if_blank = msg.get("json_hide_if_blank", False)
+
+            req = urllib.request.Request(content, headers={'User-Agent': 'RDS-Encoder/1.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                response_bytes = resp.read()
+                try:
+                    response_text = response_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    response_text = response_bytes.decode('latin-1')
+                json_data = json.loads(response_text)
+
+            def get_value_by_path(obj, path):
+                if not path:
+                    return ''
+                parts = path.replace('[0]', '').split('.')
+                current = obj
+                for part in parts:
+                    if isinstance(current, list) and len(current) > 0:
+                        current = current[0]
+                    if isinstance(current, dict) and part in current:
+                        current = current[part]
+                    else:
+                        return ''
+                if current is None:
+                    return ''
+                elif isinstance(current, str):
+                    return current
+                else:
+                    return str(current)
+
+            field1_value = get_value_by_path(json_data, field1_path)
+            field2_value = get_value_by_path(json_data, field2_path) if field2_path else ''
+            if hide_if_blank and not field1_value:
+                return field2_value
+            out = field1_value
+            if field2_value:
+                out += delimiter + field2_value
+            return out
+
+        return content
+
+    def _rt_content_fetch_loop(self):
+        """Background daemon keeping file/URL/JSON RadioText fresh.
+
+        The cache is only ever written on a successful fetch, so when a feed
+        drops the last good text keeps going out until new data arrives.
+        """
+        while True:
+            try:
+                try:
+                    messages = json.loads(state.get("rt_messages", "[]"))
+                except Exception:
+                    messages = []
+                now = time.time()
+                seen = set()
+                for msg in messages:
+                    if not msg.get("enabled", True):
+                        continue
+                    if msg.get("source_type", "manual") not in ("file", "url", "json"):
+                        continue
+                    msg_id = msg.get("id", "")
+                    seen.add(msg_id)
+                    # Changing the source must invalidate the cached text
+                    key = (msg.get("source_type"), msg.get("content", ""),
+                           msg.get("json_field1", ""), msg.get("json_field2", ""))
+                    if self._rt_fetch_key.get(msg_id) != key:
+                        self._rt_fetch_key[msg_id] = key
+                        self._rt_content_cache.pop(msg_id, None)
+                        self._rt_fetch_last.pop(msg_id, None)
+                    if now - self._rt_fetch_last.get(msg_id, 0) < self.RT_FETCH_INTERVAL:
+                        continue
+                    self._rt_fetch_last[msg_id] = now   # back off even if this attempt fails
+                    try:
+                        result = self.fetch_msg_raw(msg)
+                    except Exception as e:
+                        if msg_id not in self._rt_fetch_failed:
+                            self._rt_fetch_failed.add(msg_id)
+                            held = self._rt_content_cache.get(msg_id)
+                            print(f"[RT] source unavailable ({e}) - " +
+                                  (f"holding last good text: {held!r}" if held
+                                   else "no previous text to hold"), flush=True)
+                        monitor_data["rt_source_ok"] = False
+                        continue
+                    if msg_id in self._rt_fetch_failed:
+                        self._rt_fetch_failed.discard(msg_id)
+                        print(f"[RT] source recovered: {result!r}", flush=True)
+                    monitor_data["rt_source_ok"] = True
+                    if result:
+                        self._rt_content_cache[msg_id] = result
+                # Forget messages that no longer exist
+                for stale in [k for k in self._rt_content_cache if k not in seen]:
+                    self._rt_content_cache.pop(stale, None)
+                    self._rt_fetch_last.pop(stale, None)
+                    self._rt_fetch_key.pop(stale, None)
+                    self._rt_fetch_failed.discard(stale)
+            except Exception as e:
+                print(f"[RT] fetch loop error: {e}", flush=True)
+            time.sleep(1.0)
+
     def resolve_msg_content(self, msg):
-        """Resolve dynamic content for a message (file/URL/JSON sources)."""
+        """Resolve a message's content. NEVER blocks - file/URL/JSON text comes
+        from the cache that _rt_content_fetch_loop keeps topped up."""
         content = msg.get("content", "")
         source_type = msg.get("source_type", "manual")
         prefix = msg.get("prefix", "")
         suffix = msg.get("suffix", "")
 
-        resolved = ""
         if source_type == "manual":
-            # Check for inline dynamic patterns
+            # Inline dynamic patterns are cheap and local
             if "\\" in content:
                 resolved = parse_text_source(content) or content
             else:
                 resolved = content
-        elif source_type == "file":
-            # File path - read content
-            try:
-                with open(content, 'r', encoding='utf-8-sig', errors='replace') as f:
-                    resolved = f.read().strip()
-            except:
-                resolved = ""
-        elif source_type == "url":
-            # URL - fetch content
-            try:
-                req = urllib.request.Request(content, headers={'User-Agent': 'RDS-Encoder/1.0'})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    resolved = resp.read().decode('utf-8', errors='replace').strip()
-            except:
-                resolved = ""
-        elif source_type == "json":
-            # JSON source - fetch and extract fields
-            try:
-                url = content
-                field1_path = msg.get("json_field1", "")
-                field2_path = msg.get("json_field2", "")
-                delimiter = msg.get("split_delimiter", " - ")
-                hide_if_blank = msg.get("json_hide_if_blank", False)
-
-                req = urllib.request.Request(url, headers={'User-Agent': 'RDS-Encoder/1.0'})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    response_bytes = resp.read()
-                    try:
-                        response_text = response_bytes.decode('utf-8')
-                    except UnicodeDecodeError:
-                        response_text = response_bytes.decode('latin-1')
-                    json_data = json.loads(response_text)
-
-                # Extract values by path
-                def get_value_by_path(obj, path):
-                    if not path:
-                        return ''
-                    parts = path.replace('[0]', '').split('.')
-                    current = obj
-                    for part in parts:
-                        if isinstance(current, list) and len(current) > 0:
-                            current = current[0]
-                        if isinstance(current, dict) and part in current:
-                            current = current[part]
-                        else:
-                            return ''
-                    if current is None:
-                        return ''
-                    elif isinstance(current, str):
-                        return current
-                    else:
-                        return str(current)
-
-                field1_value = get_value_by_path(json_data, field1_path)
-                field2_value = get_value_by_path(json_data, field2_path) if field2_path else ''
-
-                # Build message
-                if hide_if_blank and not field1_value:
-                    # If Field 1 is blank and hide_if_blank is enabled, only show Field 2
-                    resolved = field2_value
-                else:
-                    resolved = field1_value
-                    if field2_value:
-                        resolved += delimiter + field2_value
-            except Exception:
-                resolved = ""
+        elif source_type in ("file", "url", "json"):
+            # Last value the background fetcher obtained; held across outages
+            resolved = self._rt_content_cache.get(msg.get("id", ""), "")
         else:
             resolved = content
 
@@ -2800,16 +2866,20 @@ class RDSScheduler:
                 self.rt_msg_cache[msg_id] = self.resolve_msg_content(current_msg)
             resolved_content = self.rt_msg_cache[msg_id]
 
-        # If content is empty, skip to next message immediately
+        # If content is empty, move on to the next message. This walks the list at
+        # most once - it used to recurse with no bound, so a feed outage that left
+        # every message empty blew the stack inside the audio callback.
         if not resolved_content or not resolved_content.strip():
-            self.advance_to_next_rt_message()
-            # Retry with next message (limit recursion to prevent infinite loop)
-            if len(messages) > 1:
-                return self.get_current_rt_message()
-            else:
-                # Only one message and it's empty - return empty
+            if self._rt_skip_depth >= len(messages):
                 return current_msg, buf, ""
+            self._rt_skip_depth += 1
+            try:
+                self.advance_to_next_rt_message()
+                return self.get_current_rt_message()
+            finally:
+                self._rt_skip_depth -= 1
 
+        self._rt_skip_depth = 0
         return current_msg, buf, resolved_content
 
     def advance_to_next_rt_message(self, toggle_buffer=True):
@@ -3539,7 +3609,7 @@ class RDSScheduler:
         The hot path (resolve_ert_msg_content) only reads from the cache
         and never blocks on I/O."""
         import urllib.request as _ur
-        while state.get("running", True):
+        while True:
             try:
                 messages = json.loads(state.get("ert_messages", "[]"))
             except Exception:
@@ -4031,6 +4101,17 @@ class RDSScheduler:
                 g_type, g_ver = schedule[self.schedule_ptr % len(schedule)]
                 self.schedule_ptr += 1
 
+        # A UECP source's own groups outrank anything generated here. MEC 0x24
+        # free-format data and MEC 0x30 TMC both arrive as complete groups and
+        # have to go out exactly as sent, so the queue is consulted before any
+        # of the built-in content. Taking one is a list pop under a short lock:
+        # nothing that can hold up the audio callback.
+        ff = uecp_take_group(g_type, g_ver)
+        if ff is not None:
+            # In a version B group block 3 is the PI code, not free data.
+            b3 = int(get_effective_value("pi"), 16) if g_ver else ff.b3
+            return self._get_group(g_type, g_ver, ff.b2_tail, b3, ff.b4)
+
         # Check for custom data groups FIRST (allows overriding built-in groups)
         try:
             custom_groups = self._get_custom_groups()
@@ -4289,9 +4370,61 @@ class RDSScheduler:
                              self.af_b_ptr = 0
             
             if g_ver == 1: b3 = int(state["pi"], 16)
+            # In UECP mode the eight PS bytes go out as they arrived. Everything
+            # else about the group - AF, DI, TA, M/S, the segment counter - is
+            # unchanged, because none of that is text.
+            uecp_ps = uecp_text_bytes("uecp_ps_raw", 8)
+            if uecp_ps is not None:
+                txt_bytes = uecp_ps
+                monitor_data["ps"] = rds_bytes_to_text(uecp_ps, stop_at_cr=False)
             return self._get_group(0, g_ver, tail, b3, (txt_bytes[seg*2]<<8)|txt_bytes[seg*2+1])
 
         elif g_type == 2:
+            # --- UECP: transmit the source's RadioText bytes unchanged ------
+            # No re-encoding, no centring, no terminator of ours, no truncation.
+            # The source has already decided what its text is, including its own
+            # 0x0D. RT+ for it arrives as its own raw groups, so there is nothing
+            # to tag here either.
+            uecp_rt = uecp_rt_queue()
+            if uecp_rt:
+                idx = getattr(self, 'uecp_rt_idx', 0) % len(uecp_rt)
+                data, _source_ab, _transmissions = uecp_rt[idx]
+                sig = (len(uecp_rt), idx, data)
+                if sig != getattr(self, 'uecp_rt_sig', None):
+                    # The A/B flag's whole job is to tell a receiver that this
+                    # is different text, so it clears its buffer instead of
+                    # merging the new message into the old one. It therefore
+                    # flips whenever the text we are sending changes - which
+                    # matters most when the source has queued several messages
+                    # and we rotate through them. Leaving the flag alone there
+                    # would leave a receiver showing one message with the tail
+                    # of another still after its terminator.
+                    self.uecp_rt_ab = not getattr(self, 'uecp_rt_ab', True)
+                    self.uecp_rt_sig, self.uecp_rt_seg = sig, 0
+                ab = 1 if getattr(self, 'uecp_rt_ab', False) else 0
+                bpg = 2 if g_ver == 1 else 4
+                # Transmission stops after the segment holding the source's
+                # 0x0D, and only that segment is padded out with spaces. A
+                # receiver is required to stop reading at the terminator, so
+                # sending the segments beyond it would only slow the text down.
+                end = data.find(0x0D)
+                used = (end + 1) if end >= 0 else len(data)
+                segs = max(1, min(16, (used + bpg - 1) // bpg))
+                seg = getattr(self, 'uecp_rt_seg', 0) % segs
+                self.uecp_rt_seg = seg + 1
+                if self.uecp_rt_seg >= segs:        # a full pass of this message
+                    self.uecp_rt_seg = 0
+                    if len(uecp_rt) > 1:
+                        self.uecp_rt_idx = idx + 1
+                chunk = data[seg * bpg:(seg + 1) * bpg].ljust(bpg, b' ')
+                monitor_data["rt"] = rds_bytes_to_text(data)
+                tail = ((ab & 1) << 4) | (seg & 0x0F)
+                if g_ver == 1:
+                    return self._get_group(2, 1, tail, int(state["pi"], 16),
+                                           (chunk[0] << 8) | chunk[1])
+                return self._get_group(2, 0, tail, (chunk[0] << 8) | chunk[1],
+                                       (chunk[2] << 8) | chunk[3])
+
             limit = 32 if state["rt_mode"] == "2B" else 64
             current_msg = None
 
@@ -4453,10 +4586,12 @@ class RDSScheduler:
 
                     buffer_setting = current_msg.get("buffer", "AB")
                     if buffer_setting == "AUTO":
-                        # AUTO: buffer only flips when content changes (handled in
-                        # get_current_rt_message). Never cycle-advance — keep
-                        # transmitting indefinitely until the source changes.
-                        pass
+                        # A lone AUTO message holds indefinitely - that is the point of
+                        # AUTO: the buffer flips only when the source text changes.
+                        # But with other messages queued behind it the list still has to
+                        # rotate, otherwise they never reach air at all.
+                        if len(self.get_rt_messages()) > 1 and self.rt_msg_cycle_count >= cycle_limit:
+                            self.advance_to_next_rt_message(toggle_buffer=True)
                     elif buffer_setting == "AB":
                         # For AB messages: do N cycles on buffer A, then N cycles on buffer B
                         # Check if we've completed N cycles on current buffer
@@ -5266,7 +5401,7 @@ class RDSScheduler:
                 dur, txt = self.ptyn_sequence[self.ptyn_seq_idx % len(self.ptyn_sequence)]
             txt = txt.ljust(8)
             # Convert PTYN text to RDS bytes (IEC 62106-4:2018)
-            txt_bytes = text_to_rds_bytes(txt)
+            txt_bytes = uecp_text_bytes("uecp_ptyn_raw", 8) or text_to_rds_bytes(txt)
             seg = self.ptyn_ptr % 2
             self.ptyn_ptr += 1
             return self._get_group(10, g_ver, seg, (txt_bytes[seg*4]<<8)|txt_bytes[seg*4+1], (txt_bytes[seg*4+2]<<8)|txt_bytes[seg*4+3])
@@ -5276,15 +5411,27 @@ class RDSScheduler:
             if not state["scheduler_auto"] or state["en_id"] or state.get("en_pin", 0):
                 # Group 1A: ECC/LIC in Block 3, PIN in Block 4 (if enabled)
                 # Cycle between ECC (variant 0) and LIC (variant 3) in Block 3
-                variants = [('ecc', 0), ('lic', 3)] if state.get("en_id", 1) else [('ecc', 0)]
+                # Each gates separately. en_id turns identification off
+                # altogether; en_ecc/en_lic exist for UECP mode, where the
+                # source may have sent one slow labelling variant and not the
+                # other. With neither available block 3 carries no code at all
+                # rather than the encoder's built-in E3/09, which would tell
+                # receivers this station is in a country it is not in.
+                variants = []
+                if state.get("en_id", 1):
+                    if state.get("en_ecc", 1):
+                        variants.append(('ecc', 0))
+                    if state.get("en_lic", 1):
+                        variants.append(('lic', 3))
 
-                # Cycle through variants every 2 seconds
-                variant_idx = int(time.time() / 2) % len(variants)
-                variant_type, variant_code = variants[variant_idx]
-
-                # Block 3: ECC or LIC with variant code in upper nibble
-                ecc_lic_value = int(state['ecc' if variant_type == 'ecc' else 'lic'], 16) & 0xFF
-                block3 = (variant_code << 12) | ecc_lic_value
+                if variants:
+                    # Cycle through variants every 2 seconds
+                    variant_idx = int(time.time() / 2) % len(variants)
+                    variant_type, variant_code = variants[variant_idx]
+                    ecc_lic_value = int(state['ecc' if variant_type == 'ecc' else 'lic'], 16) & 0xFF
+                    block3 = (variant_code << 12) | ecc_lic_value
+                else:
+                    block3 = 0
 
                 # Block 4: PIN if enabled, otherwise 0
                 block4 = 0
@@ -5373,9 +5520,15 @@ class RDSScheduler:
             return self._get_group(12, 0, b2_tail, b3_val, b4_val)
 
         elif g_type == 8:
-            # Group 8A: Traffic Message Channel (TMC) - not implemented
-            # Send PS group instead of TMC to prevent blanks (TMC requires complex message structure)
-            return self.ps_filler_group("Group 8A (TMC) is not implemented")
+            # Group 8A: Traffic Message Channel. There is no Alert-C encoder
+            # here and there does not need to be: TMC arrives from a UECP
+            # source as complete groups (MEC 0x30) and is transmitted from the
+            # queue above. Reaching this point only means the buffer happens to
+            # be empty this slot, so the slot carries PS rather than nothing.
+            if is_uecp_mode():
+                return self.ps_filler_group()
+            return self.ps_filler_group(
+                "Group 8A (TMC) needs a UECP source - none is configured")
 
         # Group not implemented (or disabled) - send PS to prevent recursion and blanks
         return self.ps_filler_group(f"Group {g_type}{'B' if g_ver else 'A'} produced nothing")
@@ -5613,6 +5766,7 @@ class RDSDSP:
 
     def __init__(self):
         self.sched = RDSScheduler()
+        self._last_cb_error_log = 0.0
         self.p_rds, self.p_pilot, self.bit_clock, self.last_bit = 0.0, 0.0, 0.0, 0
         self.bit_queue = collections.deque()
         
@@ -5947,21 +6101,76 @@ class RDSDSP:
         else:
              outdata[:] = stereo_out
 
-    def callback_duplex(self, indata, outdata, frames, time, status):
+    def _callback_failed(self, outdata, e):
+        """Never leave the output buffer untouched - an unwritten buffer is silence,
+        and silence is indistinguishable from the encoder being off air."""
+        try:
+            outdata.fill(0)
+        except Exception:
+            pass
+        now = time.time()
+        if now - self._last_cb_error_log > 5.0:
+            self._last_cb_error_log = now
+            print(f"[DSP] callback exception: {e}", flush=True)
+
+    def callback_duplex(self, indata, outdata, frames, time_info, status):
         if status.output_underflow:
             print("[DSP] output underflow", flush=True)
         try:
             self.process_frame(outdata, frames, indata)
         except Exception as e:
-            print(f"[DSP] callback exception: {e}", flush=True)
+            self._callback_failed(outdata, e)
 
-    def callback_output(self, outdata, frames, time, status):
+    def callback_output(self, outdata, frames, time_info, status):
         if status.output_underflow:
             print("[DSP] output underflow", flush=True)
         try:
             self.process_frame(outdata, frames, None)
         except Exception as e:
-            print(f"[DSP] callback exception: {e}", flush=True)
+            self._callback_failed(outdata, e)
+
+def _device_name(idx):
+    """Device name for an index, or None. Used to re-find a device after a hotplug."""
+    try:
+        return sd.query_devices(int(idx))['name']
+    except Exception:
+        return None
+
+
+def _reinit_portaudio():
+    """Re-enumerate audio devices. Required on Windows before a device that was
+    unplugged and replugged becomes visible again."""
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as e:
+        print(f"[Audio] device re-scan failed: {e}", flush=True)
+
+
+def _resolve_device(idx, want_name, output=True):
+    """Prefer the index the user chose; if it no longer names the same device
+    (PortAudio renumbers after a hotplug), find that device by name instead."""
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        return idx
+    if not want_name:
+        return idx
+    try:
+        if sd.query_devices(idx)['name'] == want_name:
+            return idx
+    except Exception:
+        pass
+    try:
+        key = 'max_output_channels' if output else 'max_input_channels'
+        for i, d in enumerate(sd.query_devices()):
+            if d['name'] == want_name and d[key] > 0:
+                print(f"[Audio] device '{want_name}' moved to index {i}", flush=True)
+                return i
+    except Exception:
+        pass
+    return idx
+
 
 def run_audio():
     import gc, sys
@@ -5973,26 +6182,75 @@ def run_audio():
     gc.disable()                    # prevent GC pauses from dropping the callback deadline
     sys.setswitchinterval(0.001)    # 1 ms GIL slice — audio thread wins the GIL faster
     engine = RDSDSP()
-    try:
-        sd_in = state["device_in_idx"] if state["device_in_idx"] != -1 else None
-        sd_out = state["device_out_idx"]
-        
-        if sd_in is not None:
-             with sd.Stream(device=(sd_in, sd_out), samplerate=SAMPLE_RATE, blocksize=2048, channels=2, callback=engine.callback_duplex):
-                 while state["running"]: sd.sleep(100)
-        else:
-             with sd.OutputStream(device=sd_out, samplerate=SAMPLE_RATE, blocksize=2048, channels=2, callback=engine.callback_output):
-                 while state["running"]: sd.sleep(100)
-    except Exception as e:
-        print(f"Audio Error: {e}")
-        state["running"] = False
+
+    # Remember the device names so we can find them again after a hotplug -
+    # PortAudio renumbers devices when one disappears and comes back.
+    want_out_name = _device_name(state["device_out_idx"])
+    want_in_name = _device_name(state["device_in_idx"]) if state["device_in_idx"] != -1 else None
+
+    backoff = 1.0
+    while state["running"]:
+        opened_at = time.time()
+        try:
+            sd_out = _resolve_device(state["device_out_idx"], want_out_name, output=True)
+            sd_in = (_resolve_device(state["device_in_idx"], want_in_name, output=False)
+                     if state["device_in_idx"] != -1 else None)
+
+            if sd_in is not None:
+                stream = sd.Stream(device=(sd_in, sd_out), samplerate=SAMPLE_RATE,
+                                   blocksize=2048, channels=2, callback=engine.callback_duplex)
+            else:
+                stream = sd.OutputStream(device=sd_out, samplerate=SAMPLE_RATE,
+                                         blocksize=2048, channels=2, callback=engine.callback_output)
+            with stream:
+                print(f"[Audio] stream open on device {sd_out}", flush=True)
+                monitor_data["audio_ok"] = True
+                backoff = 1.0
+                while state["running"]:
+                    if not stream.active:
+                        raise RuntimeError("stream went inactive (device removed?)")
+                    sd.sleep(100)
+            if not state["running"]:
+                break
+        except Exception as e:
+            if not state["running"]:
+                break
+            # A stream that ran fine for a while then died is a hiccup, not a
+            # misconfiguration - retry from a short delay rather than a long one.
+            if time.time() - opened_at > 30:
+                backoff = 1.0
+            monitor_data["audio_ok"] = False
+            print(f"[Audio] {e} - reopening in {backoff:.0f}s", flush=True)
+            _reinit_portaudio()
+            end = time.time() + backoff
+            while state["running"] and time.time() < end:
+                time.sleep(0.1)
+            backoff = min(backoff * 2, 15.0)
+
+    print("[Audio] stopped", flush=True)
+    monitor_data["audio_ok"] = False
+    state["running"] = False
 
 # --- UI ---
 @app.route('/')
 def index():
     if not session.get('auth'): return redirect(url_for('login'))
     inputs, outputs = get_valid_devices()
-    return render_template_string(UI_HTML, inputs=inputs, outputs=outputs, state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, http_port=http_port, version=VERSION, SERIAL_AVAILABLE=SERIAL_AVAILABLE)
+    return render_template_string(UI_HTML, inputs=inputs, outputs=outputs,
+                                  hostapi_filtered=hostapi_filter_active(),
+                                  profile_mode=profile_mode(),
+                                  profile_modes=list(PROFILE_MODES), state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, http_port=http_port, version=VERSION, SERIAL_AVAILABLE=SERIAL_AVAILABLE)
+
+@app.route('/devices')
+def list_devices():
+    """Device lists for the Audio tab, so toggling host APIs needs no page reload."""
+    if not session.get('auth'): return jsonify({'error': 'Not authenticated'}), 401
+    show_all = request.args.get('all', '').lower() in ('1', 'true', 'yes')
+    inputs, outputs = get_valid_devices(show_all=show_all)
+    return jsonify({'inputs': inputs, 'outputs': outputs,
+                    'filtered': hostapi_filter_active(),
+                    'default_api': REQUIRE_HOSTAPI or ''})
+
 
 @app.route('/login', methods=['GET','POST'])
 def login():
@@ -6172,99 +6430,6 @@ def restore_backup():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route('/uecp_settings', methods=['GET', 'POST'])
-def uecp_settings_route():
-    global _uecp_tcp_server, _uecp_ws_client
-    if not session.get('auth'): return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    if request.method == 'GET':
-        return jsonify({
-            "uecp_enabled":    state.get("uecp_enabled", False),
-            "uecp_port":       state.get("uecp_port", 4001),
-            "uecp_host":       state.get("uecp_host", "0.0.0.0"),
-            "uecp_psn":        state.get("uecp_psn", 0),
-            "uecp_dsn":        state.get("uecp_dsn", 0),
-            "uecp_ws_enabled": state.get("uecp_ws_enabled", False),
-            "uecp_ws_url":     state.get("uecp_ws_url", "ws://127.0.0.1/pacific"),
-            "tcp_running":     _uecp_tcp_server is not None,
-            "ws_running":      _uecp_ws_client is not None,
-        })
-
-    data = request.get_json(silent=True) or {}
-    state["uecp_enabled"] = bool(data.get("uecp_enabled", False))
-    try:
-        state["uecp_port"] = max(1, min(65535, int(data.get("uecp_port", 4001))))
-    except (ValueError, TypeError):
-        state["uecp_port"] = 4001
-    state["uecp_host"] = str(data.get("uecp_host", "0.0.0.0")).strip() or "0.0.0.0"
-    try:
-        state["uecp_psn"] = max(0, min(255, int(data.get("uecp_psn", 0))))
-    except (ValueError, TypeError):
-        state["uecp_psn"] = 0
-    try:
-        state["uecp_dsn"] = max(0, min(255, int(data.get("uecp_dsn", 0))))
-    except (ValueError, TypeError):
-        state["uecp_dsn"] = 0
-    state["uecp_ws_enabled"] = bool(data.get("uecp_ws_enabled", False))
-    state["uecp_ws_url"] = str(data.get("uecp_ws_url", "")).strip() or "ws://127.0.0.1/pacific"
-    save_config()
-
-    # Stop any existing TCP server and WS client
-    if _uecp_tcp_server is not None:
-        try:
-            _uecp_tcp_server.stop()
-        except Exception:
-            pass
-        _uecp_tcp_server = None
-    if _uecp_ws_client is not None:
-        try:
-            _uecp_ws_client.stop()
-        except Exception:
-            pass
-        _uecp_ws_client = None
-
-    tcp_enabled = state["uecp_enabled"]
-    ws_enabled  = state["uecp_ws_enabled"]
-
-    if not tcp_enabled and not ws_enabled:
-        return jsonify({"ok": True, "status": "UECP disabled"})
-
-    try:
-        from uecp_server import UECPStateHandler, UECPTCPServer, UECPWebSocketClient
-
-        def _uecp_save():
-            socketio.emit('state_update', {
-                'custom_oda_list': state.get('custom_oda_list', '[]'),
-                'custom_groups':   state.get('custom_groups',   '[]'),
-            })
-        def _uecp_restore():
-            save_config()
-            socketio.emit('state_update', {
-                'custom_oda_list': state.get('custom_oda_list', '[]'),
-                'custom_groups':   state.get('custom_groups',   '[]'),
-            })
-
-        # Shared handler — both TCP and WS connections pool into the same
-        # client count so that snapshot/restore triggers correctly.
-        handler = UECPStateHandler(state, _uecp_save, _uecp_restore)
-        status_parts = []
-
-        if tcp_enabled:
-            srv = UECPTCPServer(state["uecp_host"], state["uecp_port"], handler)
-            srv.start()
-            _uecp_tcp_server = srv
-            status_parts.append(f"TCP listening on {srv.host}:{srv.port}")
-
-        if ws_enabled:
-            wsc = UECPWebSocketClient(state["uecp_ws_url"], handler)
-            wsc.start()
-            _uecp_ws_client = wsc
-            status_parts.append(f"WS client → {wsc.url}")
-
-        return jsonify({"ok": True, "status": "; ".join(status_parts)})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
 @app.route('/fetch-json-structure', methods=['POST'])
 def fetch_json_structure():
     """Fetch JSON from URL and return available fields and sample data."""
@@ -6433,12 +6598,17 @@ def handle_control(data):
         state["running"] = False
         save_config()
 
-# Dataset API Routes
+# Profile API Routes
+# The concept is called a Profile in the UI. /datasets is kept as an alias so any
+# existing watchdog script keeps working.
+@app.route('/profiles', methods=['GET'])
 @app.route('/datasets', methods=['GET'])
 def get_datasets():
     if not session.get('auth'): return jsonify({'error': 'Not authenticated'}), 401
-    return jsonify({'datasets': datasets, 'current': current_dataset})
+    return jsonify({'datasets': datasets, 'current': current_dataset,
+                    'mode': profile_mode(), 'modes': list(PROFILE_MODES)})
 
+@app.route('/profiles', methods=['POST'])
 @app.route('/datasets', methods=['POST'])
 def create_dataset():
     """Create a new dataset. The server picks the slot so two browsers (or a
@@ -6468,10 +6638,42 @@ def create_dataset():
     new_state.pop('auto_start', None)
     new_state.pop('http_port', None)
 
-    datasets[str(num)] = {'name': data.get('name') or f'Dataset {num}', 'state': new_state}
-    save_datasets()
-    return jsonify({'success': True, 'num': num, 'name': datasets[str(num)]['name']})
+    mode = normalise_mode(data.get('mode'))
+    if mode == 'uecp':
+        # A UECP profile starts blank - its RDS content comes from the wire, and
+        # inheriting the internal coder's PS/RT would just be misleading.
+        new_state = dict(default_state)
+        new_state['running'] = False
+        for key in ('rds_level', 'device_out_idx', 'device_in_idx', 'output_channel'):
+            if key in state:
+                new_state[key] = state[key]
+        # Keep the default PS so a UECP profile with nothing received still
+        # transmits 0A rather than eight spaces. Everything else starts empty,
+        # so no group is scheduled for content the source has not sent.
+        new_state['rt_text'] = ''
+        new_state['rt_messages'] = '[]'
+        new_state['ps_long_32'] = ''
+        new_state['ptyn'] = ''
+        # Nothing the source has not sent: no ECC/LIC, no CT, no PIN, no AF, and
+        # no 0x0D appended to RadioText.
+        for off in ('en_ct', 'en_id', 'en_pin', 'en_af', 'en_eon', 'en_lps',
+                    'en_ptyn', 'en_ih', 'en_ih_station_id', 'en_ert',
+                    'en_ert_rtplus', 'en_dab', 'en_rds2', 'en_ari',
+                    'en_tdc_5a', 'en_tdc_5b', 'en_fast_tuning', 'en_rt_plus'):
+            new_state[off] = 0
+        new_state['rt_cr'] = False
+        new_state['scheduler_auto'] = False
+        new_state['group_sequence'] = '0A'
+        new_state.pop('auto_start', None)
+        new_state.pop('http_port', None)
 
+    datasets[str(num)] = {'name': data.get('name') or f'Profile {num}',
+                          'mode': mode, 'state': new_state}
+    save_datasets()
+    return jsonify({'success': True, 'num': num, 'mode': mode,
+                    'name': datasets[str(num)]['name']})
+
+@app.route('/profiles/<int:num>', methods=['PUT'])
 @app.route('/datasets/<int:num>', methods=['PUT'])
 def update_dataset(num):
     if not session.get('auth'): return jsonify({'error': 'Not authenticated'}), 401
@@ -6485,15 +6687,18 @@ def update_dataset(num):
         new_state = data.get('state')
         if not isinstance(new_state, dict) or not new_state:
             new_state = existing.get('state', {})
-        datasets[key] = {'name': data.get('name', existing.get('name', f'Dataset {num}')),
+        datasets[key] = {'name': data.get('name', existing.get('name', f'Profile {num}')),
+                         'mode': normalise_mode(data.get('mode', existing.get('mode'))),
                          'state': dict(new_state)}
     else:
-        datasets[key] = {'name': data.get('name', f'Dataset {num}'),
+        datasets[key] = {'name': data.get('name', f'Profile {num}'),
+                         'mode': normalise_mode(data.get('mode')),
                          'state': dict(data.get('state') or state)}
 
     save_datasets()
     return jsonify({'success': True})
 
+@app.route('/profiles/<int:num>/switch', methods=['POST'])
 @app.route('/datasets/<int:num>/switch', methods=['POST'])
 def switch_to_dataset(num):
     if not session.get('auth'): return jsonify({'error': 'Not authenticated'}), 401
@@ -6502,6 +6707,7 @@ def switch_to_dataset(num):
         return jsonify({'success': True, 'current': current_dataset})
     return jsonify({'error': 'Dataset not found'}), 404
 
+@app.route('/profiles/<int:num>', methods=['DELETE'])
 @app.route('/datasets/<int:num>', methods=['DELETE'])
 def delete_dataset(num):
     global current_dataset
@@ -6843,55 +7049,288 @@ if UPDATER_AVAILABLE:
             print(f"[Updater] You may need to manually restore from backup")
 
 # --- UECP SERVER ---
-_uecp_tcp_server = None
-_uecp_ws_client  = None
 
-def _start_uecp_server():
-    global _uecp_tcp_server, _uecp_ws_client
-    tcp_enabled = state.get("uecp_enabled", False)
-    ws_enabled  = state.get("uecp_ws_enabled", False)
-    if not tcp_enabled and not ws_enabled:
+# ---------------------------------------------------------------------------
+# UECP runtime
+# ---------------------------------------------------------------------------
+# Only alive while the live profile's mode is "uecp". The store holds every data
+# set and programme service the source has sent; a worker copies the live one
+# into `state` so the existing generator transmits it without knowing where the
+# data came from.
+_uecp_store = None
+_uecp_tcp = None
+_uecp_ws = None
+_uecp_dirty = threading.Event()
+
+
+def uecp_store():
+    """The live store, created on demand."""
+    global _uecp_store
+    if _uecp_store is None:
+        import uecp
+        _uecp_store = uecp.Store(
+            site=int(state.get("uecp_site_address", 0) or 0),
+            encoder=int(state.get("uecp_encoder_address", 0) or 0),
+        )
+    return _uecp_store
+
+
+def _uecp_changed():
+    """Called from a transport thread - never do real work here."""
+    _uecp_dirty.set()
+
+
+def uecp_text_bytes(key, length=None):
+    """A text field exactly as the UECP source sent it, or None.
+
+    Text arriving over UECP is already in the RDS character set, so it is
+    transmitted unchanged rather than decoded and re-encoded - that round trip
+    is what was turning an a-umlaut and the 0x0D terminator into full stops.
+    """
+    if _uecp_store is None:
+        return None
+    try:
+        if not is_uecp_mode():
+            return None
+        raw = bytes.fromhex(state.get(key, "") or "")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    return raw.ljust(length, b" ")[:length] if length else raw
+
+
+def uecp_rt_queue():
+    """The source's RadioText as (bytes, A/B flag, transmissions) tuples."""
+    if _uecp_store is None:
+        return []
+    try:
+        if not is_uecp_mode():
+            return []
+        rows = json.loads(state.get("uecp_rt_raw", "") or "[]")
+        return [(bytes.fromhex(r["hex"]), int(r.get("ab", 0)),
+                 int(r.get("transmissions", 0))) for r in rows if r.get("hex")]
+    except Exception:
+        return []
+
+
+def uecp_take_group(g_type, g_ver):
+    """The next raw group a UECP source has queued for this slot, or None.
+
+    Called from the generator for every group it is about to build, so it stays
+    cheap: two dict lookups and a list pop. Anything that could raise is
+    swallowed - a fault in the UECP path must never stop the carrier.
+    """
+    store = _uecp_store
+    if store is None:
+        return None
+    try:
+        if not is_uecp_mode():
+            return None
+        return store.take_group(((int(g_type) & 0x0F) << 1) | (int(g_ver) & 1))
+    except Exception:
+        return None
+
+
+def stop_uecp():
+    global _uecp_tcp, _uecp_ws
+    for obj in (_uecp_tcp, _uecp_ws):
+        if obj is not None:
+            try:
+                obj.stop()
+            except Exception as exc:
+                print(f"[UECP] stop: {exc}", flush=True)
+    _uecp_tcp = _uecp_ws = None
+
+
+def start_uecp():
+    """Bring the transports up for a UECP profile; tear them down otherwise."""
+    global _uecp_tcp, _uecp_ws, _uecp_store
+    stop_uecp()
+    if not is_uecp_mode():
         return
     try:
-        from uecp_server import UECPStateHandler, UECPTCPServer, UECPWebSocketClient
+        import uecp
+    except Exception as exc:
+        print(f"[UECP] package unavailable: {exc}", flush=True)
+        return
 
-        def _uecp_save():
-            socketio.emit('state_update', {
-                'custom_oda_list': state.get('custom_oda_list', '[]'),
-                'custom_groups':   state.get('custom_groups',   '[]'),
-            })
-        def _uecp_restore():
-            save_config()
-            socketio.emit('state_update', {
-                'custom_oda_list': state.get('custom_oda_list', '[]'),
-                'custom_groups':   state.get('custom_groups',   '[]'),
-            })
+    _uecp_store = None                      # rebuild with this profile's address
+    store = uecp_store()
 
-        handler = UECPStateHandler(state, _uecp_save, _uecp_restore)
+    if state.get("uecp_tcp_enabled", True):
+        _uecp_tcp = uecp.TcpListener(
+            str(state.get("uecp_host", "0.0.0.0")),
+            int(state.get("uecp_port", 4001) or 4001),
+            store, _uecp_changed)
+        _uecp_tcp.start()
+    if state.get("uecp_ws_enabled", False):
+        _uecp_ws = uecp.WebSocketClient(
+            str(state.get("uecp_ws_url", "")), store, _uecp_changed)
+        _uecp_ws.start()
 
-        if tcp_enabled:
-            srv = UECPTCPServer(
-                str(state.get("uecp_host", "0.0.0.0")),
-                int(state.get("uecp_port", 4001)),
-                handler,
-            )
-            srv.start()
-            _uecp_tcp_server = srv
-            print(f"[UECP] TCP server listening on {srv.host}:{srv.port}")
+    # Suppress the internal-coder defaults straight away rather than waiting for
+    # the first frame - a source that never connects must not leave ECC, CT and
+    # the rest of the built-in content going to air.
+    try:
+        uecp.apply_to_state(store, state)
+    except Exception as exc:
+        print(f"[UECP] initial apply failed: {exc}", flush=True)
 
-        if ws_enabled:
-            wsc = UECPWebSocketClient(
-                str(state.get("uecp_ws_url", "ws://127.0.0.1/pacific")),
-                handler,
-            )
-            wsc.start()
-            _uecp_ws_client = wsc
-            print(f"[UECP] WS client connecting to {wsc.url}")
 
-    except Exception as e:
-        print(f"[UECP] Failed to start: {e}")
+def uecp_apply_loop():
+    """Copy the live data set into `state` shortly after anything changes.
 
-_start_uecp_server()
+    Coalesced rather than applied per frame: a busy source sends many elements a
+    second and there is no point rewriting state for each one.
+    """
+    import uecp
+    while True:
+        woken = _uecp_dirty.wait(timeout=2.0)
+        if woken:
+            _uecp_dirty.clear()
+            time.sleep(0.05)                # let a burst of elements land together
+        # Run on the timeout as well, not only when something arrived. A profile
+        # that has received nothing still needs its internal-coder defaults
+        # suppressed, or the encoder transmits ECC, CT and the rest regardless.
+        try:
+            if is_uecp_mode() and _uecp_store is not None:
+                uecp.apply_to_state(_uecp_store, state)
+        except Exception as exc:
+            print(f"[UECP] apply failed: {exc}", flush=True)
+
+
+threading.Thread(target=uecp_apply_loop, daemon=True).start()
+
+
+@app.route('/uecp/status')
+def uecp_status():
+    """Everything the monitor pane needs, in one poll."""
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    if not is_uecp_mode():
+        return jsonify({'mode': profile_mode(), 'active': False})
+    import uecp
+    store = uecp_store()
+    data = store.summary()
+    data.update({
+        'mode': 'uecp',
+        'active': True,
+        'group_sequence': state.get("group_sequence", ""),
+        'sequence_origin': state.get("uecp_sequence_origin", "automatic"),
+        'sequence_override': state.get("uecp_group_sequence", ""),
+        'sequence_overrides': uecp.sequence_overrides(state),
+        'sequence_dsn': state.get("uecp_sequence_dsn", store.current),
+        'tcp': {
+            'enabled': bool(state.get("uecp_tcp_enabled", True)),
+            'running': _uecp_tcp.running if _uecp_tcp else False,
+            'clients': _uecp_tcp.clients if _uecp_tcp else 0,
+            'host': state.get("uecp_host", "0.0.0.0"),
+            'port': state.get("uecp_port", 4001),
+            'error': _uecp_tcp.last_error if _uecp_tcp else '',
+        },
+        'ws': {
+            'enabled': bool(state.get("uecp_ws_enabled", False)),
+            'running': _uecp_ws.running if _uecp_ws else False,
+            'connected': _uecp_ws.connected if _uecp_ws else False,
+            'url': state.get("uecp_ws_url", ""),
+            'error': _uecp_ws.last_error if _uecp_ws else '',
+        },
+    })
+    return jsonify(data)
+
+
+GROUP_TOKEN = re.compile(r"^(1[0-5]|[0-9])([AB])$", re.I)
+
+
+def parse_group_sequence(text):
+    """Turn "0A 2A 0A" into a tidy list, or raise ValueError naming the problem.
+
+    Operators type these by hand, so a typo has to come back as a message
+    rather than as a data set that quietly transmits the wrong groups.
+    """
+    tokens = str(text or "").replace(",", " ").split()
+    out = []
+    for token in tokens:
+        match = GROUP_TOKEN.match(token)
+        if not match:
+            raise ValueError(f"{token!r} is not a group - use 0A to 15B")
+        out.append(f"{int(match.group(1))}{match.group(2).upper()}")
+    return out
+
+
+@app.route('/uecp/sequence', methods=['POST'])
+def uecp_sequence():
+    """Set or clear one data set's group sequence.
+
+    MEC 0x16 addresses a data set, so each DSN has its own sequence and its own
+    override. A sequence the source sends for that data set replaces what is
+    set here; clearing the field goes back to automatic.
+    """
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    if not is_uecp_mode():
+        return jsonify({'error': 'This profile is not a UECP input'}), 400
+    import uecp
+    data = request.json or {}
+    try:
+        dsn = int(data.get("dsn", 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Bad data set number'}), 400
+    if not 1 <= dsn <= 253:
+        return jsonify({'error': 'Data set number must be 1 to 253'}), 400
+    try:
+        groups = parse_group_sequence(data.get("sequence", ""))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    overrides = uecp.sequence_overrides(state)
+    if groups:
+        overrides[str(dsn)] = " ".join(groups)
+    else:
+        overrides.pop(str(dsn), None)
+    state["uecp_group_sequence_by_dsn"] = json.dumps(overrides, sort_keys=True)
+    if _uecp_store is not None and dsn == _uecp_store.current:
+        state["uecp_group_sequence"] = overrides.get(str(dsn), "")
+    save_config()
+    _uecp_dirty.set()
+    return jsonify({'success': True, 'dsn': dsn,
+                    'sequence': overrides.get(str(dsn), "")})
+
+
+@app.route('/uecp/settings', methods=['POST'])
+def uecp_settings():
+    """Transport settings for this profile. The RDS data itself stays read-only."""
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    data = request.json or {}
+    state["uecp_tcp_enabled"] = bool(data.get("uecp_tcp_enabled", True))
+    state["uecp_ws_enabled"] = bool(data.get("uecp_ws_enabled", False))
+    state["uecp_host"] = str(data.get("uecp_host", "0.0.0.0")).strip() or "0.0.0.0"
+    state["uecp_ws_url"] = str(data.get("uecp_ws_url", "")).strip()
+    # MEC 0x16 addresses a data set, so a hand-set sequence belongs to one too:
+    # it is filed under whichever data set is live when it is entered.
+    import uecp
+    seq = str(data.get("uecp_group_sequence", "")).strip()
+    overrides = uecp.sequence_overrides(state)
+    dsn = str(state.get("uecp_sequence_dsn") or (_uecp_store.current if _uecp_store else 1))
+    if seq:
+        overrides[dsn] = seq
+    else:
+        overrides.pop(dsn, None)
+    state["uecp_group_sequence_by_dsn"] = json.dumps(overrides, sort_keys=True)
+    state["uecp_group_sequence"] = seq
+    for key, lo, hi, fallback in (("uecp_port", 1, 65535, 4001),
+                                  ("uecp_site_address", 0, 1023, 0),
+                                  ("uecp_encoder_address", 0, 63, 0)):
+        try:
+            state[key] = max(lo, min(hi, int(data.get(key, fallback))))
+        except (TypeError, ValueError):
+            state[key] = fallback
+    save_config()
+    start_uecp()
+    return jsonify({'success': True})
+
 
 def auto_start_if_enabled():
     if auto_start and not state.get("running"):
@@ -6910,6 +7349,11 @@ def delayed_auto_start():
     auto_start_if_enabled()
 
 threading.Thread(target=delayed_auto_start, daemon=True).start()
+
+try:
+    start_uecp()
+except Exception as _exc:
+    print(f"[UECP] start failed: {_exc}", flush=True)
 
 # Config Export/Import Routes
 @app.route('/config/export', methods=['POST'])
@@ -7436,13 +7880,14 @@ UI_HTML = r"""
         <div class="workspace">
             <div class="sidebar">
                 <div class="tab-btn active" onclick="setTab('dashboard')">Dashboard</div>
-                <div class="tab-btn" onclick="setTab('basic')">Basic RDS</div>
-                <div class="tab-btn" onclick="setTab('expert')">Expert</div>
+                <div class="tab-btn" data-mode="internal" onclick="setTab('basic')">Basic RDS</div>
+                <div class="tab-btn" data-mode="internal" onclick="setTab('expert')">Expert</div>
                 <div class="tab-btn" onclick="setTab('audio')">Audio & MPX</div>
-                <div class="tab-btn" onclick="setTab('rds2')">RDS2 Carriers</div>
-                <div class="tab-btn" onclick="setTab('datasets')">Datasets</div>
+                <div class="tab-btn" data-mode="internal" onclick="setTab('rds2')">RDS2 Carriers</div>
+                <div class="tab-btn" data-mode="internal" onclick="setTab('datasets')">Profiles</div>
+                <div class="tab-btn" data-mode="uecp" onclick="setTab('datasets')">Profiles</div>
                 <div class="tab-btn" onclick="setTab('settings')">Settings</div>
-                <div class="tab-btn" onclick="setTab('uecp')">UECP</div>
+                <div class="tab-btn" data-mode="uecp" onclick="setTab('uecp')">UECP Monitor</div>
             </div>
 
             <div id="dashboard" class="content active">
@@ -7543,6 +7988,14 @@ UI_HTML = r"""
                                          <span class="flex items-center gap-1" title="Group 15B fast basic tuning">
                                              <span class="inline-block w-2 h-2 rounded-full" id="fast_tuning_indicator"></span>
                                              <span>15B</span>
+                                         </span>
+                                         <span class="flex items-center gap-1" title="Audio device open and the RDS carrier is being generated">
+                                             <span class="inline-block w-2 h-2 rounded-full" id="audio_indicator"></span>
+                                             <span>CARRIER</span>
+                                         </span>
+                                         <span class="flex items-center gap-1" title="Last fetch of a file/URL/JSON RadioText source succeeded">
+                                             <span class="inline-block w-2 h-2 rounded-full" id="rt_source_indicator"></span>
+                                             <span>RT SRC</span>
                                          </span>
                                      </div>
                                  </div>
@@ -9276,6 +9729,23 @@ UI_HTML = r"""
                                 </select>
                             </div>
                         </div>
+                        {% if hostapi_filtered %}
+                        <div class="mt-3 bg-[#1a1a1a] border border-[#333] rounded p-3">
+                            <label class="flex items-center justify-between cursor-pointer">
+                                <div>
+                                    <span class="text-xs text-gray-300">Show all available APIs</span>
+                                    <div class="text-[10px] text-gray-500 mt-1">
+                                        Lists WASAPI, DirectSound and WDM-KS alongside MME. Only devices that
+                                        accept the encoder's 192 kHz sample rate are offered, so some may not appear.
+                                    </div>
+                                </div>
+                                <input type="checkbox" class="toggle-checkbox" id="show_all_hostapis"
+                                       {% if state.show_all_hostapis %}checked{% endif %}
+                                       onchange="refreshDeviceLists(); sync()">
+                            </label>
+                            <div id="device_refresh_status" class="text-[10px] text-gray-500 mt-2"></div>
+                        </div>
+                        {% endif %}
 
                         <div class="mt-2">
                             <label>Output Channel</label>
@@ -9550,22 +10020,22 @@ UI_HTML = r"""
 
             <div id="datasets" class="content">
                 <div class="section">
-                    <div class="section-header">RDS Datasets</div>
+                    <div class="section-header">Profiles</div>
                     <div class="section-body">
-                        <p class="text-sm text-gray-400 mb-4">Save and switch between different RDS configurations. Each dataset stores all RDS settings.</p>
+                        <p class="text-sm text-gray-400 mb-4">Each profile is a complete saved configuration - either an Internal RDS coder or a UECP input. Switching profile switches the whole encoder, so a watchdog script can fail over with POST /profiles/&lt;n&gt;/switch.</p>
 
                         <div class="grid grid-cols-3 gap-3 mb-4" id="dataset_buttons">
                         </div>
 
                         <div class="flex gap-2">
-                            <button onclick="createDataset()" class="bg-green-600 hover:bg-green-500 text-white rounded px-3 py-2 text-sm">+ New Dataset</button>
+                            <button onclick="createDataset()" class="bg-green-600 hover:bg-green-500 text-white rounded px-3 py-2 text-sm">+ New Profile</button>
                             <button onclick="renameCurrentDataset()" class="bg-blue-600 hover:bg-blue-500 text-white rounded px-3 py-2 text-sm">Rename</button>
                             <button onclick="deleteCurrentDataset()" class="bg-red-600 hover:bg-red-500 text-white rounded px-3 py-2 text-sm">Delete</button>
                         </div>
 
                         <div class="mt-4 p-3 bg-black/40 rounded border border-gray-700">
                             <div class="text-xs text-gray-400">
-                                <strong>Current Dataset:</strong> <span id="current_dataset_name">Dataset 1</span>
+                                <strong>Current Profile:</strong> <span id="current_dataset_name">Profile 1</span> <span id="current_dataset_mode" class="text-xs text-gray-400"></span>
                             </div>
                         </div>
                     </div>
@@ -9615,14 +10085,14 @@ UI_HTML = r"""
                         <div class="mb-3">
                             <label>Export Type</label>
                             <select id="export_type" onchange="updateExportOptions()" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm">
-                                <option value="full">Full System (All datasets + global settings)</option>
-                                <option value="dataset">Current Dataset Only</option>
+                                <option value="full">Full System (All profiles + global settings)</option>
+                                <option value="dataset">Current Profile Only</option>
                                 <option value="partial">Custom Selection</option>
                             </select>
                         </div>
 
                         <div id="export_dataset_options" style="display: none;" class="mb-3">
-                            <label>Select Datasets to Export</label>
+                            <label>Select Profiles to Export</label>
                             <div id="export_dataset_checkboxes" class="bg-black/30 border border-gray-700 rounded p-3 space-y-2 max-h-40 overflow-y-auto">
                                 <!-- Populated dynamically -->
                             </div>
@@ -9693,21 +10163,21 @@ UI_HTML = r"""
                             <div class="mb-3">
                                 <label>Import Mode</label>
                                 <select id="import_mode" onchange="updateImportOptions()" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm">
-                                    <option value="new">Import as New Dataset(s)</option>
-                                    <option value="overwrite">Overwrite Existing Dataset</option>
-                                    <option value="merge">Merge into Existing Dataset(s)</option>
+                                    <option value="new">Import as New Profile(s)</option>
+                                    <option value="overwrite">Overwrite Existing Profile</option>
+                                    <option value="merge">Merge into Existing Profile(s)</option>
                                 </select>
                             </div>
 
                             <div id="import_target_dataset" style="display: none;" class="mb-3">
-                                <label>Target Dataset</label>
+                                <label>Target Profile</label>
                                 <select id="import_target_dataset_select" class="w-full bg-black/60 border border-gray-700 rounded px-3 py-2 text-sm">
                                     <!-- Populated dynamically -->
                                 </select>
                             </div>
 
                             <div id="import_dataset_selection" class="mb-3">
-                                <label>Select Datasets to Import</label>
+                                <label>Select Profiles to Import</label>
                                 <div id="import_dataset_checkboxes" class="bg-black/30 border border-gray-700 rounded p-3 space-y-2 max-h-40 overflow-y-auto">
                                     <!-- Populated from file -->
                                 </div>
@@ -9883,76 +10353,167 @@ UI_HTML = r"""
 
             <div id="uecp" class="content">
                 <div class="section">
-                    <div class="section-header">&#9112; UECP Server (Universal Encoder Communications Protocol)</div>
+                    <div class="section-header">UECP Input</div>
                     <div class="section-body">
-                        <div class="flex items-start gap-2 mb-3">
-                            <div class="flex-1">
-                                <label>Enable UECP TCP Server</label>
-                                <div class="text-[9px] text-gray-500">Accept UECP 6.02 connections to remotely update RDS parameters (PI, PS, PTY, TA/TP, DI, M/S, PIN, RadioText).</div>
-                            </div>
-                            <input type="checkbox" class="toggle-checkbox" id="uecp_enabled" {% if state.uecp_enabled %}checked{% endif %}>
-                        </div>
-                        <div class="grid grid-cols-2 gap-3 mb-3">
-                            <div>
-                                <label>Bind Address</label>
-                                <input type="text" id="uecp_host" value="{{ state.get('uecp_host', '0.0.0.0') }}" placeholder="0.0.0.0">
-                                <div class="text-[9px] text-gray-500 mt-1">Use 0.0.0.0 for all interfaces or 127.0.0.1 for local-only.</div>
-                            </div>
-                            <div>
-                                <label>TCP Port</label>
-                                <input type="number" id="uecp_port" value="{{ state.get('uecp_port', 4001) }}" min="1" max="65535">
-                                <div class="text-[9px] text-gray-500 mt-1">Default UECP port is 4001.</div>
-                            </div>
-                        </div>
-                        <div class="grid grid-cols-2 gap-3 mb-3">
-                            <div>
-                                <label>PSN Filter</label>
-                                <input type="number" id="uecp_psn" value="{{ state.get('uecp_psn', 0) }}" min="0" max="255">
-                                <div class="text-[9px] text-gray-500 mt-1">Programme Service Number to accept (0 = accept all). Messages with PSN 0 always pass.</div>
-                            </div>
-                            <div>
-                                <label>DSN Filter</label>
-                                <input type="number" id="uecp_dsn" value="{{ state.get('uecp_dsn', 0) }}" min="0" max="255">
-                                <div class="text-[9px] text-gray-500 mt-1">Dataset Number to accept (0 = accept all). Messages with DSN 0 always pass.</div>
-                            </div>
-                        </div>
-                        <div class="border-t border-gray-700 pt-3 mb-3">
-                            <div class="flex items-center justify-between mb-2">
-                                <div>
-                                    <label>Enable UECP WebSocket Client</label>
-                                    <div class="text-[9px] text-gray-500">Connect to a WebSocket that publishes base64-encoded UECP frames (alternative to TCP server).</div>
+                        <p class="text-sm text-gray-400 mb-3">
+                            This profile takes its RDS data from an external UECP source.
+                            The data below is read-only - the encoder transmits what arrives on
+                            the wire. To edit RDS by hand, switch to an Internal RDS coder profile.
+                        </p>
+                        <div class="grid grid-cols-2 gap-4 mb-3">
+                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3">
+                                <label class="flex items-center justify-between cursor-pointer mb-2">
+                                    <span class="text-xs text-gray-300 font-bold">TCP listener</span>
+                                    <input type="checkbox" class="toggle-checkbox" id="uecp_tcp_enabled"
+                                           {% if state.uecp_tcp_enabled %}checked{% endif %}>
+                                </label>
+                                <div class="grid grid-cols-3 gap-2">
+                                    <div class="col-span-2">
+                                        <label class="text-[10px] text-gray-500">Bind address</label>
+                                        <input type="text" id="uecp_host"
+                                               value="{{ state.uecp_host or '0.0.0.0' }}" placeholder="0.0.0.0">
+                                    </div>
+                                    <div>
+                                        <label class="text-[10px] text-gray-500">Port</label>
+                                        <input type="number" id="uecp_port" min="1" max="65535"
+                                               value="{{ state.uecp_port or 4001 }}">
+                                    </div>
                                 </div>
-                                <input type="checkbox" class="toggle-checkbox" id="uecp_ws_enabled" {% if state.get('uecp_ws_enabled') %}checked{% endif %}>
+                            </div>
+                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3">
+                                <label class="flex items-center justify-between cursor-pointer mb-2">
+                                    <span class="text-xs text-gray-300 font-bold">WebSocket source</span>
+                                    <input type="checkbox" class="toggle-checkbox" id="uecp_ws_enabled"
+                                           {% if state.uecp_ws_enabled %}checked{% endif %}>
+                                </label>
+                                <label class="text-[10px] text-gray-500">Server URL</label>
+                                <input type="text" id="uecp_ws_url"
+                                       placeholder="wss://host/uecpserver/name"
+                                       value="{{ state.uecp_ws_url or '' }}">
+                                <div class="text-[10px] text-gray-500 mt-1">
+                                    ws:// or wss://. Text frames may be base64; both are handled.
+                                </div>
+                            </div>
+                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3 col-span-2">
+                                <label class="text-[10px] text-gray-500">Group sequence for the data set on air</label>
+                                <div class="flex items-center gap-3">
+                                    <input type="text" id="uecp_group_sequence" class="flex-1"
+                                           placeholder="Automatic - derived from what the source sends"
+                                           value="{{ state.uecp_group_sequence or '' }}">
+                                    <div class="text-[10px] text-gray-500" style="width:17rem">
+                                        Leave blank for automatic. Each data set has its own
+                                        sequence - pick one in the monitor tree to set the
+                                        others. If the source sends its own (MEC 0x16) it is
+                                        written here, replacing what was set.
+                                    </div>
+                                </div>
+                                <div class="text-[11px] mt-2">
+                                    <span class="text-gray-400">In use:</span>
+                                    <span id="uecp_seq_live" class="text-gray-200 font-mono">-</span>
+                                    <span id="uecp_seq_origin" class="text-gray-500"></span>
+                                </div>
+                            </div>
+
+                            <div class="bg-[#1a1a1a] border border-[#333] rounded p-3 col-span-2">
+                                <div class="flex items-end gap-3">
+                                    <div>
+                                        <label class="text-[10px] text-gray-500">Our site address</label>
+                                        <input type="number" id="uecp_site_address" class="w-28" min="0" max="1023"
+                                               value="{{ state.uecp_site_address or 0 }}">
+                                    </div>
+                                    <div>
+                                        <label class="text-[10px] text-gray-500">Our encoder address</label>
+                                        <input type="number" id="uecp_encoder_address" class="w-28" min="0" max="63"
+                                               value="{{ state.uecp_encoder_address or 0 }}">
+                                    </div>
+                                    <div class="text-[10px] text-gray-500 flex-1">
+                                        0 accepts frames for any address. Set these to match the
+                                        source only if it addresses this encoder specifically.
+                                    </div>
+                                    <button onclick="saveUecpTransport()"
+                                            class="px-4 py-2 bg-pink-600 hover:bg-pink-500 rounded text-sm text-white font-bold">
+                                        Apply &amp; Reconnect</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label>TCP status</label>
+                                <div class="live-display sub" id="uecp_tcp_status">-</div>
                             </div>
                             <div>
-                                <label>WebSocket URL</label>
-                                <input type="text" id="uecp_ws_url" value="{{ state.get('uecp_ws_url', 'ws://127.0.0.1/pacific') }}" placeholder="ws://192.168.1.10/pacific">
-                                <div class="text-[9px] text-gray-500 mt-1">UECP frames must be published as base64-encoded text messages. Reconnects automatically on drop.</div>
+                                <label>WebSocket status</label>
+                                <div class="live-display sub" id="uecp_ws_status">-</div>
+                            </div>
+                            <div>
+                                <label>Address filter</label>
+                                <div class="live-display sub" id="uecp_addr_status">-</div>
+                            </div>
+                            <div>
+                                <label>Traffic</label>
+                                <div class="live-display sub" id="uecp_frame_status">-</div>
                             </div>
                         </div>
-                        <div class="p-3 bg-black/30 rounded border border-gray-700 mb-3 text-[10px] text-gray-400">
-                            <div class="font-bold text-gray-300 mb-1">Supported UECP Message Elements</div>
-                            <div class="grid grid-cols-2 gap-x-4">
-                                <div>0x01 PI &mdash; Programme Identification</div>
-                                <div>0x02 PS &mdash; Programme Service name</div>
-                                <div>0x03 TA/TP &mdash; Traffic flags</div>
-                                <div>0x04 DI &mdash; Decoder Identification</div>
-                                <div>0x05 M/S &mdash; Music/Speech switch</div>
-                                <div>0x06 PIN &mdash; Programme Item Number</div>
-                                <div>0x07 PTY &mdash; Programme Type</div>
-                                <div>0x0A RT &mdash; RadioText (Group 2A)</div>
-                                <div>0x13 AF &mdash; Alternative Frequencies</div>
-                                <div>0x1A SLC &mdash; Slow Labelling Codes (ECC/LIC)</div>
-                                <div>0x24 FFG &mdash; Free Format Group (any group, cyclic or one-shot)</div>
-                                <div>0x40 ODA_SET &mdash; ODA Application Assignment (Group 3A)</div>
-                                <div>0x46 ODA_DATA &mdash; ODA Data (group data for registered AID)</div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">Data Sets and Programme Services</div>
+                    <div class="section-body">
+                        <div class="grid grid-cols-3 gap-4">
+                            <div class="col-span-1">
+                                <label>Received data sets</label>
+                                <div id="uecp_tree" class="live-display sub"
+                                     style="min-height:220px; overflow:auto;">
+                                    Waiting for data...
+                                </div>
                             </div>
-                            <div class="mt-2 text-gray-500">Note: receiving an RT update (0x0A) automatically clears the RT Messages list so that UECP has full control of RadioText.</div>
+                            <div class="col-span-2">
+                                <label>Selected service</label>
+                                <div id="uecp_detail" class="live-display sub"
+                                     style="min-height:220px; overflow:auto;">
+                                    Nothing received yet.
+                                </div>
+                            </div>
                         </div>
-                        <div class="flex gap-2 items-center">
-                            <button onclick="saveUECPSettings()" class="bg-pink-600 hover:bg-pink-500 text-white font-semibold rounded px-4 py-2 text-sm transition">Apply</button>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">Other Networks, ODA and Queued Groups</div>
+                    <div class="section-body">
+                        <div class="grid grid-cols-3 gap-4">
+                            <div>
+                                <label>Other networks (EON)</label>
+                                <div id="uecp_eon" class="live-display sub font-mono text-[11px]"
+                                     style="min-height:110px; overflow:auto;">-</div>
+                            </div>
+                            <div>
+                                <label>ODA applications</label>
+                                <div id="uecp_oda" class="live-display sub font-mono text-[11px]"
+                                     style="min-height:110px; overflow:auto;">-</div>
+                            </div>
+                            <div>
+                                <label>Raw groups waiting to go out</label>
+                                <div id="uecp_queue" class="live-display sub font-mono text-[11px]"
+                                     style="min-height:110px; overflow:auto;">-</div>
+                            </div>
                         </div>
-                        <div id="uecp_status" class="text-[11px] text-gray-400 mt-2"></div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header">Recent Message Elements</div>
+                    <div class="section-body">
+                        <div id="uecp_log" class="live-display sub font-mono text-[11px]"
+                             style="min-height:160px; max-height:320px; overflow:auto;">
+                            No message elements received yet.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="uecp_status" class="text-[11px] text-gray-400 mt-2"></div>
                     </div>
                 </div>
             </div>
@@ -10160,6 +10721,55 @@ UI_HTML = r"""
                     <button onclick="closeRTPlusModal()" class="px-4 py-2 bg-[#333] hover:bg-[#444] rounded text-sm text-gray-300">Cancel</button>
                     <button onclick="applyBuilderConfig()" class="px-4 py-2 bg-[#d946ef] hover:bg-[#c026d3] rounded text-sm text-white font-bold">Apply</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="new_profile_modal" class="rtplus-modal-overlay" style="display: none;">
+        <div class="rtplus-modal-content" style="max-width: 560px;">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-lg font-bold">New Profile</h3>
+                <button onclick="closeNewProfileModal()" class="text-2xl leading-none hover:text-pink-600">&times;</button>
+            </div>
+
+            <div class="mb-4">
+                <label class="text-xs text-gray-400 mb-1 block">Profile name</label>
+                <input type="text" id="new_profile_name" class="w-full bg-black border border-gray-600 rounded px-2 py-2"
+                       placeholder="Main Studio">
+            </div>
+
+            <label class="text-xs text-gray-400 mb-2 block">What drives this profile?</label>
+            <div class="space-y-2 mb-4">
+                <label class="flex gap-3 items-start p-3 bg-[#1a1a1a] border border-[#333] rounded cursor-pointer hover:border-pink-600"
+                       onclick="selectProfileMode('internal')" id="new_profile_opt_internal">
+                    <input type="radio" name="new_profile_mode" value="internal" class="mt-1 accent-pink-600" checked>
+                    <div>
+                        <div class="text-sm text-gray-200 font-bold">Internal RDS coder</div>
+                        <div class="text-[11px] text-gray-500 mt-1">
+                            You configure PS, RadioText, PTY, AF, EON and everything else in this
+                            interface. Use this for a standalone encoder, or as a failover profile.
+                        </div>
+                    </div>
+                </label>
+                <label class="flex gap-3 items-start p-3 bg-[#1a1a1a] border border-[#333] rounded cursor-pointer hover:border-pink-600"
+                       onclick="selectProfileMode('uecp')" id="new_profile_opt_uecp">
+                    <input type="radio" name="new_profile_mode" value="uecp" class="mt-1 accent-pink-600">
+                    <div>
+                        <div class="text-sm text-gray-200 font-bold">UECP input</div>
+                        <div class="text-[11px] text-gray-500 mt-1">
+                            RDS data arrives from an external UECP source over TCP or WebSocket.
+                            The profile starts empty and this interface only monitors it - the
+                            encoder transmits exactly what the source sends.
+                        </div>
+                    </div>
+                </label>
+            </div>
+
+            <div class="flex justify-end gap-2">
+                <button onclick="closeNewProfileModal()"
+                        class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm">Cancel</button>
+                <button onclick="confirmNewProfile()"
+                        class="px-4 py-2 bg-pink-600 hover:bg-pink-500 rounded text-sm text-white font-bold">Create Profile</button>
             </div>
         </div>
     </div>
@@ -11122,10 +11732,10 @@ UI_HTML = r"""
                 }
 
                 // Load intelligent tagging settings
-                if (document.getElementById('rt_msg_prefix'))
-                    document.getElementById('rt_msg_prefix').value = msg.prefix || '';
-                if (document.getElementById('rt_msg_suffix'))
-                    document.getElementById('rt_msg_suffix').value = msg.suffix || '';
+                if (document.getElementById('rt_msg_prefix_auto'))
+                    document.getElementById('rt_msg_prefix_auto').value = msg.prefix || '';
+                if (document.getElementById('rt_msg_suffix_auto'))
+                    document.getElementById('rt_msg_suffix_auto').value = msg.suffix || '';
                 if (document.getElementById('rt_msg_split_pattern'))
                     document.getElementById('rt_msg_split_pattern').value = msg.split_delimiter || ' - ';
                 if (document.getElementById('rt_msg_before_tag'))
@@ -11208,10 +11818,10 @@ UI_HTML = r"""
             } else {
                 // File/URL source with intelligent tagging
                 document.getElementById('rt_msg_content').value = msg.content || '';
-                if (document.getElementById('rt_msg_prefix'))
-                    document.getElementById('rt_msg_prefix').value = msg.prefix || '';
-                if (document.getElementById('rt_msg_suffix'))
-                    document.getElementById('rt_msg_suffix').value = msg.suffix || '';
+                if (document.getElementById('rt_msg_prefix_auto'))
+                    document.getElementById('rt_msg_prefix_auto').value = msg.prefix || '';
+                if (document.getElementById('rt_msg_suffix_auto'))
+                    document.getElementById('rt_msg_suffix_auto').value = msg.suffix || '';
                 if (document.getElementById('rt_msg_split_pattern'))
                     document.getElementById('rt_msg_split_pattern').value = msg.split_delimiter || ' - ';
                 if (document.getElementById('rt_msg_before_tag'))
@@ -11541,6 +12151,17 @@ UI_HTML = r"""
                     tag2Len = result.tag2Len;
                     tag2Type = result.tag2Type;
                     appliedRuleName = result.appliedPolicy;
+                    // Prefix/suffix are applied by the encoder for file/URL sources,
+                    // so show them here too and shift the tag positions to match.
+                    var pfEl = document.getElementById('rt_msg_prefix_auto');
+                    var sfEl = document.getElementById('rt_msg_suffix_auto');
+                    var pf = pfEl ? pfEl.value : '';
+                    var sf = sfEl ? sfEl.value : '';
+                    if (pf || sf) {
+                        preview = pf + preview + sf;
+                        if (tag1Len > 0) tag1Start += pf.length;
+                        if (tag2Len > 0) tag2Start += pf.length;
+                    }
                 } else {
                     preview = '(no content)';
                 }
@@ -12391,8 +13012,8 @@ UI_HTML = r"""
                 } else {
                     // Intelligent tagging mode
                     msg.content = document.getElementById('rt_msg_sample_text') ? document.getElementById('rt_msg_sample_text').value : 'Artist - Song Title'; // Store sample text
-                    msg.prefix = document.getElementById('rt_msg_prefix') ? document.getElementById('rt_msg_prefix').value || '' : '';
-                    msg.suffix = document.getElementById('rt_msg_suffix') ? document.getElementById('rt_msg_suffix').value || '' : '';
+                    msg.prefix = document.getElementById('rt_msg_prefix_auto') ? document.getElementById('rt_msg_prefix_auto').value || '' : '';
+                    msg.suffix = document.getElementById('rt_msg_suffix_auto') ? document.getElementById('rt_msg_suffix_auto').value || '' : '';
                     msg.split_delimiter = document.getElementById('rt_msg_split_pattern') ? document.getElementById('rt_msg_split_pattern').value : ' - ';
                     msg.rt_plus_tags = {
                         tag1_type: parseInt(document.getElementById('rt_msg_before_tag') ? document.getElementById('rt_msg_before_tag').value : '4') || 4,
@@ -12433,8 +13054,8 @@ UI_HTML = r"""
             } else {
                 // Save file/URL fields with intelligent tagging
                 msg.content = document.getElementById('rt_msg_content').value;
-                msg.prefix = document.getElementById('rt_msg_prefix') ? document.getElementById('rt_msg_prefix').value || '' : '';
-                msg.suffix = document.getElementById('rt_msg_suffix') ? document.getElementById('rt_msg_suffix').value || '' : '';
+                msg.prefix = document.getElementById('rt_msg_prefix_auto') ? document.getElementById('rt_msg_prefix_auto').value || '' : '';
+                msg.suffix = document.getElementById('rt_msg_suffix_auto') ? document.getElementById('rt_msg_suffix_auto').value || '' : '';
                 msg.rt_plus_enabled = document.getElementById('rt_msg_rtplus_enabled').checked;
                 msg.split_delimiter = document.getElementById('rt_msg_split_pattern') ? document.getElementById('rt_msg_split_pattern').value : ' - ';
                 msg.rt_plus_tags = {
@@ -13346,6 +13967,18 @@ UI_HTML = r"""
             setIndicator('ta_indicator', data.ta);
             setIndicator('ms_indicator', data.ms);
             setIndicator('fast_tuning_indicator', data.en_fast_tuning);
+            // Carrier and feed health: red rather than grey, because a silent
+            // failure here is the one an engineer would otherwise miss.
+            var carrierEl = document.getElementById('audio_indicator');
+            if (carrierEl) {
+                carrierEl.className = 'inline-block w-2 h-2 rounded-full ' +
+                    (data.audio_ok ? 'bg-green-400' : 'bg-red-500 animate-pulse');
+            }
+            var rtSrcEl = document.getElementById('rt_source_indicator');
+            if (rtSrcEl) {
+                rtSrcEl.className = 'inline-block w-2 h-2 rounded-full ' +
+                    (data.rt_source_ok === false ? 'bg-red-500 animate-pulse' : 'bg-green-400');
+            }
             
             // Alternative Frequencies - format based on method
             let afDisplay = "None";
@@ -13520,31 +14153,6 @@ UI_HTML = r"""
             }
         }
 
-        async function saveUECPSettings() {
-            const statusEl = document.getElementById('uecp_status');
-            if (statusEl) statusEl.innerText = 'Applying...';
-            const payload = {
-                uecp_enabled:    document.getElementById('uecp_enabled').checked,
-                uecp_port:       parseInt(document.getElementById('uecp_port').value, 10) || 4001,
-                uecp_host:       document.getElementById('uecp_host').value.trim() || '0.0.0.0',
-                uecp_psn:        parseInt(document.getElementById('uecp_psn').value, 10) || 0,
-                uecp_dsn:        parseInt(document.getElementById('uecp_dsn').value, 10) || 0,
-                uecp_ws_enabled: document.getElementById('uecp_ws_enabled').checked,
-                uecp_ws_url:     document.getElementById('uecp_ws_url').value.trim() || 'ws://127.0.0.1/pacific',
-            };
-            try {
-                const res = await fetch('/uecp_settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const data = await res.json();
-                if (statusEl) statusEl.innerText = data.status || data.error || (res.ok ? 'Saved.' : 'Error.');
-            } catch (e) {
-                if (statusEl) statusEl.innerText = 'Save failed (network error).';
-            }
-        }
-
         function updatePSGroupWarning() {
             var psGroupVersion = document.getElementById('ps_group_version').value;
             var warningDiv = document.getElementById('ps_0b_warning');
@@ -13610,6 +14218,7 @@ UI_HTML = r"""
                 pi: getVal('pi'), pty: getVal('pty'), rbds: getVal('rbds'), tp: getVal('tp'), ta: getVal('ta'), ms: getVal('ms'),
                 di_stereo: getVal('di_stereo'), di_head: getVal('di_head'), di_comp: getVal('di_comp'), di_dyn: getVal('di_dyn'),
                 en_fast_tuning: getVal('en_fast_tuning'), fast_tuning_rate: getVal('fast_tuning_rate'),
+                show_all_hostapis: getVal('show_all_hostapis'),
                 en_af: getVal('en_af'), af_list: getVal('af_list'), af_method: getVal('af_method'),
                 ps_dynamic: getVal('ps_dynamic'), ps_centered: getVal('ps_centered'), ps_group_version: getVal('ps_group_version'),
                 rt_text: getVal('rt_text'),
@@ -13836,15 +14445,25 @@ UI_HTML = r"""
                 var dataset = datasets[num];
                 var btn = document.createElement('button');
                 btn.className = parseInt(num) === currentDataset ? 'px-4 py-3 rounded text-sm font-semibold bg-pink-600 text-white' : 'px-4 py-3 rounded text-sm font-semibold bg-gray-700 hover:bg-gray-600 text-gray-200';
-                btn.textContent = dataset.name || 'Dataset ' + num;
+                btn.textContent = (dataset.name || 'Profile ' + num) +
+                                  (dataset.mode === 'uecp' ? '  \u00b7 UECP' : '');
+                btn.title = (dataset.mode === 'uecp'
+                             ? 'UECP input - RDS comes from an external source'
+                             : 'Internal RDS coder');
                 btn.onclick = (function(n) { return function() { switchDataset(n); }; })(parseInt(num));
                 container.appendChild(btn);
             }
 
             var nameEl = document.getElementById('current_dataset_name');
             if (nameEl && datasets[currentDataset]) {
-                nameEl.textContent = datasets[currentDataset].name || 'Dataset ' + currentDataset;
+                nameEl.textContent = datasets[currentDataset].name || 'Profile ' + currentDataset;
             }
+            var modeEl = document.getElementById('current_dataset_mode');
+            if (modeEl && datasets[currentDataset]) {
+                modeEl.textContent = datasets[currentDataset].mode === 'uecp'
+                    ? '(UECP input)' : '(Internal RDS coder)';
+            }
+            applyProfileMode(datasets[currentDataset] ? datasets[currentDataset].mode : 'internal');
         }
 
         function switchDataset(num) {
@@ -13854,50 +14473,78 @@ UI_HTML = r"""
                         location.reload();
                     }
                 })
-                .catch(function(e) { alert('Failed to switch dataset'); });
+                .catch(function(e) { alert('Failed to switch profile'); });
         }
 
         function createDataset() {
             var keys = Object.keys(datasets).map(function(n) { return parseInt(n); });
             var suggested = keys.length > 0 ? Math.max.apply(Math, keys) + 1 : 1;
-            var name = prompt('Enter dataset name:', 'Dataset ' + suggested);
-            if (!name) return;
+            document.getElementById('new_profile_name').value = 'Profile ' + suggested;
+            selectProfileMode('internal');
+            document.getElementById('new_profile_modal').style.display = 'flex';
+            setTimeout(function() { document.getElementById('new_profile_name').focus(); }, 50);
+        }
 
-            // Copy RDS volume and soundcard from current dataset. The server picks
-            // the actual slot number so a stale page can't overwrite a dataset.
+        function selectProfileMode(mode) {
+            document.querySelectorAll('input[name="new_profile_mode"]').forEach(function(r) {
+                r.checked = (r.value === mode);
+            });
+            [['internal', 'new_profile_opt_internal'], ['uecp', 'new_profile_opt_uecp']]
+                .forEach(function(pair) {
+                    var el = document.getElementById(pair[1]);
+                    if (!el) return;
+                    el.classList.toggle('border-pink-600', pair[0] === mode);
+                    el.classList.toggle('border-[#333]', pair[0] !== mode);
+                });
+        }
+
+        function closeNewProfileModal() {
+            document.getElementById('new_profile_modal').style.display = 'none';
+        }
+
+        function confirmNewProfile() {
+            var name = document.getElementById('new_profile_name').value.trim();
+            if (!name) {
+                alert('Give the profile a name.');
+                return;
+            }
+            var checked = document.querySelector('input[name="new_profile_mode"]:checked');
+            var mode = checked ? checked.value : 'internal';
+
+            // Carry the soundcard and level over so a new profile can transmit
+            // straight away; everything else starts from defaults.
             var newState = {};
             if (datasets[currentDataset] && datasets[currentDataset].state) {
-                var currentState = datasets[currentDataset].state;
-                if (currentState.rds_level !== undefined) {
-                    newState.rds_level = currentState.rds_level;
-                }
-                if (currentState.device_out_idx !== undefined) {
-                    newState.device_out_idx = currentState.device_out_idx;
-                }
+                var cur = datasets[currentDataset].state;
+                if (cur.rds_level !== undefined) newState.rds_level = cur.rds_level;
+                if (cur.device_out_idx !== undefined) newState.device_out_idx = cur.device_out_idx;
             }
 
-            fetch('/datasets', {
+            fetch('/profiles', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: name, state: newState })
+                body: JSON.stringify({ name: name, mode: mode, state: newState })
             })
                 .then(function(res) {
                     if (!res.ok) throw new Error('HTTP ' + res.status);
                     return res.json();
                 })
-                .then(function() { loadDatasets(); })
-                .catch(function(e) { alert('Failed to create dataset'); });
+                .then(function() {
+                    closeNewProfileModal();
+                    loadDatasets();
+                })
+                .catch(function(e) { alert('Failed to create profile: ' + e); });
         }
 
         function renameCurrentDataset() {
             // Ensure dataset exists before renaming
             if (!datasets[currentDataset]) {
-                alert('Dataset not loaded. Please refresh the page.');
+                alert('Profile not loaded. Please refresh the page.');
                 return;
             }
 
-            var currentName = datasets[currentDataset].name || 'Dataset ' + currentDataset;
-            var newName = prompt('Enter new name:', currentName);
+            var currentName = datasets[currentDataset].name || 'Profile ' + currentDataset;
+            var newName = prompt('Enter new profile name:', currentName);
             if (!newName) return;
 
             datasets[currentDataset].name = newName;
@@ -13911,16 +14558,16 @@ UI_HTML = r"""
                         loadDatasets();
                     }
                 })
-                .catch(function(e) { alert('Failed to rename dataset'); });
+                .catch(function(e) { alert('Failed to rename profile'); });
         }
 
         function deleteCurrentDataset() {
             if (Object.keys(datasets).length <= 1) {
-                alert('Cannot delete the last dataset');
+                alert('Cannot delete the last profile');
                 return;
             }
-            var currentName = datasets[currentDataset] ? datasets[currentDataset].name : 'Dataset ' + currentDataset;
-            if (!confirm('Delete dataset "' + currentName + '"?')) return;
+            var currentName = datasets[currentDataset] ? datasets[currentDataset].name : 'Profile ' + currentDataset;
+            if (!confirm('Delete profile "' + currentName + '"?')) return;
 
             fetch('/datasets/' + currentDataset, { method: 'DELETE' })
                 .then(function(res) {
@@ -16741,6 +17388,469 @@ UI_HTML = r"""
             if (cb && opts) opts.style.display = cb.checked ? 'block' : 'none';
         }
 
+        // Show only the tabs that belong to the live profile's mode. Tabs carry a
+        // data-mode attribute; anything without one (Dashboard, Audio, Profiles,
+        // Settings) is common to both modes.
+        var PROFILE_MODE = '{{ profile_mode }}';
+
+        function applyProfileMode(mode) {
+            PROFILE_MODE = (mode === 'uecp') ? 'uecp' : 'internal';
+            var tabs = document.querySelectorAll('.tab-btn[data-mode]');
+            var activeHidden = false;
+            tabs.forEach(function(tab) {
+                var show = tab.getAttribute('data-mode') === PROFILE_MODE;
+                tab.style.display = show ? '' : 'none';
+                if (!show && tab.classList.contains('active')) activeHidden = true;
+            });
+            if (activeHidden) setTab('dashboard');
+            if (typeof startUecpPolling === 'function') startUecpPolling();
+        }
+
+        // --- UECP monitor ---------------------------------------------------
+        // Polled rather than pushed: the store changes far faster than anyone can
+        // read, and polling keeps the transport threads out of the socket layer.
+        var uecpSelected = null;          // "dsn/psn" of the row being shown
+        var uecpTimer = null;
+
+        function saveUecpTransport() {
+            fetch('/uecp/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    uecp_tcp_enabled: document.getElementById('uecp_tcp_enabled').checked,
+                    uecp_ws_enabled: document.getElementById('uecp_ws_enabled').checked,
+                    uecp_host: document.getElementById('uecp_host').value,
+                    uecp_port: parseInt(document.getElementById('uecp_port').value, 10) || 4001,
+                    uecp_ws_url: document.getElementById('uecp_ws_url').value,
+                    uecp_site_address: parseInt(document.getElementById('uecp_site_address').value, 10) || 0,
+                    uecp_encoder_address: parseInt(document.getElementById('uecp_encoder_address').value, 10) || 0,
+                    uecp_group_sequence: document.getElementById('uecp_group_sequence').value
+                })
+            }).then(function() { pollUecp(); })
+              .catch(function(e) { alert('Could not apply UECP settings: ' + e); });
+        }
+
+        function uecpAge(ts) {
+            if (!ts) return 'never';
+            var secs = Math.max(0, Math.round(Date.now() / 1000 - ts));
+            if (secs < 60) return secs + 's ago';
+            if (secs < 3600) return Math.round(secs / 60) + 'm ago';
+            return Math.round(secs / 3600) + 'h ago';
+        }
+
+        function renderUecpTree(data) {
+            var el = document.getElementById('uecp_tree');
+            if (!el) return;
+            // Every data set and service is listed, whether or not the source
+            // has sent anything for it, so the structure is visible. Empty ones
+            // are dimmed and collapsed until the operator opens them.
+            var tree = data.tree || data.data_sets || [];
+            if (!tree.length) {
+                el.innerHTML = '<span class="text-gray-500">No data sets received yet.</span>';
+                return;
+            }
+            var html = '';
+            tree.forEach(function(ds) {
+                var live = ds.dsn === data.current;
+                var used = ds.services.filter(function(s) { return !s.empty; });
+                var open = live || used.length > 0 || uecpOpenSets['d' + ds.dsn];
+                var head = live ? 'text-pink-400 font-bold'
+                                : (used.length ? 'text-gray-300' : 'text-gray-600');
+                html += '<div class="mb-2">';
+                var sel = (uecpSelected === ds.dsn + '/') ? ' bg-pink-900 text-white' : '';
+                html += '<div class="cursor-pointer rounded ' + head + sel + '" '
+                      + 'onclick="selectUecpSet(' + ds.dsn + ')">'
+                      + (open ? '▾ ' : '▸ ')
+                      + 'Data Set ' + ds.dsn + (live ? ' (on air)' : '')
+                      + (used.length ? '' : ' <span class="text-[9px] text-gray-600">empty</span>')
+                      + '</div>';
+                if (open) {
+                    ds.services.forEach(function(svc) {
+                        var key = ds.dsn + '/' + svc.psn;
+                        var isMain = svc.psn === ds.main_psn;
+                        var cls = (uecpSelected === key) ? 'bg-pink-900 text-white' : 'hover:bg-gray-700';
+                        html += '<div class="pl-3 py-0.5 cursor-pointer rounded ' + cls
+                              + (svc.empty ? ' text-gray-600' : '') + '" '
+                              + 'onclick="selectUecp(&quot;' + key + '&quot;)">'
+                              + 'PSN ' + svc.psn
+                              + (svc.ps ? ' - ' + escapeHtml(svc.ps.trim()) : '')
+                              + (svc.pi ? ' (' + svc.pi + ')' : '')
+                              + (svc.empty ? ' <span class="text-[9px] text-gray-600">-</span>'
+                                 : isMain ? ' <span class="text-[9px] text-green-400">MAIN</span>'
+                                          : ' <span class="text-[9px] text-gray-500">EON</span>')
+                              + (svc.enabled ? '' : ' <span class="text-[9px] text-red-400">OFF</span>')
+                              + '</div>';
+                    });
+                }
+                html += '</div>';
+            });
+            el.innerHTML = html;
+        }
+
+        var uecpOpenSets = {};
+
+        function selectUecpSet(dsn) {
+            // Selecting a data set shows its own settings, the way selecting a
+            // service shows that service's. Clicking the one already selected
+            // folds it away again.
+            if (uecpSelected === dsn + '/') {
+                uecpOpenSets['d' + dsn] = !uecpOpenSets['d' + dsn];
+            } else {
+                uecpSelected = dsn + '/';
+                uecpOpenSets['d' + dsn] = true;
+            }
+            pollUecp();
+        }
+
+        function selectUecp(key) {
+            uecpSelected = key;
+            pollUecp();
+        }
+
+        function groupNames(list) {
+            return (list || []).map(function(b) {
+                return ((b >> 1) & 0x0F) + (b & 1 ? 'B' : 'A');
+            });
+        }
+
+        function renderUecpSetDetail(data, ds) {
+            // A data set's own settings. The RDS data itself belongs to the
+            // services underneath it and to the source; what an operator sets
+            // here is the group sequence, which MEC 0x16 addresses per data set.
+            var live = ds.dsn === data.current;
+            var fromSource = groupNames(ds.group_sequence);
+            var override = (data.sequence_overrides || {})[String(ds.dsn)] || '';
+            var used = ds.services.filter(function(s) { return !s.empty; });
+
+            var html = '<div class="text-pink-400 mb-2">Data Set ' + ds.dsn
+                     + (live ? ' <span class="text-[10px] text-green-400">ON AIR</span>' : '')
+                     + '</div>';
+
+            html += '<label class="text-[10px] text-gray-500">Group sequence'
+                  + ' for this data set</label>'
+                  + '<div class="flex items-center gap-2 mt-1">'
+                  + '<input type="text" id="uecp_ds_seq" class="flex-1 font-mono"'
+                  + ' placeholder="Automatic - built from what this data set has received"'
+                  + ' value="' + escapeHtml(override) + '">'
+                  + '<button class="btn" onclick="saveUecpSetSequence(' + ds.dsn + ')">Set</button>'
+                  + '<button class="btn" onclick="clearUecpSetSequence(' + ds.dsn + ')">Auto</button>'
+                  + '</div>'
+                  + '<div id="uecp_ds_seq_msg" class="text-[10px] mt-1 text-gray-500">'
+                  + (fromSource.length
+                       ? 'The source sends its own sequence for this data set (MEC 0x16); '
+                         + 'it replaces whatever is set here.'
+                       : 'Leave blank for automatic. Groups are written like 0A 2A 0A 8A.')
+                  + '</div>';
+
+            if (live) {
+                html += '<div class="text-[11px] mt-2"><span class="text-gray-400">In use:</span> '
+                      + '<span class="text-gray-200 font-mono">'
+                      + escapeHtml(data.group_sequence || '-') + '</span> '
+                      + '<span class="text-gray-500">(' + escapeHtml(data.sequence_origin || '') + ')</span></div>';
+            }
+
+            var rows = [
+                ['Main service', 'PSN ' + ds.main_psn
+                    + (used.length ? '' : ' (nothing received yet)')],
+                ['Other networks', used.filter(function(x) { return x.psn !== ds.main_psn; }).length],
+                ['From the source', fromSource.length ? fromSource.join(' ') : 'no MEC 0x16 sent']
+            ];
+            var slc = ds.slc || {};
+            if (Object.keys(slc).length) {
+                rows.push(['Slow labelling', Object.keys(slc).map(function(v) {
+                    return 'variant ' + v + ' = 0x' + slc[v].toString(16).toUpperCase();
+                }).join(', ')]);
+            }
+            if (live && (data.queued_groups || []).length) {
+                rows.push(['Raw groups waiting', (data.queued_groups || []).map(function(q) {
+                    return q.group + ' x' + q.waiting;
+                }).join(', ')]);
+            }
+            html += '<table class="w-full text-xs mt-3">';
+            rows.forEach(function(r) {
+                html += '<tr><td class="text-gray-400 pr-3 align-top" style="width:9rem">'
+                      + r[0] + '</td><td class="text-gray-200">'
+                      + escapeHtml(String(r[1])) + '</td></tr>';
+            });
+            html += '</table>';
+            html += '<div class="text-[10px] text-gray-500 mt-3">'
+                  + 'This profile is a UECP input, so the RDS data below a data set is '
+                  + 'whatever the source sends and is shown read-only. Pick a PSN to see it.'
+                  + '</div>';
+            document.getElementById('uecp_detail').innerHTML = html;
+        }
+
+        function saveUecpSetSequence(dsn) {
+            var box = document.getElementById('uecp_ds_seq');
+            var msg = document.getElementById('uecp_ds_seq_msg');
+            fetch('/uecp/sequence', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({dsn: dsn, sequence: box ? box.value : ''})
+            }).then(function(r) { return r.json().then(function(j) { return [r.ok, j]; }); })
+              .then(function(pair) {
+                  if (msg) {
+                      msg.textContent = pair[0]
+                          ? 'Saved for data set ' + dsn + '.'
+                          : (pair[1].error || 'Could not save');
+                      msg.className = 'text-[10px] mt-1 '
+                          + (pair[0] ? 'text-green-400' : 'text-red-400');
+                  }
+                  if (pair[0]) pollUecp();
+              })
+              .catch(function(e) {
+                  if (msg) { msg.textContent = String(e); msg.className = 'text-[10px] mt-1 text-red-400'; }
+              });
+        }
+
+        function clearUecpSetSequence(dsn) {
+            var box = document.getElementById('uecp_ds_seq');
+            if (box) box.value = '';
+            saveUecpSetSequence(dsn);
+        }
+
+        function renderUecpDetail(data) {
+            var el = document.getElementById('uecp_detail');
+            if (!el) return;
+            // A data set is selected as "<dsn>/" and a service as "<dsn>/<psn>".
+            if (uecpSelected && uecpSelected.slice(-1) === '/') {
+                var wantDsn = parseInt(uecpSelected, 10);
+                var found = (data.tree || data.data_sets || []).filter(function(ds) {
+                    return ds.dsn === wantDsn;
+                })[0];
+                if (found) {
+                    // Never redraw the field out from under someone typing in it.
+                    var box = document.getElementById('uecp_ds_seq');
+                    if (!box || document.activeElement !== box) {
+                        renderUecpSetDetail(data, found);
+                    }
+                    return;
+                }
+            }
+            var chosen = null, parent = null;
+            (data.tree || data.data_sets || []).forEach(function(ds) {
+                ds.services.forEach(function(svc) {
+                    var key = ds.dsn + '/' + svc.psn;
+                    if (key === uecpSelected) { chosen = svc; parent = ds; }
+                    // Default to the live data set's main service.
+                    if (!uecpSelected && ds.dsn === data.current && svc.psn === ds.main_psn) {
+                        chosen = svc; parent = ds; uecpSelected = key;
+                    }
+                });
+            });
+            if (!chosen) {
+                el.innerHTML = '<span class="text-gray-500">Nothing received yet.</span>';
+                return;
+            }
+            var rows = [
+                ['PI', chosen.pi || '-'],
+                ['PS', chosen.ps || '-'],
+                ['RadioText', chosen.rt || '-'],
+                ['RT messages', chosen.rt_count],
+                ['PTY', chosen.pty === null ? '-' : chosen.pty],
+                ['PTYN', chosen.ptyn || '-'],
+                ['Long PS', chosen.long_ps || '-'],
+                ['TA / TP', (chosen.ta ? 'TA' : '-') + ' / ' + (chosen.tp ? 'TP' : '-')],
+                ['M/S', chosen.ms ? 'Music' : 'Speech'],
+                ['DI', '0x' + (chosen.di || 0).toString(16).toUpperCase()],
+                ['PIN', chosen.pin === null ? '-' : chosen.pin],
+                ['AF bytes', chosen.af_bytes],
+                ['Role', chosen.psn === parent.main_psn ? 'Main service (transmitted)'
+                                                        : 'Other network (EON)'],
+                ['Last update', uecpAge(chosen.updated_at)]
+            ];
+            var html = '<div class="text-pink-400 mb-1">Data Set ' + parent.dsn
+                     + ' / PSN ' + chosen.psn + '</div><table class="w-full text-xs">';
+            rows.forEach(function(r) {
+                html += '<tr><td class="text-gray-400 pr-3 align-top" style="width:9rem">'
+                      + r[0] + '</td><td class="text-gray-200">' + escapeHtml(String(r[1])) + '</td></tr>';
+            });
+            html += '</table>';
+            if (parent.group_sequence && parent.group_sequence.length) {
+                html += '<div class="mt-2 text-gray-400">Group sequence: <span class="text-gray-200">'
+                      + parent.group_sequence.map(function(b) {
+                            return ((b >> 1) & 0x0F) + (b & 1 ? 'B' : 'A');
+                        }).join(', ') + '</span></div>';
+            }
+            var slc = parent.slc || {};
+            if (Object.keys(slc).length) {
+                html += '<div class="mt-1 text-gray-400">Slow labelling: <span class="text-gray-200">'
+                      + Object.keys(slc).map(function(v) {
+                            return 'variant ' + v + ' = 0x' + slc[v].toString(16).toUpperCase();
+                        }).join(', ') + '</span></div>';
+            }
+            el.innerHTML = html;
+        }
+
+        function renderUecpStatus(data) {
+            var set = function(id, text, ok) {
+                var e = document.getElementById(id);
+                if (!e) return;
+                e.textContent = text;
+                e.className = 'live-display sub ' + (ok === undefined ? ''
+                              : ok ? 'text-green-300' : 'text-red-400');
+            };
+            var tcp = data.tcp || {}, ws = data.ws || {};
+            set('uecp_tcp_status',
+                !tcp.enabled ? 'disabled'
+                  : (tcp.running ? 'listening on ' + tcp.host + ':' + tcp.port
+                                   + ' (' + tcp.clients + ' client' + (tcp.clients === 1 ? '' : 's') + ')'
+                                 : (tcp.error || 'starting...')),
+                !tcp.enabled ? undefined : tcp.running);
+            set('uecp_ws_status',
+                !ws.enabled ? 'disabled'
+                  : (ws.connected ? 'connected to ' + ws.url
+                                  : (ws.error || 'connecting...')),
+                !ws.enabled ? undefined : ws.connected);
+            set('uecp_addr_status', 'site ' + data.site + ' / encoder ' + data.encoder
+                + (data.site === 0 && data.encoder === 0 ? '  (accepts any)' : ''));
+            var seqEl = document.getElementById('uecp_seq_live');
+            if (seqEl) seqEl.textContent = data.group_sequence || '-';
+            // The source can replace the sequence; reflect that in the box, but
+            // never while it is being edited.
+            var boxEl = document.getElementById('uecp_group_sequence');
+            if (boxEl && document.activeElement !== boxEl
+                && data.sequence_override !== undefined
+                && boxEl.value !== data.sequence_override) {
+                boxEl.value = data.sequence_override;
+            }
+            var originEl = document.getElementById('uecp_seq_origin');
+            if (originEl) originEl.textContent = data.sequence_origin
+                ? '(' + data.sequence_origin + ')' : '';
+            set('uecp_frame_status',
+                data.frames + ' frames, ' + data.elements + ' elements, '
+                + data.errors + ' errors - last ' + uecpAge(data.last_frame_at),
+                data.frames > 0 && data.errors === 0);
+        }
+
+        function renderUecpExtras(data) {
+            // EON comes from the other programme services in the live data set,
+            // per MEC 0x28. A source that sends only one service has no EON to
+            // give, and saying so plainly beats an empty box.
+            var live = null;
+            (data.tree || data.data_sets || []).forEach(function(ds) {
+                if (ds.dsn === data.current) live = ds;
+            });
+            var eon = document.getElementById('uecp_eon');
+            if (eon) {
+                var others = live ? live.services.filter(function(s) {
+                    return !s.empty && s.psn !== live.main_psn;
+                }) : [];
+                eon.innerHTML = others.length
+                    ? others.map(function(s) {
+                        return 'PSN ' + s.psn + '  ' + escapeHtml((s.pi || '----'))
+                             + '  ' + escapeHtml((s.ps || '').trim())
+                             + (s.ta ? '  TA' : '') + (s.tp ? '  TP' : '');
+                      }).join('<br>')
+                    : '<span class="text-gray-500">None. This source sends one '
+                    + 'programme service, so there are no other networks to put '
+                    + 'in groups 14A/14B.</span>';
+            }
+            var oda = document.getElementById('uecp_oda');
+            if (oda) {
+                oda.innerHTML = (data.oda && data.oda.length)
+                    ? data.oda.map(function(a) {
+                        return 'AID ' + escapeHtml(a.aid) + ' -> ' + escapeHtml(a.group)
+                             + ' <span class="text-gray-500">(' + escapeHtml(a.announced_by || '') + ')</span>';
+                      }).join('<br>')
+                    : '<span class="text-gray-500">None announced.</span>';
+            }
+            var q = document.getElementById('uecp_queue');
+            if (q) {
+                var rows = data.queued_groups || [];
+                var tmc = (data.transparent && data.transparent.TMC) || 0;
+                q.innerHTML = (rows.length
+                    ? rows.map(function(r) {
+                        return escapeHtml(r.group) + '  ' + r.waiting + ' waiting';
+                      }).join('<br>')
+                    : '<span class="text-gray-500">Nothing queued.</span>')
+                    + '<div class="text-gray-500 mt-1">TMC messages received: ' + tmc
+                    + (data.dropped_stale ? ' &middot; dropped as stale: '
+                        + data.dropped_stale : '') + '</div>';
+            }
+        }
+
+        function renderUecpLog(data) {
+            var el = document.getElementById('uecp_log');
+            if (!el) return;
+            var log = data.log || [];
+            if (!log.length) {
+                el.innerHTML = '<span class="text-gray-500">No message elements received yet.</span>';
+                return;
+            }
+            el.innerHTML = log.map(function(row) {
+                var t = new Date(row.at * 1000).toLocaleTimeString();
+                return '<div><span class="text-gray-500">' + t + '</span>  '
+                     + escapeHtml(row.text) + '</div>';
+            }).join('');
+        }
+
+        function pollUecp() {
+            if (PROFILE_MODE !== 'uecp') return;
+            fetch('/uecp/status')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (!data.active) return;
+                    renderUecpStatus(data);
+                    renderUecpTree(data);
+                    renderUecpDetail(data);
+                    renderUecpExtras(data);
+                    renderUecpLog(data);
+                })
+                .catch(function() { /* transient; the next poll retries */ });
+        }
+
+        function startUecpPolling() {
+            if (uecpTimer) clearInterval(uecpTimer);
+            if (PROFILE_MODE === 'uecp') {
+                pollUecp();
+                uecpTimer = setInterval(pollUecp, 1000);
+            }
+        }
+
+        function refreshDeviceLists() {
+            var cb = document.getElementById('show_all_hostapis');
+            var statusEl = document.getElementById('device_refresh_status');
+            if (!cb) return;
+            if (statusEl) statusEl.textContent = 'Scanning devices...';
+            fetch('/devices?all=' + (cb.checked ? '1' : '0'))
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var fill = function(id, list, allowNone) {
+                        var sel = document.getElementById(id);
+                        if (!sel) return;
+                        var prev = sel.value;
+                        sel.innerHTML = '';
+                        if (allowNone) {
+                            var none = document.createElement('option');
+                            none.value = '-1';
+                            none.textContent = 'None (Internal Generator Only)';
+                            sel.appendChild(none);
+                        }
+                        list.forEach(function(d) {
+                            var o = document.createElement('option');
+                            o.value = d.index;
+                            o.textContent = d.name;
+                            sel.appendChild(o);
+                        });
+                        // Keep the previous selection if that device is still listed
+                        if (Array.prototype.some.call(sel.options, function(o) { return o.value === prev; })) {
+                            sel.value = prev;
+                        }
+                    };
+                    fill('dev_in', data.inputs || [], true);
+                    fill('dev_out', data.outputs || [], false);
+                    if (statusEl) {
+                        statusEl.textContent = (data.outputs || []).length + ' output, ' +
+                            (data.inputs || []).length + ' input device(s) available' +
+                            (cb.checked ? ' across all APIs' : ' on ' + (data.default_api || 'the default API'));
+                    }
+                })
+                .catch(function(e) {
+                    if (statusEl) statusEl.textContent = 'Device scan failed: ' + e;
+                });
+        }
+
         function updateAFMethodUI() {
             var method = document.getElementById('af_method').value;
             var methodAUI = document.getElementById('af_method_a_ui');
@@ -17697,7 +18807,7 @@ UI_HTML = r"""
                          'ecc', 'lic', 'tz_offset', 'en_ct', 'en_id', 'en_pin', 'pin_day', 'pin_hour', 'pin_minute',
                          'en_ert', 'ert_text', 'ert_encoding', 'ert_messages', 'ert_group_type', 'ert_direction',
                          'en_ert_rtplus', 'ert_rtplus_tags', 'ert_rtplus_group_type', 'ert_source',
-                         'en_paging', 'paging_group_designation'],
+                         ],
             'advanced': ['custom_oda_list', 'custom_groups', 'group_sequence', 'scheduler_auto',
                          'dynamic_control_enabled', 'dynamic_control_rules',
                          'en_tdc_5a', 'en_tdc_5b', 'tdc_5a_channel', 'tdc_5b_channel', 'tdc_5a_text', 'tdc_5b_text',
@@ -17709,7 +18819,8 @@ UI_HTML = r"""
                       'rds2_logo_path', 'rds2_logo_filename',
                       'en_ari', 'ari_region', 'ari_announcement', 'ari_announcement_mode', 'ari_bk_level', 'ari_dk_level'],
             'connectivity': ['serial_enabled', 'serial_port', 'serial_baud',
-                            'uecp_enabled', 'uecp_port', 'uecp_host', 'uecp_psn', 'uecp_dsn',
+                            'uecp_tcp_enabled', 'uecp_port', 'uecp_host',
+                            'uecp_site_address', 'uecp_encoder_address',
                             'uecp_ws_enabled', 'uecp_ws_url']
         };
 
@@ -17735,7 +18846,6 @@ UI_HTML = r"""
             'ih': ['en_ih', 'en_ih_station_id', 'ih_first_start_date', 'ih_frequency', 'ih_site_code'],
             'ert': ['en_ert', 'ert_text', 'ert_encoding', 'ert_messages', 'ert_group_type', 'ert_direction',
                     'en_ert_rtplus', 'ert_rtplus_tags', 'ert_rtplus_group_type', 'ert_source'],
-            'paging': ['en_paging', 'paging_group_designation'],
             'custom_groups': ['custom_groups'],
             'custom_oda': ['custom_oda_list'],
             'group_sequence': ['group_sequence', 'scheduler_auto'],
@@ -17746,7 +18856,8 @@ UI_HTML = r"""
                      'rds2_logo_path', 'rds2_logo_filename'],
             'ari': ['en_ari', 'ari_region', 'ari_announcement', 'ari_announcement_mode', 'ari_bk_level', 'ari_dk_level'],
             'serial': ['serial_enabled', 'serial_port', 'serial_baud'],
-            'uecp': ['uecp_enabled', 'uecp_port', 'uecp_host', 'uecp_psn', 'uecp_dsn', 'uecp_ws_enabled', 'uecp_ws_url']
+            'uecp': ['uecp_tcp_enabled', 'uecp_port', 'uecp_host', 'uecp_site_address',
+                     'uecp_encoder_address', 'uecp_ws_enabled', 'uecp_ws_url']
         };
 
         function updateExportOptions() {
