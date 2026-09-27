@@ -83,13 +83,9 @@ python app.py
 
 ## Limits and Roadmap
 
-- EON (Enhanced Other Networks) Group 14B TA not implemented. ⚠️
-
 - No packaged EXE release yet
 
 - Support for UECP output (planned)
-
-- Support for MRDS1322 RDS encoder chip (planned)
 
 ## Development Status
 
