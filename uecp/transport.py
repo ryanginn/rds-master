@@ -45,7 +45,7 @@ class _Handler(socketserver.BaseRequestHandler):
                         store.last_error = str(item)
                         store.note(f"bad frame from {peer}: {item}")
                         continue
-                    apply_frame(store, item)
+                    apply_frame(store, item, server.allowed, server.link)
                     if server.on_change:
                         server.on_change()
         finally:
@@ -57,7 +57,9 @@ class _Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, store, on_change):
+    def __init__(self, addr, store, on_change, allowed=None, link=""):
+        self.allowed = allowed
+        self.link = link
         self.store = store
         self.on_change = on_change
         self.clients = 0
@@ -68,7 +70,10 @@ class _Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
 class TcpListener:
     """Accepts UECP over TCP. Keeps trying to bind if the port is busy."""
 
-    def __init__(self, host: str, port: int, store: Store, on_change=None) -> None:
+    def __init__(self, host: str, port: int, store: Store, on_change=None,
+                 allowed=None, name: str = "") -> None:
+        self.allowed = allowed
+        self.name = name or f"TCP {host}:{port}"
         self.host, self.port = host, port
         self.store = store
         self.on_change = on_change
@@ -96,7 +101,8 @@ class TcpListener:
         backoff = 1.0
         while not self._stop.is_set():
             try:
-                self._server = _Server((self.host, self.port), self.store, self.on_change)
+                self._server = _Server((self.host, self.port), self.store,
+                                       self.on_change, self.allowed, self.name)
             except OSError as exc:
                 self.last_error = str(exc)
                 self.store.note(f"TCP listener cannot bind {self.host}:{self.port} - {exc}")
@@ -163,7 +169,10 @@ class WebSocketClient:
     says so, rather than failing silently.
     """
 
-    def __init__(self, url: str, store: Store, on_change=None) -> None:
+    def __init__(self, url: str, store: Store, on_change=None,
+                 allowed=None, name: str = "") -> None:
+        self.allowed = allowed
+        self.name = name or f"WebSocket {url}"
         self.url = url
         self.store = store
         self.on_change = on_change
@@ -219,7 +228,7 @@ class WebSocketClient:
                             self.store.last_error = str(item)
                             self.store.note(f"bad frame over WebSocket: {item}")
                             continue
-                        apply_frame(self.store, item)
+                        apply_frame(self.store, item, self.allowed, self.name)
                         if self.on_change:
                             self.on_change()
             except Exception as exc:

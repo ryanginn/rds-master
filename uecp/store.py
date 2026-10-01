@@ -365,8 +365,15 @@ class Store:
         # Decoded paging and EPP calls, newest first
         self.paging: list = []
 
+        # Which commands this encoder will act on. None means all of them,
+        # which is the default; a set restricts it. Every encoder of this kind
+        # has the feature - a studio link should not be able to rewrite the PI
+        # or the AF list just because it can reach the port.
+        self.allowed_mecs: set | None = None
+
         # Health counters, so the UI can show whether anything is arriving.
         self.frames = 0
+        self.elements_blocked = 0
         self.frames_rejected = 0
         self.elements = 0
         self.elements_ignored = 0
@@ -494,6 +501,9 @@ class Store:
             "paging": list(self.paging)[:20],
             "frames": self.frames, "frames_rejected": self.frames_rejected,
             "elements": self.elements, "elements_ignored": self.elements_ignored,
+            "elements_blocked": self.elements_blocked,
+            "allowed_mecs": (None if self.allowed_mecs is None
+                             else sorted(self.allowed_mecs)),
             "errors": self.errors, "last_error": self.last_error,
             "last_frame_at": self.last_frame_at,
             "log": list(self.log)[:60],

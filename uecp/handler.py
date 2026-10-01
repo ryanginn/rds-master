@@ -636,9 +636,25 @@ GLOBAL_HANDLERS = {
 # Dispatch
 # ---------------------------------------------------------------------------
 
-def apply_element(store: Store, el: Element) -> None:
-    """Apply one message element to the store."""
+def apply_element(store: Store, el: Element, allowed=None, link: str = "") -> None:
+    """Apply one message element to the store.
+
+    `allowed` is the set of commands the connection it arrived on may use, or
+    None for all of them. Hardware coders set these per port, so a studio link
+    can be allowed to set RadioText while a remote one cannot touch the PI.
+    """
     store.elements += 1
+
+    if allowed is None:
+        allowed = store.allowed_mecs
+    # A command that is not allowed is counted and logged rather than dropped
+    # silently, so it is obvious from the monitor why a source's PS is missing.
+    if allowed is not None and el.mec not in allowed:
+        store.elements_blocked += 1
+        where = f" on {link}" if link else ""
+        store.note(f"{el.name}: not allowed{where} "
+                   f"(MEC 0x{el.mec:02X} is blocked here)")
+        return
 
     handler = GLOBAL_HANDLERS.get(el.mec)
     if handler is not None:
@@ -690,11 +706,12 @@ def apply_element(store: Store, el: Element) -> None:
     store.note(f"{el.name}: no handler for MEC 0x{el.mec:02X}")
 
 
-def apply_frame(store: Store, frame: Frame) -> int:
+def apply_frame(store: Store, frame: Frame, allowed=None, link: str = "") -> int:
     """Apply every element in a frame. Returns how many were applied.
 
     The frame's address is checked first: a frame for another encoder is counted
-    as rejected and goes no further.
+    as rejected and goes no further. `allowed` and `link` describe the
+    connection it arrived on, for per-connection access rights.
     """
     if not store.address.accepts(frame.address):
         store.frames_rejected += 1
@@ -711,6 +728,6 @@ def apply_frame(store: Store, frame: Frame) -> int:
             store.last_error = str(item)
             store.note(f"malformed element: {item}")
             break
-        apply_element(store, item)
+        apply_element(store, item, allowed, link)
         applied += 1
     return applied

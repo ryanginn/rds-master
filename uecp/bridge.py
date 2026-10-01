@@ -29,6 +29,18 @@ SLC_VARIANT_ECC = 0      # paging + Extended Country Code; ECC is the low byte
 SLC_VARIANT_LIC = 3      # Language Identification Code
 
 
+def in_house_wanted(state: dict) -> bool:
+    """Whether group 6A should be transmitted.
+
+    In-House data belongs to the transmitter site rather than to a programme
+    service, so like Clock Time it is one setting for the whole encoder and not
+    something held per data set. A UECP source has no way to send it, so it is
+    the operator's own switch - the same `en_ih` the internal coder uses, with
+    the same channel, date and station identifier behind it.
+    """
+    return bool(state.get("en_ih"))
+
+
 CT_FROM_SOURCE = "source"     # only when the source has sent a time (default)
 CT_FROM_LOCAL = "local"      # this encoder's own clock, as the internal coder does
 CT_OFF = "off"               # never, whatever the source sends
@@ -88,6 +100,180 @@ def af_codes_to_mhz(af: bytes) -> list[str]:
     return out
 
 
+# What a programme service is being used for within its data set.
+ROLE_MAIN = "main"     # the station itself - its PI, PS and RadioText go to air
+ROLE_EON = "eon"       # an other network, carried in groups 14A and 14B
+ROLE_OFF = "off"       # present in the tree, not transmitted
+ROLES = (ROLE_MAIN, ROLE_EON, ROLE_OFF)
+
+
+def local_services(state: dict, dsn: int) -> dict:
+    """The operator's own entries for this data set, keyed by PSN.
+
+    A UECP source describes EON by sending the other networks as further PSNs
+    in the data set, with MEC 0x28 naming which one is the main service. Plenty
+    of sources never do - the one this was written against sends a single
+    service - so the same structure can be filled in here instead: one entry per
+    PSN, each marked as the main service, as an other network, or as neither.
+
+    Entries are additions and overrides. A data set with none behaves exactly as
+    before: whatever the source called the main service is the main service, and
+    its other PSNs are the other networks.
+    """
+    try:
+        table = json.loads(state.get("uecp_local_services") or "{}")
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(table, dict):
+        return {}
+    out = {}
+    for row in table.get(str(dsn)) or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            psn = int(row.get("psn", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= psn <= 255:
+            out[psn] = row
+    return out
+
+
+def local_main_psn(state: dict, dsn: int) -> int | None:
+    """The PSN the operator has marked as this data set's main service."""
+    for psn, row in sorted(local_services(state, dsn).items()):
+        if str(row.get("role", "")).lower() == ROLE_MAIN:
+            return psn
+    return None
+
+
+def _linkage_word(link: dict) -> int:
+    """Pack linkage information the way group 14A variant 12 carries it.
+
+    Bit 15 is the Linkage Actuator, bit 14 the Extended Generic indicator,
+    bit 12 the International Linkage Set, and the low twelve bits the Linkage
+    Set Number.
+    """
+    try:
+        lsn = int(str(link.get("lsn", "0") or "0"), 16) & 0x0FFF
+    except ValueError:
+        lsn = 0
+    return (((1 if link.get("la") else 0) << 15)
+            | ((1 if link.get("eg") else 0) << 14)
+            | ((1 if link.get("ils") else 0) << 12)
+            | lsn)
+
+
+def _service_from_row(row: dict) -> dict:
+    """One hand-entered other network, in the shape the EON code expects."""
+    entry = {
+        "pi_on": str(row.get("pi", "")).strip().upper(),
+        "ps": str(row.get("ps", "")).ljust(8)[:8],
+        "pty": int(row.get("pty", 0) or 0) & 0x1F,
+        "tp": 1 if row.get("tp") else 0,
+        "ta": 1 if row.get("ta") else 0,
+        "af_list": str(row.get("af_list", "") or ""),
+        "mapped_freqs": list(row.get("mapped_freqs") or []),
+        "uecp_psn": int(row.get("psn", 0) or 0),
+        "uecp_origin": "set here",
+    }
+    link = row.get("linkage")
+    if isinstance(link, dict):
+        entry["linkage"] = _linkage_word(link)
+    if row.get("en_pin"):
+        entry.update({
+            "en_pin": 1,
+            "pin_day": int(row.get("pin_day", 0) or 0) & 0x1F,
+            "pin_hour": int(row.get("pin_hour", 0) or 0) & 0x1F,
+            "pin_minute": int(row.get("pin_minute", 0) or 0) & 0x3F,
+        })
+    return entry
+
+
+def _programme_service_from_row(row: dict) -> ProgrammeService:
+    """A programme service built from an operator's own entry.
+
+    Used when a PSN has been marked as the main service but the source has
+    never sent anything for it, so there is nothing in the store to use.
+    """
+    svc = ProgrammeService(int(row.get("psn", 0) or 0))
+    pi = str(row.get("pi", "")).strip().upper()
+    if pi:
+        try:
+            svc.pi = int(pi, 16)
+        except ValueError:
+            svc.pi = None
+    ps = str(row.get("ps", ""))
+    if ps.strip():
+        svc.ps = ps.ljust(8)[:8]
+    svc.pty = int(row.get("pty", 0) or 0) & 0x1F
+    svc.tp = bool(row.get("tp"))
+    svc.ta = bool(row.get("ta"))
+    if row.get("en_pin"):
+        svc.pin = (((int(row.get("pin_day", 0) or 0) & 0x1F) << 11)
+                   | ((int(row.get("pin_hour", 0) or 0) & 0x1F) << 6)
+                   | (int(row.get("pin_minute", 0) or 0) & 0x3F))
+    svc.touch()
+    return svc
+
+
+def main_service(ds, state: dict):
+    """The service whose data goes to air as the station itself.
+
+    Returns it with its PSN and, when it was built here rather than received,
+    the operator's row it came from - the caller needs that for the AF list,
+    which a source sends as raw memory and an operator types as frequencies.
+    """
+    chosen = local_main_psn(state, ds.dsn)
+    if chosen is None:
+        return ds.main, ds.main_psn, None
+    received = ds.services.get(chosen)
+    if received is not None:
+        return received, chosen, None            # the source's own data wins
+    row = local_services(state, ds.dsn).get(chosen)
+    if row is None:
+        return ds.main, ds.main_psn, None
+    return _programme_service_from_row(row), chosen, row
+
+
+def eon_services(store: Store, ds, state: dict) -> list:
+    """Every other network for this data set.
+
+    A PSN the source describes wins over a hand-entered copy of the same one,
+    so switching a source on does not leave a stale duplicate on air beside it.
+    An entry with no PI is skipped: group 14A cannot do without one, and the
+    alternative is transmitting 0000.
+    """
+    local = local_services(state, ds.dsn)
+    _, main_psn, _row = main_service(ds, state)
+
+    services, taken = [], set()
+    for psn, svc in sorted(ds.services.items()):
+        if psn == main_psn or not svc.enabled or svc.pi is None:
+            continue
+        # A PSN the source sent is an other network unless the operator has
+        # said otherwise for that PSN.
+        row = local.get(psn, {})
+        if str(row.get("role", ROLE_EON)).lower() != ROLE_EON:
+            continue
+        if not row.get("enabled", True):
+            continue
+        services.append(_eon_service(svc))
+        taken.add(psn)
+
+    for psn, row in sorted(local.items()):
+        if psn in taken or psn == main_psn:
+            continue
+        if str(row.get("role", "")).lower() != ROLE_EON:
+            continue
+        if not row.get("enabled", True):
+            continue
+        entry = _service_from_row(row)
+        if entry["pi_on"]:
+            services.append(entry)
+    return services
+
+
 def _eon_service(svc: ProgrammeService) -> dict:
     """One other-network PSN in the shape the EON code already expects."""
     entry = {
@@ -99,6 +285,7 @@ def _eon_service(svc: ProgrammeService) -> dict:
         "af_list": ", ".join(af_codes_to_mhz(svc.af)),
         "mapped_freqs": [],
         "uecp_psn": svc.psn,
+        "uecp_origin": "from the source",
     }
     if svc.pin:
         entry.update({
@@ -129,7 +316,7 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
     # received. This has to happen even with an empty store: a profile whose
     # source has never connected must not fall back on the built-in ECC, CT,
     # Long PS and the rest, which is exactly what it used to do.
-    for flag in ("en_lps", "en_ptyn", "en_ih", "en_ih_station_id", "en_ert",
+    for flag in ("en_lps", "en_ptyn", "en_ert",
                  "en_ert_rtplus", "en_dab", "en_rds2", "en_ari", "en_tdc_5a",
                  "en_tdc_5b", "en_fast_tuning", "en_paging", "en_rt_plus",
                  "en_id", "en_ecc", "en_lic", "en_ct", "en_pin", "en_af",
@@ -140,7 +327,8 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
     put("scheduler_auto", False)
 
     ds = store.live
-    main = ds.main if ds is not None else None
+    main, main_psn, main_row = (main_service(ds, state) if ds is not None
+                                else (None, None, None))
     if ds is None or main is None:
         # Nothing received at all: PS only, and whatever PS the profile holds.
         manual = str(sequence_overrides(state).get(str(store.current), "") or "").strip()
@@ -151,6 +339,8 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
         # CT is the encoder's, not a data set's, so an operator who has asked
         # for it still gets it even before any source has connected.
         put("en_ct", 1 if clock_time_wanted(store, state) else 0)
+        if in_house_wanted(state):
+            put("group_sequence", manual or "0A 6A 0A")
         return changed
 
     if main.pi is not None:
@@ -211,21 +401,51 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
             for m in main.rt if m.raw
         ]))
     else:
+        # No RadioText from the source means none goes out. Leaving the
+        # profile's own text in place would put the internal coder's default
+        # on air the moment a 2A slot came round.
         put("uecp_rt_raw", "[]")
+        put("rt_text", "")
+        put("rt_messages", "[]")
+
+    # Fields the operator has set for whichever service is the station. These
+    # apply whether or not the source also sends that PSN - the source has no
+    # way to send some of them, and where it does its own value is used.
+    station_row = local_services(state, ds.dsn).get(main_psn) or {}
 
     freqs = af_codes_to_mhz(main.af)
+    typed_af = str(station_row.get("af_list", "") or "").strip()
     if freqs:
         put("af_list", ", ".join(freqs))
+        put("en_af", 1)
+    elif typed_af:
+        put("af_list", typed_af)
         put("en_af", 1)
     else:
         put("en_af", 0)
 
-    # Other PSNs become EON services. Only replace the list when there is one, so
-    # an EON setup does not vanish the moment a source stops sending 0x28.
-    others = [s for s in ds.others if s.enabled and s.pi is not None]
-    if others:
-        put("eon_services", json.dumps([_eon_service(s) for s in others]))
-        put("en_eon", 1)
+    if main.ptyn is None:
+        typed_ptyn = str(station_row.get("ptyn", "") or "").strip()
+        if typed_ptyn:
+            put("ptyn", typed_ptyn)
+            put("en_ptyn", 1)
+
+    # Linkage: what the source sent by MEC 0x2E if it sent any, otherwise what
+    # was set here. It rides in group 1A as the Linkage Actuator bit and in
+    # group 14A variant 12 as the whole word.
+    if main.linkage is not None:
+        put("linkage_word", main.linkage & 0xFFFF)
+    else:
+        link = station_row.get("linkage")
+        put("linkage_word", _linkage_word(link) if isinstance(link, dict) else 0)
+
+    # Other networks: whatever the source describes as further PSNs, plus any
+    # the operator has entered for this data set. The list is written every time
+    # rather than only when non-empty, so removing the last one really removes
+    # it instead of leaving the previous set on air.
+    services = eon_services(store, ds, state)
+    put("eon_services", json.dumps(services))
+    put("en_eon", 1 if services else 0)
 
     # --- Free-format, TMC and ODA groups -----------------------------------
     # Raw groups are NOT copied into state. The generator takes them straight
@@ -276,7 +496,7 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
         if manual:
             seq, origin = manual, "set here"
         else:
-            seq, origin = derive_sequence(store, ds), "automatic"
+            seq, origin = derive_sequence(store, ds, state), "automatic"
     put("uecp_group_sequence_by_dsn", json.dumps(overrides, sort_keys=True))
     put("uecp_group_sequence", overrides.get(key, ""))
     put("group_sequence", seq)
@@ -313,7 +533,7 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
     return changed
 
 
-def derive_sequence(store, ds) -> str:
+def derive_sequence(store, ds, state=None) -> str:
     """A group sequence matching what the source has actually sent.
 
     Used when the source sends no MEC 0x16 and no manual override is set. Only
@@ -322,6 +542,8 @@ def derive_sequence(store, ds) -> str:
     """
     main = ds.main
     seq = ["0A"]                       # PS always; everything else must be earned
+    if state is not None and in_house_wanted(state):
+        seq += ["6A", "0A"]            # unlike 4A, in-house is sent from its slot
     if main is not None and main.rt:
         seq += ["2A", "0A"]
     if ds.slc or (main is not None and main.pin is not None):
@@ -330,7 +552,7 @@ def derive_sequence(store, ds) -> str:
         seq += ["10A", "0A"]
     if main is not None and main.long_ps:
         seq += ["15A", "0A"]
-    if [x for x in ds.others if x.enabled and x.pi is not None]:
+    if state is not None and eon_services(store, ds, state):
         seq += ["14A", "0A"]
     # No 4A here. Clock Time is sent by the generator on the minute boundary,
     # pre-empting the schedule, because a 4A carrying a time that is not aligned

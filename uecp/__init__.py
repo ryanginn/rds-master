@@ -40,7 +40,9 @@ from .element import (DSN_ALL, DSN_ALL_OTHER, DSN_CURRENT, PSN_MAIN, Element,
 from .store import Clock, DataSet, ProgrammeService, RtMessage, Store
 from .handler import apply_element, apply_frame
 from .bridge import (CT_MODES, af_codes_to_mhz, apply_to_state,
-                     clock_time_wanted, sequence_overrides)
+                     ROLES, clock_time_wanted, eon_services, in_house_wanted,
+                     local_main_psn, local_services, main_service,
+                     sequence_overrides)
 from .transport import TcpListener, WebSocketClient
 
 __all__ = [
@@ -52,5 +54,7 @@ __all__ = [
     "Clock", "DataSet", "ProgrammeService", "RtMessage", "Store",
     "apply_element", "apply_frame", "af_codes_to_mhz", "apply_to_state",
     "sequence_overrides", "CT_MODES", "clock_time_wanted",
+    "in_house_wanted", "eon_services", "local_services",
+    "local_main_psn", "main_service", "ROLES",
     "TcpListener", "WebSocketClient",
 ]
