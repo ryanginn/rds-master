@@ -110,6 +110,17 @@ class TcpListener:
                     return
                 backoff = min(backoff * 2, 30.0)
                 continue
+            if self._stop.is_set():
+                # Asked to stop while this bind was in flight. Without this the
+                # socket would go on to serve for ever with nothing left to shut
+                # it down, holding the port against the listener that replaces
+                # it - which looks like a working port that receives nothing.
+                try:
+                    self._server.server_close()
+                except Exception:
+                    pass
+                self._server = None
+                return
             self.last_error = ""
             backoff = 1.0
             self.store.note(f"TCP listener on {self.host}:{self.port}")
@@ -135,6 +146,20 @@ class TcpListener:
                 srv.shutdown()
             except Exception:
                 pass
+        # Wait for the serving thread to close the socket before returning.
+        # shutdown() only ends the accept loop; the close happens in that
+        # thread. Without this, whatever restarts the listener binds the port
+        # while the old socket still holds it - and because allow_reuse_address
+        # is set, that bind succeeds on Windows while incoming connections keep
+        # going to the stale listener, whose store has already been thrown
+        # away. The port looks open, the client connects, and nothing arrives.
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                self.last_error = "the listener thread did not stop"
+                self.store.note(f"{self.name}: listener thread did not stop")
+        self._thread = None
         self.store.note("TCP listener stopped")
 
 
