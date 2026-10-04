@@ -296,7 +296,7 @@ python app.py
 
 - Datasets Mode (Group 5A) for transparent data channel. ✅
 
-- No packaged EXE release yet; restart-on-crash not managed.
+- No packaged EXE release yet; restart-on-crash not managed. ✅
 
 - Support for RBDS variant. ✅
 
