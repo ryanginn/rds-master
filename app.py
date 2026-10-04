@@ -35,6 +35,8 @@ import threading
 import time
 import re
 import sys
+import socket
+import subprocess
 import os
 import signal
 import random
@@ -44,7 +46,8 @@ import urllib.request
 import json
 import tempfile
 from datetime import datetime, timezone, date
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, send_from_directory
+from flask import (Flask, render_template_string, request, redirect, url_for,
+                   session, jsonify, send_from_directory, Response)
 from werkzeug.utils import secure_filename
 from flask_socketio import SocketIO
 from scipy import signal as dsp_signal
@@ -68,7 +71,7 @@ except ImportError:
     print("[Updater] updater.py not found - update functionality disabled")
 
 # --- VERSION ---
-VERSION = "v1.5"
+VERSION = "v1.6"
 
 # --- SETTINGS ---
 # Host API filtering: auto-detect based on OS, can be overridden via RDS_HOSTAPI env var
@@ -250,12 +253,76 @@ def get_rtplus_type_info(type_code):
 
 app = Flask(__name__)
 CONFIG_FILE = 'config.ini'  # Legacy - deprecated
+
+
+def running_installed():
+    """True when this is a built application rather than a checkout."""
+    return getattr(sys, "frozen", False)
+
+
+def data_directory():
+    """Where the configuration, uploads and backups live.
+
+    Running from a checkout, that is the directory the source is in, which is
+    what everyone working on it expects. An installed build is a different
+    matter: its program directory is Program Files or /opt, which a service
+    account cannot write to and an upgrade would overwrite, so the data goes to
+    the usual per-machine place instead.
+
+    RDS_DATA_DIR overrides both, which is how the service units point a system
+    install at /var/lib and a user install at the home directory.
+    """
+    override = os.environ.get("RDS_DATA_DIR")
+    if override:
+        return override
+    if not running_installed():
+        return os.path.dirname(os.path.abspath(__file__))
+    if sys.platform == "win32":
+        base = os.environ.get("PROGRAMDATA") or os.path.expanduser("~")
+        return os.path.join(base, "RDS Master")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/RDS Master")
+    return os.path.expanduser("~/.config/rds-master")
+
+
+DATA_DIR = data_directory()
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except OSError as _exc:
+    print(f"[STARTUP] cannot use {DATA_DIR} ({_exc}); "
+          f"falling back to the program directory", flush=True)
+    DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Configuration file. RDS_DATASETS_FILE points it elsewhere - used by the test
 # suite so it never touches a live on-air configuration, and handy for running a
 # second instance from the same directory.
 DATASETS_FILE = os.environ.get("RDS_DATASETS_FILE") or os.path.join(
-    os.path.dirname(__file__), 'datasets.json')
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
+    DATA_DIR, 'datasets.json')
+
+# Who changed what, when, and from where. Beside the configuration rather than
+# beside the program, for the same reason: the program directory is read-only
+# on an installed build.
+try:
+    import audit
+    audit.configure(DATA_DIR)
+except Exception as _exc:          # pragma: no cover - never stop the air
+    audit = None
+    print(f"[Audit] disabled: {_exc}", flush=True)
+
+
+def audit_log(kind, action, detail="", **extra):
+    """Record an event, if the trail is available. Never raises."""
+    if audit is None:
+        return
+    try:
+        who = auth_config.get("user", "") if session.get("auth") else ""
+    except Exception:
+        who = ""
+    try:
+        audit.record(kind, action, detail, user=who, request=request, **extra)
+    except Exception:
+        pass
+UPLOAD_FOLDER = os.path.join(DATA_DIR, 'uploads')
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
 
 # Create upload folder if it doesn't exist
@@ -891,6 +958,7 @@ def migrate_config_ini():
 def load_config():
     """Load configuration from datasets.json."""
     global state, auth_config, current_dataset, auto_start, site_name, http_port
+    global http_host
     
     # First, check if we need to migrate from config.ini
     migrate_config_ini()
@@ -939,6 +1007,7 @@ def load_config():
 
                 # Load http_port global setting
                 http_port = data.get('http_port', 5000)
+                http_host = str(data.get('http_host', '0.0.0.0') or '0.0.0.0')
         else:
             print("datasets.json not found, using default state.")
     except Exception as e:
@@ -1186,6 +1255,7 @@ def save_config():
 
         # Save http_port
         data['http_port'] = http_port
+        data['http_host'] = http_host
 
         # Validate JSON serializability before writing
         try:
@@ -1236,6 +1306,11 @@ current_dataset = 1
 auto_start = True  # Global setting, not per-dataset
 site_name = "Where am I"  # Global setting for UI branding
 http_port = 5000  # Global setting for HTTP port, not per-dataset
+# Which interface the web UI listens on. 0.0.0.0 is every one of them, which is
+# the old behaviour; 127.0.0.1 keeps it to this machine.
+http_host = "0.0.0.0"
+# When this process started, for /healthz.
+_started_at = time.time()
 
 # False when datasets.json exists but could not be *opened* (locked, permissions).
 # While False every writer skips the file, so a transient I/O problem can never
@@ -1338,7 +1413,7 @@ def datasets_file_ready():
 
 def save_datasets():
     """Save datasets along with auth and system settings."""
-    global auto_start, http_port
+    global auto_start, http_port, http_host
     if not datasets_file_ready():
         print("⚠ Skipping dataset save — datasets.json is still unreadable.")
         return
@@ -1384,6 +1459,7 @@ def save_datasets():
         data['current'] = current_dataset
         data['auto_start'] = auto_start  # Save global auto_start setting at root level
         data['http_port'] = http_port  # Save global http_port setting at root level
+        data['http_host'] = http_host
 
         # Always save current auth credentials
         data['auth'] = {'user': auth_config.get('user', 'admin'), 'pass': auth_config.get('pass', 'admin')}
@@ -2803,8 +2879,11 @@ class RDSScheduler:
         else:
             resolved = content
 
-        # Apply prefix/suffix for file/URL sources
-        if source_type in ("file", "url") and resolved:
+        # Prefix and suffix apply to every kind of message. They used to be
+        # added only to file and URL content, so a manual message quietly
+        # ignored them - and the RT+ tag positions are worked out assuming the
+        # prefix is present, so the tags landed in the wrong place too.
+        if resolved and (prefix or suffix):
             resolved = prefix + resolved + suffix
 
         # Apply optional text trim
@@ -4521,8 +4600,34 @@ class RDSScheduler:
 
             # If A/B buffer changed, restart RT from the beginning
             if buf != self.last_rt_buf:
+                # In AUTO that flip means the text itself changed, so what was
+                # on air counts as a showing of this message. Without this the
+                # restart throws away the part-finished pass the rotation is
+                # counting, and a feed that updates often never hands over.
+                if current_msg and current_msg.get("buffer") == "AUTO":
+                    self.rt_msg_cycle_count += 1
                 self.rt_ptr = 0
                 self.last_rt_buf = buf
+
+            # The rotation for AUTO is checked on every group rather than only
+            # when a pass finishes, for the same reason: a message that keeps
+            # restarting would otherwise never reach the end of one.
+            if current_msg and current_msg.get("buffer") == "AUTO" \
+                    and len(self.get_rt_messages()) > 1:
+                try:
+                    auto_limit = max(1, int(current_msg.get("cycles", 2)))
+                except (TypeError, ValueError):
+                    auto_limit = 2
+                if self.rt_msg_cycle_count >= auto_limit:
+                    self.advance_to_next_rt_message(toggle_buffer=True)
+                    current_msg, buf, raw = self.get_current_rt_message()
+                    if not raw:
+                        raw = " " * limit
+                    if current_msg and current_msg.get("rt_plus_enabled", False):
+                        raw = self.apply_rt_rtplus_formatting(current_msg, raw)
+                    raw = raw[:limit]
+                    self.rt_ptr = 0
+                    self.last_rt_buf = buf
 
             sig = f"{raw}_{state['rt_centered']}_{state['rt_cr']}_{state.get('rt_disable_0d', False)}"
 
@@ -6292,6 +6397,199 @@ def list_devices():
                     'default_api': REQUIRE_HOSTAPI or ''})
 
 
+@app.route('/audit')
+def audit_feed():
+    """The audit trail, filtered. Used by the panel in Settings."""
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    if audit is None:
+        return jsonify({'available': False,
+                        'error': 'The audit trail could not be opened.'}), 200
+    try:
+        limit = max(1, min(2000, int(request.args.get('limit', 300))))
+    except (TypeError, ValueError):
+        limit = 300
+    events = audit.read(limit=limit,
+                        kind=request.args.get('kind', ''),
+                        search=request.args.get('q', ''),
+                        since=request.args.get('since', ''),
+                        until=request.args.get('until', ''))
+    return jsonify({'available': True, 'events': events,
+                    'kinds': audit.KINDS, 'summary': audit.summary()})
+
+
+@app.route('/audit/pdf')
+def audit_pdf():
+    """The same list as a PDF, for handing to somebody who asked for it."""
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    if audit is None:
+        return jsonify({'error': 'The audit trail is not available.'}), 503
+    try:
+        limit = max(1, min(5000, int(request.args.get('limit', 1000))))
+    except (TypeError, ValueError):
+        limit = 1000
+    events = audit.read(limit=limit,
+                        kind=request.args.get('kind', ''),
+                        search=request.args.get('q', ''),
+                        since=request.args.get('since', ''),
+                        until=request.args.get('until', ''))
+    try:
+        body = audit.to_pdf(events, site=site_name)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 503
+    audit_log("system", "audit log exported", f"{len(events)} events as PDF")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    return Response(body, mimetype="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="rds-master-audit-{stamp}.pdf"'})
+
+
+def under_service_manager() -> bool:
+    """Whether something will start this again by itself if it exits.
+
+    systemd sets INVOCATION_ID for everything it runs, and the Windows service
+    wrapper sets RDS_SERVICE. A scheduled task sets neither, which is the case
+    that used to be mistaken for managed.
+    """
+    return bool(os.environ.get("RDS_SERVICE")
+                or os.environ.get("INVOCATION_ID")
+                or os.environ.get("RDS_MANAGED"))
+
+
+def relaunch_command() -> list:
+    """The command that starts another copy of this program."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]                 # the built executable itself
+    return [sys.executable] + list(sys.argv)
+
+
+def start_replacement(command: list) -> bool:
+    """Start another copy of this program. Returns whether one is now starting.
+
+    Launched by Task Scheduler there is no console and the standard handles can
+    be invalid; inheriting them makes CreateProcess fail, which is why a
+    restart used to do nothing at all. Nothing is inherited here, and if the
+    detached launch still will not go, a plain one is tried before giving up -
+    a restart that leaves the station off air is the one outcome to avoid.
+    """
+    environment = dict(os.environ)
+    # The replacement waits for this one to let go of the port before it binds,
+    # otherwise it races us and dies on "address in use".
+    environment["RDS_WAIT_FOR_PORT"] = str(http_port)
+    try:
+        working = os.path.dirname(os.path.abspath(command[0]))
+    except Exception:
+        working = None
+
+    attempts = []
+    if sys.platform == "win32":
+        # Detached and in its own process group, so ending the task or closing
+        # a window does not take the new one down with it.
+        attempts.append({"creationflags": 0x00000008 | 0x00000200})
+        attempts.append({"creationflags": 0x00000200})
+        attempts.append({})
+    else:
+        attempts.append({"start_new_session": True})
+        attempts.append({})
+
+    last = None
+    for options in attempts:
+        try:
+            subprocess.Popen(command, env=environment,
+                             cwd=working if working and os.path.isdir(working) else None,
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             close_fds=True, **options)
+            return True
+        except Exception as exc:
+            last = exc
+            print(f"[Restart] launch attempt failed ({options}): {exc}", flush=True)
+    audit_log("system", "restart failed",
+              f"could not start a replacement: {last}")
+    return False
+
+
+def wait_for_port_free(host: str, port: int, timeout: float = 20.0) -> bool:
+    """Wait until nothing is listening on the port, so a restart can bind it."""
+    target = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            if probe.connect_ex((target, port)) != 0:
+                return True
+        time.sleep(0.4)
+    return False
+
+
+@app.route('/restart', methods=['POST'])
+def restart_app():
+    """Restart the encoder from the UI.
+
+    How it restarts depends on how it was started. Under a service manager -
+    systemd, a Windows service, a scheduled task - exiting is enough, because
+    the manager brings it straight back and that is cleaner than trying to
+    re-exec a frozen build in place. Started by hand, it re-execs itself.
+
+    Either way the answer goes out before anything happens, so the page can put
+    its overlay up and start watching for the heartbeat to return.
+    """
+    if not session.get('auth'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    audit_log("system", "restart requested")
+    save_config()
+
+    def do_restart():
+        time.sleep(1.0)        # let the response reach the browser
+        try:
+            if state.get("running"):
+                state["running"] = False
+                time.sleep(0.6)      # let the audio thread close the device
+        except Exception:
+            pass
+
+        if under_service_manager():
+            # systemd or the Windows service wrapper starts it again; exiting
+            # is the whole job.
+            print("[Restart] exiting for the service manager to restart", flush=True)
+            os._exit(0)
+
+        # Nothing is watching this one - a scheduled task at logon, or someone
+        # running it from a prompt - so it has to start its own replacement.
+        # Exiting on its own took the station off air and left it there.
+        command = relaunch_command()
+        print(f"[Restart] starting a replacement: {command}", flush=True)
+        if not start_replacement(command):
+            print("[Restart] staying up rather than going off air", flush=True)
+            return
+        time.sleep(0.4)
+        os._exit(0)
+
+    threading.Thread(target=do_restart, daemon=True).start()
+    return jsonify({'success': True, 'restarting': True})
+
+
+@app.route('/healthz')
+def healthz():
+    """A small unauthenticated status endpoint.
+
+    The tray icon and any monitoring system use this to tell "running" from
+    "not answering" without a login. It deliberately carries nothing a stranger
+    should not see - no PI, no text, no credentials - only whether the encoder
+    is up and on air.
+    """
+    return jsonify({
+        'app': 'RDS Master',
+        'version': VERSION,
+        'running': bool(state.get("running")),
+        'profile': profile_mode(),
+        'port': http_port,
+        'host': http_host,
+        'uptime_seconds': int(time.time() - _started_at),
+    })
+
+
 @app.route('/login', methods=['GET','POST'])
 def login():
     msg = ""
@@ -6300,13 +6598,21 @@ def login():
         p = request.form.get('pass', '')
         if u == auth_config.get('user') and p == auth_config.get('pass'):
             session['auth'] = True
+            if audit:
+                audit.record("login", "signed in", user=u, request=request)
             return redirect(url_for('index'))
         else:
             msg = "Invalid credentials"
+            # The attempted user name is recorded, never the password offered.
+            if audit:
+                audit.record("login_failed", "wrong user name or password",
+                             detail=f"tried to sign in as {u!r}", user=u,
+                             request=request)
     return render_template_string(LOGIN_HTML, msg=msg, user=auth_config.get('user',''), site_name=site_name, version=VERSION)
 
 @app.route('/logout')
 def logout():
+    audit_log("login", "signed out")
     session.clear()
     return redirect(url_for('login'))
 
@@ -6621,9 +6927,21 @@ def resolve_content():
     return result
 
 @socketio.on('update')
-def handle_update(data): 
+def handle_update(data):
     if not session.get('auth'): return
+    # Snapshot only the keys being written, so the comparison is cheap even
+    # though this runs on every change the browser sends.
+    before = ({k: state.get(k) for k in data} if audit and isinstance(data, dict)
+              else {})
     Sanitize.to_state(data)
+    if audit and before:
+        after = {k: state.get(k) for k in before}
+        lines = audit.changes(before, after)
+        if lines:
+            audit.record("config", "settings changed",
+                         detail="; ".join(lines[:12])
+                                + (f" (+{len(lines) - 12} more)" if len(lines) > 12 else ""),
+                         user=auth_config.get("user", ""), request=request)
 
 @socketio.on('control')
 def handle_control(data):
@@ -6633,10 +6951,14 @@ def handle_control(data):
         state["device_in_idx"] = int(data["dev_in"])
         state["running"] = True
         save_config()
+        audit_log("encoder", "on air",
+                  f"output device {state['device_out_idx']}, "
+                  f"input device {state.get('device_in_idx', -1)}")
         threading.Thread(target=run_audio, daemon=True).start()
     else:
         state["running"] = False
         save_config()
+        audit_log("encoder", "off air")
 
 # Profile API Routes
 # The concept is called a Profile in the UI. /datasets is kept as an alias so any
@@ -8103,6 +8425,7 @@ def import_config():
 
         # Reload config if current dataset was affected
         global current_dataset, state, auth_config, auto_start, site_name, http_port
+        global http_host
 
         # The import wrote straight to disk, so refresh the in-memory dataset list —
         # otherwise the next save_datasets() would write the stale list back over it.
@@ -8412,6 +8735,7 @@ UI_HTML = r"""
                 <div class="tab-btn" data-mode="internal" onclick="setTab('datasets')">Profiles</div>
                 <div class="tab-btn" data-mode="uecp" onclick="setTab('datasets')">Profiles</div>
                 <div class="tab-btn" onclick="setTab('settings')">Settings</div>
+                <div class="tab-btn" onclick="setTab('audit')">Audit Log</div>
                 <div class="tab-btn" data-mode="uecp" onclick="setTab('uecp')">UECP Monitor</div>
             </div>
 
@@ -10567,7 +10891,64 @@ UI_HTML = r"""
                 </div>
             </div>
 
+            <div id="audit" class="content">
+
+                <div class="section">
+                    <div class="section-header">Audit log</div>
+                    <div class="section-body">
+                        <div class="flex items-center gap-2 flex-wrap mb-2">
+                            <select id="audit_kind" onchange="loadAudit()"
+                                    class="bg-black/60 border border-gray-700 rounded px-2 py-1 text-gray-100"
+                                    style="width:13rem; color-scheme: dark;">
+                                <option value="">Everything</option>
+                            </select>
+                            <input type="text" id="audit_q" placeholder="Search"
+                                   class="bg-black/60 border border-gray-700 rounded px-2 py-1"
+                                   style="width:14rem" onkeyup="if(event.key===&quot;Enter&quot;)loadAudit()">
+                            <!-- A date input is drawn by the browser, which gives it a
+                                 white background unless colour-scheme says otherwise -
+                                 light grey on white being exactly the problem. -->
+                            <label class="text-[10px] text-gray-400">From</label>
+                            <input type="date" id="audit_since" onchange="loadAudit()"
+                                   class="bg-black/60 border border-gray-700 rounded px-2 py-1 text-gray-100"
+                                   style="width:9.5rem; color-scheme: dark;">
+                            <label class="text-[10px] text-gray-400">To</label>
+                            <input type="date" id="audit_until" onchange="loadAudit()"
+                                   class="bg-black/60 border border-gray-700 rounded px-2 py-1 text-gray-100"
+                                   style="width:9.5rem; color-scheme: dark;">
+                            <button class="btn" onclick="loadAudit()">Refresh</button>
+                            <button class="btn" onclick="exportAuditPdf()">Export PDF</button>
+                            <span id="audit_count" class="text-[10px] text-gray-500"></span>
+                        </div>
+                        <div class="text-[10px] text-gray-500 mb-2">
+                            Sign ins and failed attempts with the address they came from,
+                            every setting changed with its old and new value, and what the
+                            encoder did. Passwords and the secret key are recorded as having
+                            changed, never with the value.
+                        </div>
+                        <div id="audit_rows" class="live-display sub font-mono text-[11px]"
+                             style="max-height:30rem; overflow:auto;">Loading...</div>
+                    </div>
+                </div>
+            </div>
+
             <div id="settings" class="content">
+
+                <div class="section">
+                    <div class="section-header">Restart</div>
+                    <div class="section-body">
+                        <div class="flex items-center gap-3">
+                            <button class="btn" onclick="restartRdsMaster()">Restart RDS Master</button>
+                            <div class="text-[10px] text-gray-500 flex-1">
+                                Takes the encoder off air for a few seconds while it
+                                reinitialises. Installed as a service or a scheduled task,
+                                the system starts it again; started by hand, it restarts
+                                itself.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="section">
                     <div class="section-header">Startup & Access</div>
                     <div class="section-body">
@@ -11104,6 +11485,25 @@ UI_HTML = r"""
             </div>
 
             <div id="uecp_status" class="text-[11px] text-gray-400 mt-2"></div>
+
+        <!-- Covers the page while the encoder is restarting. The page behind it
+             is blurred rather than hidden, so it is obvious this is the same
+             session coming back rather than a new one. -->
+        <div id="restart_overlay" style="display:none; position:fixed; inset:0;
+             z-index:9999; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px);
+             align-items:center; justify-content:center;">
+            <div style="text-align:center; color:#eee;">
+                <div id="restart_spinner" style="width:54px; height:54px; margin:0 auto 18px;
+                     border:5px solid rgba(255,255,255,0.18);
+                     border-top-color:#ec4899; border-radius:50%;
+                     animation:rdsmspin 0.9s linear infinite;"></div>
+                <div style="font-size:19px; font-weight:600;">Restarting...</div>
+                <div id="restart_note" style="font-size:12.5px; opacity:0.75; margin-top:7px;">
+                    Please wait while RDS Master reinitialises.
+                </div>
+            </div>
+        </div>
+        <style>@keyframes rdsmspin { to { transform: rotate(360deg); } }</style>
                     </div>
                 </div>
             </div>
@@ -14434,6 +14834,9 @@ UI_HTML = r"""
             document.getElementById(id).classList.add('active');
             const tgt = evt ? evt.target : (typeof event !== 'undefined' ? event.target : null);
             if (tgt) tgt.classList.add('active');
+            // The audit log is only read when its tab is actually opened: it is
+            // a file read per request and nobody needs it in the background.
+            if (id === 'audit' && typeof loadAudit === 'function') loadAudit();
         }
 
         function toggleTdcMode(type) {
@@ -18038,6 +18441,151 @@ UI_HTML = r"""
               .catch(function(e) { alert('Could not apply UECP settings: ' + e); });
         }
 
+        // ---- the audit log ------------------------------------------------
+
+        var auditKindsLoaded = false;
+
+        function auditQuery() {
+            var q = [];
+            var kind = document.getElementById('audit_kind');
+            var text = document.getElementById('audit_q');
+            var since = document.getElementById('audit_since');
+            var until = document.getElementById('audit_until');
+            if (kind && kind.value) q.push('kind=' + encodeURIComponent(kind.value));
+            if (text && text.value) q.push('q=' + encodeURIComponent(text.value));
+            // The dates are days; the trail stores an instant, so the end of the
+            // chosen day is included rather than cutting it off at midnight.
+            if (since && since.value) q.push('since=' + encodeURIComponent(since.value));
+            if (until && until.value) q.push('until=' + encodeURIComponent(until.value + 'T23:59:59'));
+            return q.join('&');
+        }
+
+        function loadAudit() {
+            var rows = document.getElementById('audit_rows');
+            if (!rows) return;
+            fetch('/audit?limit=400&' + auditQuery())
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (!data.available) {
+                        rows.innerHTML = '<span class="text-red-400">'
+                            + escapeHtml(data.error || 'The audit trail is not available.')
+                            + '</span>';
+                        return;
+                    }
+                    var kindSelect = document.getElementById('audit_kind');
+                    if (kindSelect && !auditKindsLoaded && data.kinds) {
+                        auditKindsLoaded = true;
+                        Object.keys(data.kinds).forEach(function(k) {
+                            var opt = document.createElement('option');
+                            opt.value = k;
+                            opt.textContent = data.kinds[k];
+                            kindSelect.appendChild(opt);
+                        });
+                    }
+                    var count = document.getElementById('audit_count');
+                    if (count) {
+                        count.textContent = data.events.length + ' shown of '
+                            + (data.summary ? data.summary.total : data.events.length)
+                            + ' kept';
+                    }
+                    if (!data.events.length) {
+                        rows.innerHTML = '<span class="text-gray-500">Nothing recorded '
+                            + 'for this filter.</span>';
+                        return;
+                    }
+                    var colour = {
+                        login: 'text-green-400', login_failed: 'text-red-400',
+                        config: 'text-sky-300', profile: 'text-amber-300',
+                        encoder: 'text-pink-400', uecp: 'text-purple-300',
+                        system: 'text-gray-400'
+                    };
+                    rows.innerHTML = '<table class="w-full">' + data.events.map(function(e) {
+                        var when = (e.at || '').replace('T', ' ').replace('+00:00', '');
+                        return '<tr>'
+                          + '<td class="text-gray-500 pr-2 align-top" style="white-space:nowrap">'
+                          + escapeHtml(when) + '</td>'
+                          + '<td class="pr-2 align-top ' + (colour[e.kind] || 'text-gray-400')
+                          + '" style="white-space:nowrap">'
+                          + escapeHtml((data.kinds && data.kinds[e.kind]) || e.kind) + '</td>'
+                          + '<td class="text-gray-200 pr-2 align-top">' + escapeHtml(e.action || '')
+                          + '</td>'
+                          + '<td class="text-gray-400 pr-2 align-top">' + escapeHtml(e.detail || '')
+                          + '</td>'
+                          + '<td class="text-gray-500 pr-2 align-top" style="white-space:nowrap">'
+                          + escapeHtml(e.user || '') + '</td>'
+                          + '<td class="text-gray-500 align-top" style="white-space:nowrap">'
+                          + escapeHtml(e.ip || '') + '</td>'
+                          + '</tr>';
+                    }).join('') + '</table>';
+                })
+                .catch(function(err) {
+                    rows.innerHTML = '<span class="text-red-400">'
+                        + escapeHtml(String(err)) + '</span>';
+                });
+        }
+
+        function exportAuditPdf() {
+            window.open('/audit/pdf?limit=2000&' + auditQuery(), '_blank');
+        }
+
+        // ---- restarting ------------------------------------------------------
+
+        function restartRdsMaster() {
+            if (!confirm('Restart RDS Master?' + String.fromCharCode(10)
+                         + String.fromCharCode(10)
+                         + 'This takes the encoder off air for a few seconds.')) {
+                return;
+            }
+            var overlay = document.getElementById('restart_overlay');
+            var note = document.getElementById('restart_note');
+            if (overlay) overlay.style.display = 'flex';
+            fetch('/restart', {method: 'POST'})
+                .then(function() { waitForRestart(note, overlay); })
+                .catch(function() {
+                    // The connection dropping is normal here - it means the
+                    // encoder went down before it could answer.
+                    waitForRestart(note, overlay);
+                });
+        }
+
+        function waitForRestart(note, overlay) {
+            var started = Date.now();
+            var wentDown = false;
+            var timer = setInterval(function() {
+                var seconds = Math.round((Date.now() - started) / 1000);
+                fetch('/healthz', {cache: 'no-store'})
+                    .then(function(r) { return r.json(); })
+                    .then(function(h) {
+                        // Only treat it as back once it has actually gone away and
+                        // returned: answering straight away is the old process that
+                        // has not exited yet.
+                        if (!wentDown) {
+                            if (note) note.textContent = 'Stopping the encoder...';
+                            return;
+                        }
+                        clearInterval(timer);
+                        if (note) note.textContent = 'Back. Reloading...';
+                        setTimeout(function() { window.location.reload(); }, 600);
+                    })
+                    .catch(function() {
+                        wentDown = true;
+                        if (note) {
+                            note.textContent = 'Please wait while RDS Master reinitialises'
+                                + (seconds > 3 ? ' (' + seconds + 's)' : '') + '.';
+                        }
+                    });
+                if (seconds > 90) {
+                    clearInterval(timer);
+                    if (note) {
+                        note.innerHTML = 'It has not come back after 90 seconds.<br>'
+                            + 'If it was started by hand it may need starting again.';
+                    }
+                    var spinner = document.getElementById('restart_spinner');
+                    if (spinner) spinner.style.display = 'none';
+                }
+            }, 1000);
+        }
+
         function uecpAge(ts) {
             if (!ts) return 'never';
             var secs = Math.max(0, Math.round(Date.now() / 1000 - ts));
@@ -20632,5 +21180,15 @@ UI_HTML = r"""
 
 if __name__ == '__main__':
     print("[STARTUP] RDS Encoder application starting...", flush=True)
-    print(f"[STARTUP] Starting threads and web server on port {http_port}", flush=True)
-    socketio.run(app, host='0.0.0.0', port=http_port, debug=False, log_output=False, allow_unsafe_werkzeug=True)
+    # Started as somebody's replacement: wait for them to let go of the port.
+    _waiting = os.environ.pop("RDS_WAIT_FOR_PORT", "")
+    if _waiting:
+        print(f"[STARTUP] waiting for port {_waiting} to be released...", flush=True)
+        if wait_for_port_free(http_host, int(_waiting or http_port)):
+            print("[STARTUP] port is free", flush=True)
+        else:
+            print("[STARTUP] port is still busy; starting anyway", flush=True)
+
+    print(f"[STARTUP] Starting threads and web server on {http_host}:{http_port}", flush=True)
+    print(f"[STARTUP] Configuration directory: {DATA_DIR}", flush=True)
+    socketio.run(app, host=http_host, port=http_port, debug=False, log_output=False, allow_unsafe_werkzeug=True)

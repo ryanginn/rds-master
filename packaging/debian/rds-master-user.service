@@ -1,0 +1,24 @@
+[Unit]
+# The encoder in the user's own session, which is where PipeWire and PulseAudio
+# live. Despite being a user service this still starts at boot with nobody
+# logged in, provided lingering is enabled for the account:
+#
+#     loginctl enable-linger $USER
+#     systemctl --user enable --now rds-master
+#
+# That is the difference from macOS, where an agent genuinely does need a login.
+Description=RDS Master encoder (user session)
+After=network-online.target pipewire.service pulseaudio.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rds-master
+Environment=RDS_DATA_DIR=%h/.config/rds-master
+ExecStart=/opt/rds-master/rds-master
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target

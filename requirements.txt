@@ -18,6 +18,10 @@ sounddevice>=0.4.6
 # WebSocket client reports that it is unavailable rather than failing quietly.
 websocket-client>=1.6
 
+# Exporting the audit log as a PDF. Without it the rest of the audit log still
+# works and the export says what to install.
+reportlab>=4.0
+
 # --- Optional -------------------------------------------------------------
 # Serial RDS output to an external encoder. Imported in a try/except: without
 # it the serial options are simply not offered.

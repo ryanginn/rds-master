@@ -1,0 +1,63 @@
+#!/bin/sh
+# Runs after the files are unpacked. It must be safe to run again on an
+# upgrade, so everything here checks before it acts - and it never touches an
+# existing configuration, which is a station's profiles, login and secret key.
+set -e
+
+DATA=/var/lib/rds-master
+USER=rdsmaster
+
+case "$1" in
+  configure)
+    if ! getent passwd "$USER" >/dev/null; then
+        adduser --system --group --no-create-home \
+                --home "$DATA" --gecos "RDS Master encoder" "$USER"
+        # The audio group is what lets a system service open an ALSA device.
+        adduser "$USER" audio >/dev/null 2>&1 || true
+    fi
+
+    mkdir -p "$DATA"
+    if [ -f "$DATA/datasets.json" ]; then
+        cp -a "$DATA/datasets.json" \
+              "$DATA/datasets.json.backup-$(date +%Y%m%d-%H%M%S)"
+        echo "Existing configuration kept; a dated backup is beside it."
+    fi
+    chown -R "$USER:$USER" "$DATA"
+    # The configuration holds the web login and the Flask secret key.
+    chmod 750 "$DATA"
+    [ -f "$DATA/datasets.json" ] && chmod 640 "$DATA/datasets.json" || true
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -qtf /usr/share/icons/hicolor || true
+    fi
+
+    # Registered but not started: which of the two services to use depends on
+    # whether the output device is ALSA or PipeWire, and that is the operator's
+    # call. The README and the tray both explain it.
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+
+        # An upgrade stopped it in prerm. Bring it back only if it was enabled
+        # before, so upgrading never starts something the operator had off.
+        if systemctl is-enabled rds-master >/dev/null 2>&1; then
+            echo "Restarting the rds-master service after the upgrade..."
+            systemctl restart rds-master || true
+        fi
+        echo ""
+        echo "RDS Master is installed. Start it with one of:"
+        echo ""
+        echo "  system-wide, ALSA devices only, no login needed:"
+        echo "      sudo systemctl enable --now rds-master"
+        echo ""
+        echo "  your session, any device including PipeWire, also starts at boot:"
+        echo "      loginctl enable-linger \$USER"
+        echo "      systemctl --user enable --now rds-master"
+        echo ""
+    fi
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RDS Master
+GenericName=RDS encoder
+Comment=Watch and control the RDS encoder, and set which address it listens on
+Exec=/opt/rds-master/rds-master-tray
+Icon=rds-master
+Terminal=false
+Categories=AudioVideo;Audio;Network;
+Keywords=RDS;RBDS;UECP;radio;broadcast;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

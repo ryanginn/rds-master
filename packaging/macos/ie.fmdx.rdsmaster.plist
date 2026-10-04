@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A LaunchAgent, not a LaunchDaemon, and that is deliberate.
+
+  A daemon runs as root before anyone logs in, where there is no CoreAudio
+  session, so it cannot open a soundcard at all. macOS has no equivalent of
+  systemd's lingering, so unattended operation on a Mac means an agent plus
+  automatic login - set that in System Settings, Users and Groups.
+
+  Install:   cp this to ~/Library/LaunchAgents/ and
+             launchctl load ~/Library/LaunchAgents/ie.fmdx.rdsmaster.plist
+
+  NOTE: the macOS packaging has never been run. Treat it as a starting point.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ie.fmdx.rdsmaster</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/RDS Master.app/Contents/MacOS/rds-master</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RDS_DATA_DIR</key>
+        <string>~/Library/Application Support/RDS Master</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/rds-master.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/rds-master.log</string>
+</dict>
+</plist>

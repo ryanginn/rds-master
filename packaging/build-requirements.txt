@@ -1,0 +1,18 @@
+# Only needed to build an installer, not to run the encoder.
+#     pip install -r packaging/build-requirements.txt
+
+# Freezes the encoder and the tray into executables.
+pyinstaller>=6.0
+
+# The tray icon itself.
+pystray>=0.19
+pillow>=10.0
+
+# Turning rdsm-icon.svg into .ico, .icns and the PNG set. Pure Python, no
+# native libraries, which is why it is these rather than cairosvg.
+svglib>=1.5
+rlPyCairo>=0.3
+
+# Windows service mode only. Without it the installer still offers session
+# mode, which works with any soundcard.
+pywin32>=306 ; sys_platform == "win32"

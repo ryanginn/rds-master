@@ -1,0 +1,19 @@
+#!/bin/sh
+# On purge, take the account and the data with it. On a plain remove, leave the
+# configuration alone: someone reinstalling wants their profiles back.
+set -e
+
+case "$1" in
+  purge)
+    rm -rf /var/lib/rds-master
+    if getent passwd rdsmaster >/dev/null; then
+        deluser --system rdsmaster >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

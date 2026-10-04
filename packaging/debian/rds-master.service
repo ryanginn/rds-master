@@ -1,0 +1,38 @@
+[Unit]
+# The encoder as a machine-wide service: starts at boot, needs nobody logged in.
+#
+# A system service cannot reach PulseAudio or PipeWire, which belong to a user
+# session, so the output device has to be an ALSA one - hw:0,0 and the like.
+# Pick it in the Audio tab. If the card only works through PipeWire, use the
+# user service instead (rds-master-user.service), which starts at boot as well
+# once lingering is enabled for the account.
+Description=RDS Master encoder
+Documentation=https://github.com/fmdx-ie/rds-master
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rdsmaster
+Group=audio
+WorkingDirectory=/opt/rds-master
+Environment=RDS_DATA_DIR=/var/lib/rds-master
+ExecStart=/opt/rds-master/rds-master
+Restart=always
+RestartSec=5
+
+# Keep it alive through a soundcard or network wobble rather than giving up:
+# going off air is worse than almost anything else this can do.
+StartLimitIntervalSec=0
+
+# It needs its own data directory and the audio devices, and nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/rds-master
+DeviceAllow=char-alsa rw
+SupplementaryGroups=audio
+
+[Install]
+WantedBy=multi-user.target

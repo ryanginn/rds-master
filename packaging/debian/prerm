@@ -1,0 +1,15 @@
+#!/bin/sh
+# Stop the service before the files go away, so systemd is not left pointing at
+# an executable that no longer exists.
+set -e
+
+case "$1" in
+  remove|upgrade|deconfigure)
+    if [ -d /run/systemd/system ]; then
+        systemctl stop rds-master >/dev/null 2>&1 || true
+        [ "$1" = "remove" ] && systemctl disable rds-master >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0
