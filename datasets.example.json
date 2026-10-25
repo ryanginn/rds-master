@@ -1,0 +1,27 @@
+{
+  "auth": {
+    "user": "admin",
+    "pass": "change-me"
+  },
+  "auto_start": true,
+  "http_port": 5000,
+  "site_name": "My Station",
+  "current": 1,
+  "datasets": {
+    "1": {
+      "name": "Internal coder",
+      "mode": "internal",
+      "state": {}
+    },
+    "2": {
+      "name": "UECP input",
+      "mode": "uecp",
+      "state": {
+        "uecp_tcp_enabled": true,
+        "uecp_port": 4001,
+        "uecp_ws_enabled": false,
+        "uecp_ws_url": ""
+      }
+    }
+  }
+}

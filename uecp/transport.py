@@ -187,6 +187,49 @@ def _ws_payload(data) -> bytes | None:
     return text.encode("latin-1", errors="replace")
 
 
+def ssl_context(insecure: bool = False):
+    """How a wss:// server's certificate is verified.
+
+    Both trust stores are loaded, because neither is enough on its own. The
+    machine's own store may not have the root this server chains to - Windows
+    fetches roots when it first needs them, so a locked-down or freshly
+    installed machine can be missing one that every browser accepts - while
+    certifi's bundle alone would reject a private or corporate CA that the
+    machine does trust.
+
+    `insecure` turns verification off for one connection, for a source with a
+    self-signed certificate. It is a per-connection choice, not a global one.
+    """
+    import ssl
+
+    context = ssl.create_default_context()          # the machine's own store
+    try:
+        import certifi
+
+        context.load_verify_locations(cafile=certifi.where())
+    except Exception as exc:                        # bundle missing or unreadable
+        print(f"[UECP] certifi not used for TLS: {exc}", flush=True)
+    if insecure:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def describe_tls_error(exc: Exception) -> str:
+    """An error a person can act on, rather than just the OpenSSL text."""
+    text = str(exc)
+    if "CERTIFICATE_VERIFY_FAILED" in text or "certificate verify failed" in text:
+        return (f"{text} - the server's certificate could not be verified "
+                "against this machine's trusted roots. If it is self-signed or "
+                "uses a private CA, tick 'no cert check' for this connection.")
+    if "CERTIFICATE_HAS_EXPIRED" in text:
+        return f"{text} - the server's certificate has expired."
+    if "Hostname mismatch" in text or "hostname" in text.lower() and "match" in text.lower():
+        return (f"{text} - the certificate is for a different host than the "
+                "address being connected to.")
+    return text
+
+
 class WebSocketClient:
     """Connects out to a UECP-over-WebSocket source and reconnects if it drops.
 
@@ -195,8 +238,9 @@ class WebSocketClient:
     """
 
     def __init__(self, url: str, store: Store, on_change=None,
-                 allowed=None, name: str = "") -> None:
+                 allowed=None, name: str = "", insecure: bool = False) -> None:
         self.allowed = allowed
+        self.insecure = bool(insecure)
         self.name = name or f"WebSocket {url}"
         self.url = url
         self.store = store
@@ -231,7 +275,14 @@ class WebSocketClient:
             reader = FrameReader()
             try:
                 self.store.note(f"WebSocket connecting to {self.url}")
-                self._ws = websocket.create_connection(self.url, timeout=10)
+                options = {}
+                if self.url.lower().startswith("wss://"):
+                    options["sslopt"] = {"context": ssl_context(self.insecure)}
+                    if self.insecure:
+                        self.store.note("WebSocket: certificate checking is off "
+                                        "for this connection")
+                self._ws = websocket.create_connection(self.url, timeout=10,
+                                                       **options)
                 self._ws.settimeout(1.0)
                 self.connected = True
                 self.last_error = ""
@@ -257,8 +308,8 @@ class WebSocketClient:
                         if self.on_change:
                             self.on_change()
             except Exception as exc:
-                self.last_error = str(exc)
-                self.store.note(f"WebSocket error: {exc}")
+                self.last_error = describe_tls_error(exc)
+                self.store.note(f"WebSocket error: {self.last_error}")
             finally:
                 self.connected = False
                 try:

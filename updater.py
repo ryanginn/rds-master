@@ -34,16 +34,36 @@ class UpdateManager:
     BACKUP_DIR = "backups"
     DATASETS_FILE = "datasets.json"
     REQUIRED_FILES = ["app.py"]  # Files that must be present in update
+    # Never overwritten by an update: this is the operator's, not the author's.
+    KEEP = {"datasets.json", "config.ini", "audit.log"}
 
-    def __init__(self, app_dir=None):
+    def __init__(self, app_dir=None, backup_dir=None):
         """Initialize the update manager
 
         Args:
-            app_dir: Application directory path (defaults to current directory)
+            app_dir: the directory the program's own files live in. It defaults
+                to the current directory, which is only right when the program
+                was started from it - a service or a scheduled task is usually
+                somewhere else, so the caller passes the real one.
+            backup_dir: where to keep backups. Program Files is not writable,
+                so the caller passes the data directory instead.
         """
         self.app_dir = Path(app_dir) if app_dir else Path.cwd()
-        self.backup_dir = self.app_dir / self.BACKUP_DIR
-        self.backup_dir.mkdir(exist_ok=True)
+        self.backup_dir = Path(backup_dir) if backup_dir else self.app_dir / self.BACKUP_DIR
+        try:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"[Updater] cannot create {self.backup_dir}: {exc}")
+
+    def writable(self):
+        """Whether the program's own files can be replaced in place."""
+        probe = self.app_dir / ".update-write-test"
+        try:
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return True
+        except OSError:
+            return False
 
     def create_backup(self):
         """Create a backup of critical files before update
@@ -138,6 +158,23 @@ class UpdateManager:
         except Exception as e:
             return False, f"Validation error: {str(e)}"
 
+    @staticmethod
+    def _inside(target, root):
+        """Whether a path stays within the program's own directory.
+
+        A member like ../../x would otherwise be written anywhere at all.
+        validate_zip refuses those, but extraction does not rely on having
+        been called after it.
+        """
+        try:
+            resolved = Path(target).resolve()
+        except OSError:
+            return False
+        try:
+            return resolved.is_relative_to(root)
+        except AttributeError:              # Python 3.8
+            return str(resolved).startswith(str(root))
+
     def extract_update(self, zip_path):
         """Extract update files to application directory
 
@@ -150,10 +187,26 @@ class UpdateManager:
         try:
             extracted_files = []
 
+            root = self.app_dir.resolve()
             with zipfile.ZipFile(zip_path, 'r') as zf:
+                # Every path is checked before anything is written, so a zip
+                # with one bad member does not leave half an update behind.
+                for member in zf.namelist():
+                    if member.endswith('/') or Path(member).name in self.KEEP:
+                        continue
+                    if not self._inside(self.app_dir / member, root):
+                        return False, ("Refusing to write outside the program "
+                                       f"directory: {member}"), []
+
                 for member in zf.namelist():
                     # Skip directories
                     if member.endswith('/'):
+                        continue
+
+                    # The operator's own files are not part of an update, even
+                    # when the zip happens to contain them.
+                    if Path(member).name in self.KEEP:
+                        print(f"[Updater] left alone: {member}")
                         continue
 
                     # Extract to app directory
@@ -283,23 +336,24 @@ class UpdateManager:
         except Exception as e:
             return False, f"Restore error: {str(e)}"
 
-    def restart_application(self):
-        """Restart the application process
+    def restart_application(self, restart=None):
+        """Restart the application process.
 
-        This will terminate the current process and start a new one
+        `restart` is the application's own restart, which knows whether a
+        service manager will bring it back, how to start a replacement without
+        inheriting broken handles, and how to wait for the port to be released.
+        os.execv knows none of that and cannot restart a frozen build at all,
+        so it is only the fallback for a plain script run by hand.
         """
         print("[Updater] Restarting application...")
-
-        # Get the current Python executable and script
-        python = sys.executable
-        script = sys.argv[0]
-
-        # Close all file handles and prepare for restart
         sys.stdout.flush()
         sys.stderr.flush()
 
-        # Restart using os.execv (replaces current process)
-        os.execv(python, [python] + sys.argv)
+        if restart is not None:
+            restart()
+            return
+
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _calculate_checksum(self, file_path):
         """Calculate SHA256 checksum of a file

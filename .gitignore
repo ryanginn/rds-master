@@ -1,0 +1,44 @@
+# --- Runtime configuration -------------------------------------------------
+# datasets.json holds the web-UI username/password and the Flask secret key.
+# Never commit it. Ship a datasets.example.json instead if you need a template.
+datasets.json
+datasets.json.*
+config.ini
+
+# --- Runtime data ----------------------------------------------------------
+uploads/
+*.log
+
+# --- Local clutter ---------------------------------------------------------
+# Old versions, backups, standards PDFs, third-party samples. Delete this line
+# if you would rather these were tracked.
+Stuff/
+
+# --- Build output ----------------------------------------------------------
+builds/build/
+builds/dist/
+build/
+dist/
+*.spec.bak
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+_test_datasets.json
+tests/_test_datasets.json
+
+# --- Updater ---------------------------------------------------------------
+# The self-updater copies the running app here before replacing it. Those
+# copies are of no use in the repository and a datasets.json among them would
+# carry the login and the Flask secret key.
+backups/

@@ -182,9 +182,13 @@ def build_deb() -> str:
             shutil.copy(os.path.join(HERE, "debian", script),
                         os.path.join(debian, script))
             os.chmod(os.path.join(debian, script), 0o755)
-        subprocess.run(["dpkg-deb", "--build", "--root-owner-group",
+        # xz rather than whatever this dpkg defaults to. Recent Ubuntu
+        # defaults to zstd, which dpkg on older Debian cannot unpack - the
+        # package would simply refuse to install on the machines most likely
+        # to be running it.
+        subprocess.run(["dpkg-deb", "-Zxz", "--build", "--root-owner-group",
                         staging, out], check=True)
-        say("built with dpkg-deb")
+        say("built with dpkg-deb (xz)")
         return out
 
     say("dpkg-deb is not here, assembling the archive directly")

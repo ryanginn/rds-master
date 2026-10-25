@@ -29,6 +29,69 @@ for _stream in (_sys.stdout, _sys.stderr):
     except (AttributeError, ValueError, OSError):
         pass
 
+import json as _json
+import os as _os
+
+
+def running_installed():
+    """True when this is a built application rather than a checkout."""
+    return getattr(_sys, "frozen", False)
+
+
+def data_directory():
+    """Where the configuration, uploads and backups live.
+
+    Running from a checkout, that is the directory the source is in, which is
+    what everyone working on it expects. An installed build is a different
+    matter: its program directory is Program Files or /opt, which a service
+    account cannot write to and an upgrade would overwrite, so the data goes to
+    the usual per-machine place instead.
+
+    RDS_DATA_DIR overrides both, which is how the service units point a system
+    install at /var/lib and a user install at the home directory.
+    """
+    override = _os.environ.get("RDS_DATA_DIR")
+    if override:
+        return override
+    if not running_installed():
+        return _os.path.dirname(_os.path.abspath(__file__))
+    if _sys.platform == "win32":
+        base = _os.environ.get("PROGRAMDATA") or _os.path.expanduser("~")
+        return _os.path.join(base, "RDS Master")
+    if _sys.platform == "darwin":
+        return _os.path.expanduser("~/Library/Application Support/RDS Master")
+    return _os.path.expanduser("~/.config/rds-master")
+
+
+def _asio_requested():
+    """Whether to load the PortAudio build that carries ASIO.
+
+    Read straight from the configuration file, because this has to be decided
+    before sounddevice is imported and therefore long before the configuration
+    is properly loaded. RDS_ASIO overrides it either way, which is the way out
+    if an ASIO driver on the machine turns out to be the thing stopping the
+    encoder from starting.
+    """
+    choice = _os.environ.get("RDS_ASIO", "").strip().lower()
+    if choice in ("0", "off", "no", "false"):
+        return False
+    if choice in ("1", "on", "yes", "true"):
+        return True
+    if _sys.platform != "win32":
+        return False                 # ASIO is a Windows driver model
+    try:
+        path = (_os.environ.get("RDS_DATASETS_FILE")
+                or _os.path.join(data_directory(), "datasets.json"))
+        with open(path, "r", encoding="utf-8") as handle:
+            return bool(_json.load(handle).get("asio_enabled", False))
+    except Exception:
+        return False
+
+
+if _asio_requested():
+    # sounddevice reads this when it picks which PortAudio to load.
+    _os.environ["SD_ENABLE_ASIO"] = "1"
+
 import numpy as np
 import sounddevice as sd
 import threading
@@ -71,7 +134,7 @@ except ImportError:
     print("[Updater] updater.py not found - update functionality disabled")
 
 # --- VERSION ---
-VERSION = "v1.6"
+VERSION = "v1.7"
 
 # --- SETTINGS ---
 # Host API filtering: auto-detect based on OS, can be overridden via RDS_HOSTAPI env var
@@ -255,36 +318,8 @@ app = Flask(__name__)
 CONFIG_FILE = 'config.ini'  # Legacy - deprecated
 
 
-def running_installed():
-    """True when this is a built application rather than a checkout."""
-    return getattr(sys, "frozen", False)
-
-
-def data_directory():
-    """Where the configuration, uploads and backups live.
-
-    Running from a checkout, that is the directory the source is in, which is
-    what everyone working on it expects. An installed build is a different
-    matter: its program directory is Program Files or /opt, which a service
-    account cannot write to and an upgrade would overwrite, so the data goes to
-    the usual per-machine place instead.
-
-    RDS_DATA_DIR overrides both, which is how the service units point a system
-    install at /var/lib and a user install at the home directory.
-    """
-    override = os.environ.get("RDS_DATA_DIR")
-    if override:
-        return override
-    if not running_installed():
-        return os.path.dirname(os.path.abspath(__file__))
-    if sys.platform == "win32":
-        base = os.environ.get("PROGRAMDATA") or os.path.expanduser("~")
-        return os.path.join(base, "RDS Master")
-    if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/RDS Master")
-    return os.path.expanduser("~/.config/rds-master")
-
-
+# running_installed() and data_directory() are defined at the top of the file:
+# the ASIO decision needs them before sounddevice is imported.
 DATA_DIR = data_directory()
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -329,7 +364,34 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Initialize update manager
-update_manager = UpdateManager() if UPDATER_AVAILABLE else None
+# The directory the program's own files are in. Started by a service or a
+# scheduled task the current directory is somewhere else entirely, which is how
+# an update used to write app.py into a directory nothing ever reads.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+update_manager = (UpdateManager(APP_DIR, backup_dir=os.path.join(DATA_DIR, "backups"))
+                  if UPDATER_AVAILABLE else None)
+
+
+def update_blocked():
+    """Why uploading an update cannot work here, or None when it can.
+
+    An installed build is one compiled executable: a new app.py written beside
+    it is never read, so the restart comes back on the old version. That used
+    to happen silently, which is worse than refusing.
+    """
+    if not UPDATER_AVAILABLE or update_manager is None:
+        return ("updater.py is not present, so this build cannot install an "
+                "update from a file.")
+    if getattr(sys, "frozen", False):
+        return ("This is an installed build - the program is one compiled "
+                "executable, so replacing app.py would change nothing. Update "
+                "it by running the installer for the new version; it keeps "
+                "your configuration and profiles.")
+    if not update_manager.writable():
+        return (f"{APP_DIR} cannot be written to by this user, so the files "
+                "cannot be replaced. Run the installer for the new version "
+                "instead, or start the program from a directory you own.")
+    return None
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -388,6 +450,9 @@ default_state = {
     "device_out_idx": 0, "device_in_idx": -1,
     "genlock": False, "passthrough": False,
     "show_all_hostapis": 0,   # Windows: list every host API, not just MME
+    # Which pair of the card's outputs the MPX goes to, as the numbers printed
+    # on the card. Empty means the first two. ASIO only.
+    "asio_out_channels": "",
     "pilot_level": 0.0, "rds_level": 4.5, "genlock_offset": 0.0,
     "output_channel": "both",  # Output routing: "both", "left", "right"
 
@@ -395,6 +460,11 @@ default_state = {
     "pi": "2FFF", "pty": 0, "rbds": False, "tp": 1, "ta": 0, "ms": 1,
     "di_stereo": 1, "di_head": 0, "di_comp": 1, "di_dyn": 0,
     "en_af": 1, "af_list": "87.6, 87.7", "af_method": "A", "af_pairs": "[]",
+    # 9-bit AF (ODA-AF, AID 0x6365). Its own frequency list, because it reaches
+    # below 87,5 MHz where the 0A list cannot follow; method B shares the pairs
+    # above, since the network structure is the same either way.
+    "en_oda_af": 0, "oda_af_list": "", "oda_af_method": "A",
+    "oda_af_group": 9, "oda_af_carrier": "rds1",
     "en_eon": 0, "eon_services": "[]", "eon_ta_burst": 8,
     
     # Text
@@ -831,6 +901,71 @@ class RTPlusParser:
 
         return msg
 
+# --- ASIO ----------------------------------------------------------------
+ASIO_HOSTAPI = "ASIO"
+
+
+def asio_loaded():
+    """Whether the PortAudio that was loaded has the ASIO host API at all."""
+    try:
+        return any(api["name"] == ASIO_HOSTAPI for api in sd.query_hostapis())
+    except Exception:
+        return False
+
+
+def asio_device_count():
+    """How many ASIO drivers PortAudio found. Zero means none are installed."""
+    try:
+        for api in sd.query_hostapis():
+            if api["name"] == ASIO_HOSTAPI:
+                return len(api["devices"])
+    except Exception:
+        pass
+    return 0
+
+
+def is_asio_device(index):
+    try:
+        device = sd.query_devices(int(index))
+        return sd.query_hostapis()[device["hostapi"]]["name"] == ASIO_HOSTAPI
+    except Exception:
+        return False
+
+
+def asio_channel_selectors(channels_text, wanted=2):
+    """The card's own channel numbers for our two, or None for the first two.
+
+    A broadcast card has more than two outputs and the MPX rarely goes to the
+    first pair, so they are given as the numbers printed on the card - 1 is the
+    first - and converted here to the indices PortAudio wants.
+    """
+    numbers = []
+    for part in re.split(r"[,;\s]+", str(channels_text or "").strip()):
+        if not part:
+            continue
+        try:
+            numbers.append(int(part) - 1)
+        except ValueError:
+            return None
+    if len(numbers) != wanted or any(n < 0 for n in numbers):
+        return None
+    return numbers
+
+
+def asio_settings_for(index):
+    """Extra settings for an ASIO device, or None when it is not one."""
+    if not is_asio_device(index):
+        return None
+    selectors = asio_channel_selectors(state.get("asio_out_channels", ""))
+    if selectors is None:
+        return None                  # PortAudio then uses the first two
+    try:
+        return sd.AsioSettings(channel_selectors=selectors)
+    except Exception as exc:
+        print(f"[Audio] ASIO channel selection ignored: {exc}", flush=True)
+        return None
+
+
 # --- DEVICE DISCOVERY ---
 def hostapi_filter_active():
     """True when the device list is being narrowed to one host API.
@@ -853,11 +988,23 @@ def get_valid_devices(show_all=None):
         apis = sd.query_hostapis()
         for i, d in enumerate(devs):
             api_name = apis[d['hostapi']]['name']
-            if not show_all and REQUIRE_HOSTAPI and REQUIRE_HOSTAPI not in api_name: continue
+            # An ASIO card is always listed: it was asked for explicitly, and a
+            # card sitting at 48 kHz in its own control panel would otherwise
+            # just be missing, with nothing to say why.
+            asio = api_name == ASIO_HOSTAPI
+            if not asio and not show_all and REQUIRE_HOSTAPI and REQUIRE_HOSTAPI not in api_name:
+                continue
             try:
                 if d['max_output_channels'] > 0:
-                    sd.check_output_settings(device=i, samplerate=SAMPLE_RATE)
-                    valid_outputs.append({'index': i, 'name': f"{d['name']} ({api_name})"})
+                    try:
+                        sd.check_output_settings(device=i, samplerate=SAMPLE_RATE)
+                        note = ""
+                    except Exception:
+                        if not asio:
+                            raise
+                        note = f" - not at {SAMPLE_RATE // 1000} kHz right now"
+                    valid_outputs.append({'index': i,
+                                          'name': f"{d['name']} ({api_name}){note}"})
                 if d['max_input_channels'] > 0:
                     sd.check_input_settings(device=i, samplerate=SAMPLE_RATE)
                     valid_inputs.append({'index': i, 'name': f"{d['name']} ({api_name})"})
@@ -958,7 +1105,7 @@ def migrate_config_ini():
 def load_config():
     """Load configuration from datasets.json."""
     global state, auth_config, current_dataset, auto_start, site_name, http_port
-    global http_host
+    global http_host, asio_enabled
     
     # First, check if we need to migrate from config.ini
     migrate_config_ini()
@@ -1008,6 +1155,7 @@ def load_config():
                 # Load http_port global setting
                 http_port = data.get('http_port', 5000)
                 http_host = str(data.get('http_host', '0.0.0.0') or '0.0.0.0')
+                asio_enabled = bool(data.get('asio_enabled', False))
         else:
             print("datasets.json not found, using default state.")
     except Exception as e:
@@ -1256,6 +1404,7 @@ def save_config():
         # Save http_port
         data['http_port'] = http_port
         data['http_host'] = http_host
+        data['asio_enabled'] = asio_enabled
 
         # Validate JSON serializability before writing
         try:
@@ -1309,6 +1458,10 @@ http_port = 5000  # Global setting for HTTP port, not per-dataset
 # Which interface the web UI listens on. 0.0.0.0 is every one of them, which is
 # the old behaviour; 127.0.0.1 keeps it to this machine.
 http_host = "0.0.0.0"
+# Whether to load the PortAudio build that carries ASIO. Global rather than
+# per-profile because it is decided when the program starts, long before a
+# profile is chosen - which is also why changing it needs a restart.
+asio_enabled = False
 # When this process started, for /healthz.
 _started_at = time.time()
 
@@ -1413,7 +1566,7 @@ def datasets_file_ready():
 
 def save_datasets():
     """Save datasets along with auth and system settings."""
-    global auto_start, http_port, http_host
+    global auto_start, http_port, http_host, asio_enabled
     if not datasets_file_ready():
         print("⚠ Skipping dataset save — datasets.json is still unreadable.")
         return
@@ -1460,6 +1613,7 @@ def save_datasets():
         data['auto_start'] = auto_start  # Save global auto_start setting at root level
         data['http_port'] = http_port  # Save global http_port setting at root level
         data['http_host'] = http_host
+        data['asio_enabled'] = asio_enabled
 
         # Always save current auth credentials
         data['auth'] = {'user': auth_config.get('user', 'admin'), 'pass': auth_config.get('pass', 'admin')}
@@ -1660,6 +1814,18 @@ def monitor_pusher_loop():
             monitor_data["af_list"] = state["af_list"]
             monitor_data["af_method"] = state.get("af_method", "A")
             monitor_data["af_pairs"] = state.get("af_pairs", "[]")
+            # The 9-bit list goes out on its own carrier and in its own group,
+            # so the dashboard says which, rather than leaving it to be assumed.
+            if state.get("en_oda_af"):
+                where = {"rds1": "RDS1", "rds2": "RDS2", "both": "RDS1 + RDS2"}.get(
+                    str(state.get("oda_af_carrier", "rds1")).lower(), "RDS1")
+                built = len(oda_af_groups())
+                monitor_data["oda_af"] = (
+                    f"9-bit ODA: {built} group(s) in "
+                    f"{oda_af_group_type()[0]}A on {where}"
+                    if built else "9-bit ODA: enabled, but no frequency it can carry")
+            else:
+                monitor_data["oda_af"] = ""
             monitor_data["pty_idx"] = get_effective_value("pty")
             monitor_data["pi"] = get_effective_value("pi")
             monitor_data["tp"] = get_effective_value("tp")
@@ -1760,7 +1926,7 @@ def monitor_pusher_loop():
         else:
              socketio.emit('monitor', {
                  "ps": "OFF AIR", "rt": "Encoder Stopped", "ert": "", "en_ert": False, "ert_rtplus_info": "",
-                 "lps": "", "ptyn": "", "en_ptyn": False, "af_list": "", "af_method": "A", "af_pairs": "[]", "pty_idx": 0, "rt_plus_info": "", "pi": "----",
+                 "lps": "", "ptyn": "", "en_ptyn": False, "af_list": "", "af_method": "A", "af_pairs": "[]", "oda_af": "", "pty_idx": 0, "rt_plus_info": "", "pi": "----",
                  "heartbeat": monitor_data["heartbeat"],
                  "pilot_generated": False,
                  "tp": 0, "ta": 0, "ms": 0,
@@ -2123,6 +2289,224 @@ class RDSHelper:
             for i in range(25, -1, -1):
                 bits.append((b >> i) & 1)
         return bits
+
+# --- 9-BIT AF: ODA-AF, AID 0x6365 (IEC 62106-6:2023 Annex D) -----------------
+# Group 0A carries 8-bit AF codes, which start at 87,5 MHz. Countries extending
+# the FM band downwards need frequencies below that, so this ODA carries 9-bit
+# codes covering 64,1 to 107,9 MHz, and LF/MF with them.
+#
+# The lower half of the 9-bit range (0 to 255) is deliberately the same as the
+# 8-bit definitions, so a Band II frequency has the same code in both lists and
+# the special meanings - filler, the count codes, "LF/MF follows" - carry over
+# unchanged. Anything above 87,5 MHz should still be in group 0A as well, for
+# receivers that do not know this ODA; that list is the one in the AF section.
+
+ODA_AF_AID = 0x6365
+ODA_AF_FILLER = 205              # Table D.3
+ODA_AF_NO_AF = 224               # ...and 224 + n says "n AFs follow"
+ODA_AF_LFMF_FOLLOWS = 250
+
+
+def oda_af_parse(value, region2=False):
+    """One frequency as (9-bit code, is LF/MF), or (None, False).
+
+    MHz for VHF. Anything in kHz - a "k" suffix, or simply a number too large
+    to be MHz - is an LF/MF carrier, which Tables D.4 and D.5 number in the
+    same 0 to 255 range as the special meanings. That is why an LF/MF code is
+    only ever sent after code 250 and never stands on its own.
+    """
+    text = str(value).strip().lower()
+    for suffix in ("mhz", "khz", "hz"):
+        if text.endswith(suffix):
+            text = text[:-len(suffix)].strip()
+    kilohertz = text.endswith("k")
+    text = text.rstrip("k").strip()
+    if not text:
+        return None, False
+    try:
+        number = float(text.replace(",", "."))
+    except (TypeError, ValueError):
+        return None, False
+
+    if kilohertz or number > 150:
+        return oda_af_lfmf_code(number, region2), True
+
+    # Band II keeps the 8-bit numbering: 87,6 MHz is 1, 107,9 MHz is 204.
+    if 87.55 <= number <= 107.95:
+        return max(1, min(204, int(round((number - 87.5) / 0.1)))), False
+    # Band I continues in the upper half: 64,1 MHz is 257, 88,0 MHz is 496.
+    # Only used below 87,6, so a frequency the 0A list also carries keeps the
+    # same code in both places.
+    if 64.05 <= number < 87.55:
+        return max(257, min(496, 256 + int(round((number - 64.0) / 0.1)))), False
+    return None, False
+
+
+def oda_af_code(value, region2=False):
+    """Just the code, for callers that have no use for LF/MF."""
+    return oda_af_parse(value, region2)[0]
+
+
+def oda_af_lfmf_code(kilohertz, region2=False):
+    """An LF/MF code from Table D.4 (9 kHz spacing) or D.5 (ITU region 2)."""
+    if region2:
+        if 530 <= kilohertz <= 1610:
+            return 16 + int(round((kilohertz - 530) / 10.0))
+        return None
+    if 153 <= kilohertz <= 279:
+        return 1 + int(round((kilohertz - 153) / 9.0))
+    if 531 <= kilohertz <= 1602:
+        return 16 + int(round((kilohertz - 531) / 9.0))
+    return None
+
+
+def oda_af_parse_list(raw, region2=False):
+    """A frequency list as codes, with each LF/MF entry preceded by code 250.
+
+    Returns (codes, frequencies). The marker is not a frequency and is not
+    counted: an LF/MF entry takes two codes but is one frequency.
+    """
+    codes, count = [], 0
+    for item in re.split(r"[,;\s]+", str(raw or "").strip()):
+        if not item:
+            continue
+        code, is_lfmf = oda_af_parse(item, region2)
+        if code is None:
+            print(f"[ODA-AF] Not a frequency this ODA can carry: {item}")
+            continue
+        if is_lfmf:
+            codes.append(ODA_AF_LFMF_FOLLOWS)
+        codes.append(code)
+        count += 1
+    return codes, count
+
+
+def oda_af_method_a(raw, region2=False):
+    """Method A: the count code, then every frequency. Up to 25 of them."""
+    codes, count = oda_af_parse_list(raw, region2)
+    if not codes:
+        return []
+    if count > 25:
+        print(f"[ODA-AF] Method A carries at most 25 frequencies and {count} "
+              "are configured; the rest are not sent. Use method B for a "
+              "longer list.")
+        trimmed, kept, index = [], 0, 0
+        while index < len(codes) and kept < 25:
+            if codes[index] == ODA_AF_LFMF_FOLLOWS and index + 1 < len(codes):
+                trimmed.extend(codes[index:index + 2])
+                index += 2
+            else:
+                trimmed.append(codes[index])
+                index += 1
+            kept += 1
+        codes, count = trimmed, kept
+    return [ODA_AF_NO_AF + count] + codes
+
+
+def oda_af_method_b(pairs_json, region2=False):
+    """Method B: one list per tuning frequency, each AF paired with it.
+
+    Ascending order says the AF carries the same programme, descending that it
+    is a regional variant. That ordering is the entire signalling mechanism, so
+    it is what the "regional" flag on a pair does here.
+
+    An LF/MF frequency takes two codes, the first being the 250 marker, so it
+    cannot be paired with a tuning frequency - method B has no room for one.
+    """
+    try:
+        pairs = json.loads(pairs_json) if isinstance(pairs_json, str) else (pairs_json or [])
+    except Exception as exc:
+        print(f"[ODA-AF] Could not read the frequency pairs: {exc}")
+        return []
+
+    codes = []
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        tuning, tuning_lfmf = oda_af_parse(pair.get("main", ""), region2)
+        if tuning is None or tuning_lfmf:
+            continue
+        regional = bool(pair.get("regional", False))
+        alternates = []
+        for item in re.split(r"[,;\s]+", str(pair.get("alts", "") or "")):
+            if not item:
+                continue
+            code, is_lfmf = oda_af_parse(item, region2)
+            if code is None:
+                continue
+            if is_lfmf:
+                print(f"[ODA-AF] {item} is LF/MF, which method B cannot pair "
+                      "with a tuning frequency; skipped.")
+                continue
+            alternates.append(code)
+        if not alternates:
+            continue
+        # The count is of frequencies in this list: the tuning frequency, then
+        # both members of every pair that follows.
+        total = min(25, 1 + len(alternates) * 2)
+        codes.extend([ODA_AF_NO_AF + total, tuning])
+        for alternate in alternates:
+            low, high = min(tuning, alternate), max(tuning, alternate)
+            codes.extend([high, low] if regional else [low, high])
+    return codes
+
+
+def oda_af_group_payloads(codes):
+    """Pack AF codes into application groups: four codes each, Figure D.2.
+
+    The five spare bits of block 2 hold the ninth bit of each of the four
+    codes, so blocks 3 and 4 stay byte-aligned exactly as they are in 0A.
+    """
+    groups = []
+    padded = list(codes)
+    while len(padded) % 4:
+        padded.append(ODA_AF_FILLER)
+    for start in range(0, len(padded), 4):
+        c1, c2, c3, c4 = padded[start:start + 4]
+        tail = ((((c1 >> 8) & 1) << 3) | (((c2 >> 8) & 1) << 2)
+                | (((c3 >> 8) & 1) << 1) | ((c4 >> 8) & 1))
+        groups.append((tail,
+                       ((c1 & 0xFF) << 8) | (c2 & 0xFF),
+                       ((c3 & 0xFF) << 8) | (c4 & 0xFF)))
+    return groups
+
+
+_oda_af_cache = {"key": None, "groups": []}
+
+
+def oda_af_groups():
+    """Every application group to transmit, rebuilt only when something changes."""
+    if not state.get("en_oda_af"):
+        return []
+    method = str(state.get("oda_af_method", "A")).upper()
+    region2 = bool(state.get("rbds"))
+    key = (method, state.get("oda_af_list", ""), state.get("af_pairs", "[]"), region2)
+    if key != _oda_af_cache["key"]:
+        if method == "B":
+            codes = oda_af_method_b(state.get("af_pairs", "[]"), region2)
+        else:
+            codes = oda_af_method_a(state.get("oda_af_list", ""), region2)
+        _oda_af_cache["key"] = key
+        _oda_af_cache["groups"] = oda_af_group_payloads(codes) if codes else []
+    return _oda_af_cache["groups"]
+
+
+def oda_af_group_type():
+    """The group type the application groups go in, as (type, version)."""
+    try:
+        number = int(state.get("oda_af_group", 9))
+    except (TypeError, ValueError):
+        number = 9
+    return max(0, min(15, number)), 0
+
+
+def oda_af_on(carrier):
+    """Whether the ODA is being sent on "rds1" or on "rds2"."""
+    if not state.get("en_oda_af"):
+        return False
+    chosen = str(state.get("oda_af_carrier", "rds1")).lower()
+    return chosen == carrier or chosen == "both"
+
 
 class RDSSerialOutput:
     """Handles serial output of raw RDS blocks in hex format"""
@@ -3997,12 +4381,19 @@ class RDSScheduler:
         if state.get("en_tdc_5b"): optional_groups.append((5,1))  # Group 5B
         if state.get("en_ih"): optional_groups.append((6,0))  # Group 6A - In-House Application
 
+        # 9-bit AF ODA. Annex D asks for the application group at least every
+        # 10 s; one slot per cycle is far more often than that, and the list
+        # usually takes several groups to get through.
+        if oda_af_on("rds1") and oda_af_groups():
+            optional_groups.append(oda_af_group_type())
+
         # Group 3A is ODA announcement - add if any ODA is active
         needs_3a = False
         if state.get("en_dab"): needs_3a = True
         if state.get("en_rt_plus"): needs_3a = True
         if state.get("en_ert"): needs_3a = True  # Enhanced RadioText ODA
         if state.get("en_rds2"): needs_3a = True
+        if oda_af_on("rds1") and oda_af_groups(): needs_3a = True
         # Check if custom ODAs are enabled
         if not needs_3a:
             try:
@@ -4164,6 +4555,9 @@ class RDSScheduler:
                          state.get("en_dab"), state["en_rt_plus"], state.get("en_tdc_5a"),
                          state.get("en_tdc_5b"), state.get("en_ert"), state.get("en_ert_rtplus"),
                          state.get("en_fast_tuning"), state.get("fast_tuning_rate"),
+                         state.get("en_oda_af"), state.get("oda_af_carrier"),
+                         state.get("oda_af_group"), state.get("oda_af_method"),
+                         state.get("oda_af_list"),
                          self._custom_groups_cache_str)
             cached = getattr(self, '_auto_schedule_cache', None)
             if (cached is None or self._auto_schedule_sig != sched_sig or
@@ -4443,7 +4837,16 @@ class RDSScheduler:
                                          freq_groups[main_freq]['regional'] = True
 
                                  for main_freq, group_data in freq_groups.items():
-                                     alt_list = group_data['alts']
+                                     # A frequency outside 87,5-108 MHz has no
+                                     # 8-bit code. It is carried by the 9-bit
+                                     # AF ODA instead, and sending filler in
+                                     # its place here would only mislead.
+                                     alt_list = [f for f in group_data['alts']
+                                                 if self.freq_code(f) != 205]
+                                     if self.freq_code(main_freq) == 205:
+                                         continue
+                                     if not alt_list:
+                                         continue
                                      is_regional = group_data['regional']
                                      total_freqs = 1 + (len(alt_list) * 2)
                                      tuning_indicator = 250 if is_regional else self.freq_code(main_freq)
@@ -4786,6 +5189,14 @@ class RDSScheduler:
                  ert_rtplus_agtc = (ert_rtplus_group_type * 2) + 0
                  active_odas.append({"type": "ert_rtplus", "group_type": ert_rtplus_agtc, "aid": 0x4BD8, "msg": 0x0000})
 
+             # 9-bit AF ODA, announced on whichever carrier is sending it.
+             # When it is on RDS2 only, its announcement is tunnelled in the
+             # RDS2 stream instead and has no business here.
+             if oda_af_on("rds1") and oda_af_groups():
+                 active_odas.append({"type": "oda_af",
+                                     "group_type": (oda_af_group_type()[0] << 1),
+                                     "aid": ODA_AF_AID, "msg": 0x0000})
+
              # NOTE: RDS2 ODA is NOT included here - it's only announced in the RDS2 stream, not in regular RDS
 
              # Add custom ODAs
@@ -4818,6 +5229,16 @@ class RDSScheduler:
                  return self._get_group(3, 0, app_group_code, 
                                                   current_oda["msg"], current_oda["aid"])
         
+        # 9-bit AF application group (AID 0x6365, Figure D.2): four AF codes
+        # per group, their ninth bits in the five spare bits of block 2.
+        elif g_type == oda_af_group_type()[0] and g_ver == 0 and oda_af_on("rds1"):
+            af_groups = oda_af_groups()
+            if af_groups:
+                index = getattr(self, 'oda_af_ptr', 0) % len(af_groups)
+                self.oda_af_ptr = index + 1
+                tail, b3_val, b4_val = af_groups[index]
+                return self._get_group(g_type, 0, tail, b3_val, b4_val)
+
         # Enhanced RadioText (eRT) Application Groups
         elif g_type == state.get("ert_group_type", 13) and state.get("en_ert"):
             return self.generate_ert_group(g_ver)
@@ -5702,6 +6123,11 @@ class RDS2Generator:
         self.rft_state = [0, 0, 0]  # State machine (0-49)
         self.use_crc = True  # Enable CRC
         self.crc_value = [0, 0, 0]  # Calculated CRC
+
+        # 9-bit AF ODA, when it is set to travel on RDS2: which slot of the
+        # stream we are at, and how far through the AF list.
+        self.oda_af_slot = [0, 0, 0]
+        self.oda_af_ptr = [0, 0, 0]
         
     def load_logo(self, logo_path):
         """Load station logo from file for RDS2 file transfer"""
@@ -5770,7 +6196,15 @@ class RDS2Generator:
             return [0] * 104
         
         idx = stream_num - 1
-        
+
+        # The 9-bit AF ODA takes one slot in four when it is set to RDS2. That
+        # is far more often than the once every 10 s Annex D asks for, and it
+        # still leaves three quarters of the stream to the file transfer.
+        if oda_af_on("rds2"):
+            af_bits = self._oda_af_bits(idx)
+            if af_bits is not None:
+                return af_bits
+
         if not self.logo_loaded or not self.logo_data:
             # No logo: send test pattern
             blocks = self._get_test_pattern(idx)
@@ -5795,6 +6229,34 @@ class RDS2Generator:
         # Convert 4 blocks to RDS group bits
         return self._blocks_to_bits(blocks)
     
+    def _oda_af_bits(self, idx):
+        """One tunnelled 9-bit AF group for this stream, or None this slot.
+
+        A tunnelled group is an ordinary RDS group: PI in block 1, the group
+        type and PTY in block 2, the same offset words. A receiver that follows
+        the additional stream decodes it exactly as it would on 57 kHz.
+        """
+        af_groups = oda_af_groups()
+        if not af_groups:
+            return None
+        slot = self.oda_af_slot[idx]
+        self.oda_af_slot[idx] = slot + 1
+        if slot % 4:
+            return None                 # this slot belongs to the file transfer
+
+        turn = slot // 4
+        g_type, g_ver = oda_af_group_type()
+        if turn % 8 == 0:
+            # The announcement, so a receiver joining the stream partway
+            # through still learns which group type is carrying the AFs.
+            blocks = RDSHelper.get_raw_blocks(3, 0, g_type << 1, 0x0000, ODA_AF_AID)
+        else:
+            ptr = self.oda_af_ptr[idx] % len(af_groups)
+            self.oda_af_ptr[idx] = ptr + 1
+            tail, b3_val, b4_val = af_groups[ptr]
+            blocks = RDSHelper.get_raw_blocks(g_type, g_ver, tail, b3_val, b4_val)
+        return RDSHelper.rds2_blocks_to_bits(*blocks)
+
     def _get_variant_0(self, idx):
         """RFT Variant 0: File metadata (exact C reference format)"""
         blocks = [0, 0, 0, 0]
@@ -6340,12 +6802,20 @@ def run_audio():
             sd_in = (_resolve_device(state["device_in_idx"], want_in_name, output=False)
                      if state["device_in_idx"] != -1 else None)
 
+            # An ASIO card usually has more than two outputs, and the MPX
+            # rarely goes to the first pair, so the chosen pair is passed
+            # through. Nothing changes for any other host API.
+            extra = asio_settings_for(sd_out)
             if sd_in is not None:
                 stream = sd.Stream(device=(sd_in, sd_out), samplerate=SAMPLE_RATE,
-                                   blocksize=2048, channels=2, callback=engine.callback_duplex)
+                                   blocksize=2048, channels=2,
+                                   extra_settings=(None, extra) if extra else None,
+                                   callback=engine.callback_duplex)
             else:
                 stream = sd.OutputStream(device=sd_out, samplerate=SAMPLE_RATE,
-                                         blocksize=2048, channels=2, callback=engine.callback_output)
+                                         blocksize=2048, channels=2,
+                                         extra_settings=extra,
+                                         callback=engine.callback_output)
             with stream:
                 print(f"[Audio] stream open on device {sd_out}", flush=True)
                 monitor_data["audio_ok"] = True
@@ -6382,6 +6852,10 @@ def index():
     inputs, outputs = get_valid_devices()
     return render_template_string(UI_HTML, inputs=inputs, outputs=outputs,
                                   hostapi_filtered=hostapi_filter_active(),
+                                  asio_supported=(sys.platform == "win32"),
+                                  asio_enabled=asio_enabled,
+                                  asio_loaded=asio_loaded(),
+                                  asio_devices=asio_device_count(),
                                   profile_mode=profile_mode(),
                                   mec_catalogue=mec_catalogue(),
                                   profile_modes=list(PROFILE_MODES), state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, http_port=http_port, version=VERSION, SERIAL_AVAILABLE=SERIAL_AVAILABLE)
@@ -6627,6 +7101,16 @@ def update_settings():
         auto_start = bool(data['auto_start'])
         changed = True
 
+    if 'asio_enabled' in data:
+        # Which PortAudio gets loaded is settled at startup, so this takes
+        # effect on the next one. The answer says so rather than letting
+        # somebody wonder why no ASIO card has appeared.
+        global asio_enabled
+        asio_enabled = bool(data['asio_enabled'])
+        audit_log("system", "ASIO " + ("enabled" if asio_enabled else "disabled"),
+                  "takes effect on the next restart")
+        changed = True
+
     user = data.get('user')
     if isinstance(user, str) and user.strip():
         auth_config['user'] = user.strip()
@@ -6644,7 +7128,9 @@ def update_settings():
         changed = True
 
     if changed: save_config()
-    return {"ok": True}
+    return {"ok": True, "asio_enabled": asio_enabled,
+            "asio_loaded": asio_loaded(),
+            "restart_needed": asio_enabled != asio_loaded()}
 
 @app.route('/update/upload', methods=['POST'])
 def upload_update():
@@ -6652,8 +7138,9 @@ def upload_update():
     if not session.get('auth'):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    if not UPDATER_AVAILABLE:
-        return jsonify({"ok": False, "error": "Updater module not available"}), 500
+    blocked = update_blocked()
+    if blocked:
+        return jsonify({"ok": False, "error": blocked, "blocked": True}), 400
 
     # Check if file was uploaded
     if 'file' not in request.files:
@@ -6709,18 +7196,29 @@ def restart_application():
         return jsonify({"ok": False, "error": "Updater module not available"}), 500
 
     try:
-        # Stop audio if running
-        if state.get("running"):
-            state["running"] = False
-            time.sleep(0.5)  # Give audio thread time to stop
-
-        # Save current state
+        audit_log("system", "restart requested", "after an update")
         save_datasets()
+        save_config()
 
-        # Trigger restart in a separate thread to allow response to be sent
+        # The same restart the Settings tab uses. It knows whether a service
+        # manager will bring the program back, starts a replacement without
+        # inheriting handles that may be invalid, and waits for the port to be
+        # let go. os.execv did none of that, and cannot restart a frozen build.
         def delayed_restart():
-            time.sleep(1)  # Give time for response to be sent
-            update_manager.restart_application()
+            time.sleep(1)  # let the answer reach the browser first
+            if state.get("running"):
+                state["running"] = False
+                time.sleep(0.6)      # let the audio thread close the device
+            if under_service_manager():
+                print("[Updater] exiting for the service manager to restart",
+                      flush=True)
+                os._exit(0)
+            command = relaunch_command()
+            if not start_replacement(command):
+                print("[Updater] no replacement started - staying up", flush=True)
+                return
+            time.sleep(0.4)
+            os._exit(0)
 
         threading.Thread(target=delayed_restart, daemon=True).start()
 
@@ -6736,7 +7234,8 @@ def update_status():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     if not UPDATER_AVAILABLE:
-        return jsonify({"ok": False, "updater_available": False})
+        return jsonify({"ok": False, "updater_available": False,
+                        "blocked": "updater.py is not present."})
 
     try:
         backups = update_manager.get_available_backups()
@@ -6744,6 +7243,10 @@ def update_status():
         return jsonify({
             "ok": True,
             "updater_available": True,
+            "blocked": update_blocked(),
+            "installed_build": bool(getattr(sys, "frozen", False)),
+            "app_dir": APP_DIR,
+            "version": VERSION,
             "backups": backups
         })
 
@@ -7018,7 +7521,7 @@ def create_dataset():
         new_state['ptyn'] = ''
         # Nothing the source has not sent: no ECC/LIC, no CT, no PIN, no AF, and
         # no 0x0D appended to RadioText.
-        for off in ('en_ct', 'en_id', 'en_pin', 'en_af', 'en_eon', 'en_lps',
+        for off in ('en_ct', 'en_id', 'en_pin', 'en_af', 'en_oda_af', 'en_eon', 'en_lps',
                     'en_ptyn', 'en_ih', 'en_ih_station_id', 'en_ert',
                     'en_ert_rtplus', 'en_dab', 'en_rds2', 'en_ari',
                     'en_tdc_5a', 'en_tdc_5b', 'en_fast_tuning', 'en_rt_plus'):
@@ -7462,6 +7965,7 @@ def uecp_links():
          "enabled": bool(state.get("uecp_ws_enabled", False)),
          "host": "", "port": 0,
          "url": str(state.get("uecp_ws_url", "")),
+         "insecure": bool(state.get("uecp_ws_insecure", False)),
          "mec_allowed": None, "timeout": 0},
     ]
 
@@ -7602,7 +8106,8 @@ def start_uecp():
                 if not url:
                     continue
                 obj = uecp.WebSocketClient(url, store, _uecp_changed,
-                                           allowed=allowed, name=name)
+                                           allowed=allowed, name=name,
+                                           insecure=bool(link.get("insecure")))
             else:
                 port = int(link.get("port") or 0)
                 if not port:            # port 0 deactivates it, as on a coder
@@ -7672,6 +8177,7 @@ def uecp_status():
         'group_sequence': state.get("group_sequence", ""),
         'sequence_origin': state.get("uecp_sequence_origin", "automatic"),
         'sequence_override': state.get("uecp_group_sequence", ""),
+        'sequence_from_source': state.get("uecp_sequence_from_source", ""),
         'sequence_overrides': uecp.sequence_overrides(state),
         'ct_mode': state.get("uecp_ct_mode", "source"),
         'local_services': _local_service_table(),
@@ -7782,6 +8288,9 @@ def _clean_link(row, index):
         if url and not url.lower().startswith(("ws://", "wss://")):
             raise ValueError(f"{url!r} must start with ws:// or wss://")
         out["url"] = url
+        # Only meaningful for wss://, and only when somebody has decided this
+        # particular server's certificate cannot be verified the usual way.
+        out["insecure"] = bool(row.get("insecure", False))
     else:
         try:
             port = int(row.get("port", 0) or 0)
@@ -8086,8 +8595,9 @@ def uecp_sequence():
     """Set or clear one data set's group sequence.
 
     MEC 0x16 addresses a data set, so each DSN has its own sequence and its own
-    override. A sequence the source sends for that data set replaces what is
-    set here; clearing the field goes back to automatic.
+    override. What is set here wins over the sequence the source sends for that
+    data set; clearing the field follows the source again, or goes back to
+    automatic when it sends none.
     """
     if not session.get('auth'):
         return jsonify({'error': 'Not authenticated'}), 401
@@ -8141,6 +8651,13 @@ def uecp_settings():
     # it is filed under whichever data set is live when it is entered.
     import uecp
     seq = str(data.get("uecp_group_sequence", "")).strip()
+    if seq:
+        # Typed by hand, so it is checked here rather than reaching the
+        # scheduler as something it cannot parse.
+        try:
+            seq = " ".join(parse_group_sequence(seq))
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
     overrides = uecp.sequence_overrides(state)
     dsn = str(state.get("uecp_sequence_dsn") or (_uecp_store.current if _uecp_store else 1))
     if seq:
@@ -8425,7 +8942,7 @@ def import_config():
 
         # Reload config if current dataset was affected
         global current_dataset, state, auth_config, auto_start, site_name, http_port
-        global http_host
+        global http_host, asio_enabled
 
         # The import wrote straight to disk, so refresh the in-memory dataset list —
         # otherwise the next save_datasets() would write the stale list back over it.
@@ -8718,7 +9235,7 @@ UI_HTML = r"""
             </svg>
             <div class="flex items-center gap-4">
                 <div class="text-[10px] text-gray-400 flex items-center gap-2">
-                    {{site_name}} • <span id="heartbeat" class="text-xs">♥</span> 192kHz Ready
+                    {{site_name}} • <span id="heartbeat" class="text-xs">♥</span> RDS Master {{version}}
                 </div>
                 <button id="pwrBtn" onclick="togglePower()" class="pwr-btn">OFF AIR</button>
                 <a href="/logout" class="text-[11px] text-gray-300 hover:text-white underline">Logout</a>
@@ -9626,6 +10143,76 @@ UI_HTML = r"""
                                  No frequency pairs configured. Click "+ Add Pair" to create one.
                              </div>
                          </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <div class="section-header flex justify-between items-center">
+                        <span>9-bit AF (ODA, 64.1 - 107.9 MHz)</span>
+                        <label class="flex items-center gap-2 cursor-pointer">
+                            <span class="text-xs">Enable</span>
+                            <input type="checkbox" class="toggle-checkbox" id="en_oda_af" {% if state.en_oda_af %}checked{% endif %} onchange="updateODAAFUI(); sync()">
+                        </label>
+                    </div>
+                    <div class="section-body">
+                        <div class="text-[10px] text-gray-500 mb-3 leading-relaxed">
+                            The AF codes in group 0A are 8 bits and start at 87.5 MHz. This ODA (AID 0x6365,
+                            IEC 62106-6 Annex D) carries 9-bit codes, so frequencies down to 64.1 MHz fit, and
+                            LF/MF with them. Frequencies above 87.5 MHz should stay in the 0A list as well, for
+                            receivers that do not know the ODA &mdash; leave the section above as it is.
+                            With the scheduler on Auto the application group and its 3A announcement are
+                            scheduled for you; on a manual sequence, add both to the sequence string yourself.
+                        </div>
+                        <div id="oda_af_opts" style="display:none">
+                            <div class="grid-cols-2 mb-3">
+                                <div>
+                                    <label class="text-xs text-gray-400 mb-1 block">Carrier</label>
+                                    <select id="oda_af_carrier" class="w-full" onchange="updateODAAFUI(); sync()">
+                                        <option value="rds1" {% if state.oda_af_carrier == "rds1" %}selected{% endif %}>RDS1 - the 57 kHz stream</option>
+                                        <option value="rds2" {% if state.oda_af_carrier == "rds2" %}selected{% endif %}>RDS2 - the data streams</option>
+                                        <option value="both" {% if state.oda_af_carrier == "both" %}selected{% endif %}>Both</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="text-xs text-gray-400 mb-1 block">Application group</label>
+                                    <select id="oda_af_group" class="w-full" onchange="sync()">
+                                        <option value="7" {% if state.oda_af_group|int == 7 %}selected{% endif %}>7A</option>
+                                        <option value="9" {% if state.oda_af_group|int == 9 %}selected{% endif %}>9A</option>
+                                        <option value="11" {% if state.oda_af_group|int == 11 %}selected{% endif %}>11A</option>
+                                        <option value="12" {% if state.oda_af_group|int == 12 %}selected{% endif %}>12A</option>
+                                        <option value="13" {% if state.oda_af_group|int == 13 %}selected{% endif %}>13A</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div id="oda_af_clash_warning" class="mb-3 p-2 bg-[#2a1a0a] border border-amber-900/60 rounded text-[10px] text-amber-300" style="display:none"></div>
+                            <div id="oda_af_rds2_warning" class="mb-3 p-2 bg-[#2a1a0a] border border-amber-900/60 rounded text-[10px] text-amber-300" style="display:none">
+                                RDS2 is switched off, so nothing is being transmitted on the data streams.
+                                Turn it on in the Audio tab, or set the carrier to RDS1.
+                            </div>
+                            <div class="mb-3">
+                                <label class="text-xs text-gray-400 mb-1 block">AF Method</label>
+                                <select id="oda_af_method" class="w-full" onchange="updateODAAFUI(); sync()">
+                                    <option value="A" {% if state.oda_af_method != "B" %}selected{% endif %}>Method A - Simple list</option>
+                                    <option value="B" {% if state.oda_af_method == "B" %}selected{% endif %}>Method B - Frequency pairs</option>
+                                </select>
+                            </div>
+                            <div id="oda_af_method_a_ui">
+                                <label class="text-xs text-gray-400 mb-1 block">Frequency List</label>
+                                <textarea id="oda_af_list" rows="2" placeholder="64.1, 87.6, 98.1, 1602k" onchange="sync()">{{state.oda_af_list}}</textarea>
+                                <div class="text-[10px] text-gray-500 mt-1">
+                                    MHz, comma separated, 64.1 to 107.9. Up to 25 frequencies. An LF or MF carrier
+                                    goes in as kHz with a k &mdash; 153k, 1602k &mdash; and is sent behind the
+                                    "LF/MF follows" code, as the standard requires.
+                                </div>
+                            </div>
+                            <div id="oda_af_method_b_ui" style="display:none" class="p-3 bg-[#0a1a0a] border border-green-900/50 rounded text-xs text-gray-400">
+                                Method B uses the <span class="text-white">frequency pairs above</span>, encoded as
+                                9-bit codes &mdash; the network structure is the same, only the coding differs. A
+                                frequency below 87.5 MHz can go in those pairs now: group 0A leaves it out, this ODA
+                                carries it. A pair marked regional is transmitted in descending order, which is how
+                                the standard signals a regional variant.
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -10596,6 +11183,52 @@ UI_HTML = r"""
                         </div>
                         {% endif %}
 
+                        {% if asio_supported %}
+                        <div class="mt-3 bg-[#1a1a1a] border border-[#333] rounded p-3">
+                            <label class="flex items-center justify-between cursor-pointer">
+                                <div>
+                                    <span class="text-xs text-gray-300">ASIO output</span>
+                                    <div class="text-[10px] text-gray-500 mt-1">
+                                        Uses the soundcard's own ASIO driver: exclusive access, no
+                                        resampling, and it works from a Windows service. Which audio
+                                        library is loaded is decided when the encoder starts, so this
+                                        takes effect after a restart.
+                                    </div>
+                                </div>
+                                <input type="checkbox" class="toggle-checkbox" id="asio_enabled"
+                                       {% if asio_enabled %}checked{% endif %}
+                                       onchange="saveAsio()">
+                            </label>
+                            <div class="text-[10px] mt-2">
+                                {% if asio_loaded %}
+                                    <span class="text-green-400">ASIO is loaded</span>
+                                    <span class="text-gray-500">
+                                        &middot; {{ asio_devices }} driver{% if asio_devices != 1 %}s{% endif %} found.
+                                        {% if asio_devices == 0 %}
+                                        No ASIO driver is installed on this machine - install the one that came
+                                        with the soundcard.
+                                        {% endif %}
+                                    </span>
+                                {% elif asio_enabled %}
+                                    <span class="text-amber-300">Restart the encoder to load ASIO.</span>
+                                {% else %}
+                                    <span class="text-gray-500">Not loaded.</span>
+                                {% endif %}
+                            </div>
+                            <div class="mt-2 flex items-center gap-3">
+                                <label class="text-[10px] text-gray-500 whitespace-nowrap">Output channels</label>
+                                <input type="text" id="asio_out_channels" style="width:7rem"
+                                       placeholder="1, 2" value="{{ state.asio_out_channels or '' }}"
+                                       onchange="sync()">
+                                <div class="text-[10px] text-gray-500">
+                                    The pair the MPX goes to, numbered as they are on the card. Blank uses
+                                    the first two. Ignored for every other kind of device.
+                                </div>
+                            </div>
+                            <div id="asio_status" class="text-[10px] text-gray-500 mt-2"></div>
+                        </div>
+                        {% endif %}
+
                         <div class="mt-2">
                             <label>Output Channel</label>
                             <select id="output_channel" onchange="sync()">
@@ -11211,6 +11844,12 @@ UI_HTML = r"""
                 <div class="section">
                     <div class="section-header">System Updater</div>
                     <div class="section-body">
+                        <div id="update_blocked" style="display:none"
+                             class="bg-[#2a1a0a] border border-amber-900/60 rounded p-3 mb-3">
+                            <div class="text-xs text-amber-300 font-semibold mb-1">This build updates differently</div>
+                            <div id="update_blocked_text" class="text-[11px] text-gray-300 leading-relaxed"></div>
+                        </div>
+                        <div id="update_form">
                         <div class="mb-3">
                             <div class="bg-yellow-900/20 border border-yellow-700/50 rounded p-3 mb-3">
                                 <div class="text-xs text-yellow-400 font-semibold mb-1">⚠️ Important</div>
@@ -11237,6 +11876,7 @@ UI_HTML = r"""
                         </div>
 
                         <div id="update_status" class="text-xs mt-3"></div>
+                        <div id="update_app_dir" class="text-[10px] text-gray-500 mt-2 font-mono"></div>
 
                         <div id="update_progress" style="display: none;" class="mt-3">
                             <div class="bg-black/30 border border-gray-700 rounded p-3">
@@ -11246,6 +11886,8 @@ UI_HTML = r"""
                                 </div>
                             </div>
                         </div>
+
+                        </div><!-- /update_form -->
 
                         <div id="backup_list" class="mt-4" style="display: none;">
                             <div class="text-xs font-semibold text-gray-400 mb-2">Available Backups</div>
@@ -11272,33 +11914,47 @@ UI_HTML = r"""
                                     <span class="text-xs text-gray-300 font-bold">Connections</span>
                                     <button class="btn" onclick="addUecpLink('tcp')">Add TCP</button>
                                     <button class="btn" onclick="addUecpLink('ws')">Add WebSocket</button>
-                                    <button class="btn" onclick="saveUecpLinks()">Save</button>
-                                    <span id="uecp_links_msg" class="text-[10px] text-gray-500"></span>
                                 </div>
                                 <div class="text-[10px] text-gray-500 mb-2">
                                     Several at once, as a hardware coder does. A TCP port of 0
                                     deactivates that connection. Each one can be given its own
-                                    access rights below.
+                                    access rights below. Nothing here takes effect until it is
+                                    saved.
                                 </div>
                                 <div id="uecp_links"></div>
+                                <div class="flex items-center justify-end gap-3 mt-3">
+                                    <span id="uecp_links_msg" class="text-[10px] text-gray-500"></span>
+                                    <button onclick="saveUecpLinks()"
+                                            class="px-4 py-2 bg-pink-600 hover:bg-pink-500 rounded text-sm text-white font-bold">
+                                        Save &amp; Reconnect</button>
+                                </div>
                             </div>
                             <div class="bg-[#1a1a1a] border border-[#333] rounded p-3 col-span-2">
                                 <label class="text-[10px] text-gray-500">Group sequence for the data set on air</label>
                                 <div class="flex items-center gap-3">
                                     <input type="text" id="uecp_group_sequence" class="flex-1"
-                                           placeholder="Automatic - derived from what the source sends"
+                                           placeholder="Blank - follow the source, or automatic"
+                                           onchange="saveUecpSequence()"
                                            value="{{ state.uecp_group_sequence or '' }}">
+                                    <button class="btn" onclick="saveUecpSequence()">Set</button>
                                     <div class="text-[10px] text-gray-500" style="width:17rem">
-                                        Leave blank for automatic. Each data set has its own
-                                        sequence - pick one in the monitor tree to set the
-                                        others. If the source sends its own (MEC 0x16) it is
-                                        written here, replacing what was set.
+                                        What is typed here wins over the source. Leave it blank to
+                                        follow the source's own sequence (MEC 0x16), or to derive
+                                        one from what it sends. Each data set has its own - pick
+                                        one in the monitor tree to set the others.
                                     </div>
                                 </div>
                                 <div class="text-[11px] mt-2">
                                     <span class="text-gray-400">In use:</span>
                                     <span id="uecp_seq_live" class="text-gray-200 font-mono">-</span>
                                     <span id="uecp_seq_origin" class="text-gray-500"></span>
+                                    <span id="uecp_seq_msg" class="text-[10px] ml-2"></span>
+                                </div>
+                                <div id="uecp_seq_source_row" class="text-[11px] mt-1" style="display:none">
+                                    <span class="text-gray-400">The source sends:</span>
+                                    <span id="uecp_seq_source" class="text-gray-200 font-mono">-</span>
+                                    <button class="btn ml-2" onclick="useUecpSourceSequence()">Use this</button>
+                                    <button class="btn ml-1" onclick="clearUecpSequence()">Follow the source</button>
                                 </div>
                             </div>
 
@@ -15005,6 +15661,11 @@ UI_HTML = r"""
                     afDisplay = parts.length > 0 ? parts.join("\n\n") : "None";
                 }
             }
+            // The 9-bit ODA is a separate list on a separate carrier, so it gets
+            // its own line rather than being mixed into the 0A one.
+            if (data.oda_af) {
+                afDisplay = (afDisplay === "None" ? "" : afDisplay + "\n") + data.oda_af;
+            }
             setText('live_af', afDisplay);
             
             // EON Networks
@@ -15119,6 +15780,38 @@ UI_HTML = r"""
             // Old cycle controls removed - using new message list UI
         }
 
+        // ASIO is a system setting, not a profile one, so it goes to /settings
+        // rather than through sync().
+        async function saveAsio() {
+            const box = document.getElementById('asio_enabled');
+            const statusEl = document.getElementById('asio_status');
+            if (!box) return;
+            try {
+                const res = await fetch('/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({asio_enabled: box.checked})
+                });
+                const data = await res.json();
+                if (statusEl) {
+                    if (data.restart_needed) {
+                        statusEl.className = 'text-[10px] mt-2 text-amber-300';
+                        statusEl.innerText = box.checked
+                            ? 'Saved. Restart the encoder to load ASIO - Settings has a Restart button.'
+                            : 'Saved. ASIO stays loaded until the next restart.';
+                    } else {
+                        statusEl.className = 'text-[10px] mt-2 text-green-400';
+                        statusEl.innerText = 'Saved.';
+                    }
+                }
+            } catch (e) {
+                if (statusEl) {
+                    statusEl.className = 'text-[10px] mt-2 text-red-400';
+                    statusEl.innerText = 'Could not save: ' + e.message;
+                }
+            }
+        }
+
         async function saveSettings() {
             const statusEl = document.getElementById('settings_status');
             if (statusEl) statusEl.innerText = 'Saving...';
@@ -15212,7 +15905,11 @@ UI_HTML = r"""
                 di_stereo: getVal('di_stereo'), di_head: getVal('di_head'), di_comp: getVal('di_comp'), di_dyn: getVal('di_dyn'),
                 en_fast_tuning: getVal('en_fast_tuning'), fast_tuning_rate: getVal('fast_tuning_rate'),
                 show_all_hostapis: getVal('show_all_hostapis'),
+                asio_out_channels: getVal('asio_out_channels'),
                 en_af: getVal('en_af'), af_list: getVal('af_list'), af_method: getVal('af_method'),
+                en_oda_af: getVal('en_oda_af'), oda_af_list: getVal('oda_af_list'),
+                oda_af_method: getVal('oda_af_method'), oda_af_group: getVal('oda_af_group'),
+                oda_af_carrier: getVal('oda_af_carrier'),
                 ps_dynamic: getVal('ps_dynamic'), ps_centered: getVal('ps_centered'), ps_group_version: getVal('ps_group_version'),
                 rt_text: getVal('rt_text'),
                 rt_manual_buffers: (function(){ var el = document.getElementById('rt_buffer_mode'); return el ? el.value === 'manual' : getVal('rt_manual_buffers'); })(),
@@ -18355,6 +19052,8 @@ UI_HTML = r"""
 
                // Update cycle controls visibility regularly
                updateCycleControls();
+               // ...and the 9-bit AF warnings, which depend on RDS2, eRT and RT+
+               updateODAAFUI();
         }, 1000);
 
         // Initialize RT Messages on page load
@@ -18362,6 +19061,7 @@ UI_HTML = r"""
         renderRTMessages();
         updatePTYList(); // Initialize PTY list based on RDS/RBDS setting
         updateAFMethodUI(); // Initialize AF UI based on method
+        updateODAAFUI(); // ...and the 9-bit AF ODA below it
         loadDatasets(); // Initialize datasets on page load
         updateRDS2Visibility(); // Initialize RDS2 carrier visibility
         loadEONServices(); // Initialize EON services on page load
@@ -18423,6 +19123,39 @@ UI_HTML = r"""
         var NL_CHAR = String.fromCharCode(10);
         var UECP_PTY = {{ pty_list_rds|tojson }};
         var uecpTimer = null;
+
+        // The sequence has its own endpoint: it belongs to a data set, and it is
+        // checked before it is stored rather than after it reaches the scheduler.
+        function saveUecpSequence(text) {
+            var box = document.getElementById('uecp_group_sequence');
+            var value = text !== undefined ? text : (box ? box.value : '');
+            if (text !== undefined && box) box.value = text;
+            var msg = document.getElementById('uecp_seq_msg');
+            var dsn = uecpLastStatus.sequence_dsn
+                      || (uecpLastStatus.current || 1);
+            fetch('/uecp/sequence', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({dsn: dsn, sequence: value})
+            }).then(function(r) { return r.json().then(function(j) { return [r.ok, j]; }); })
+              .then(function(p) {
+                  if (msg) {
+                      msg.textContent = p[0]
+                          ? (value ? 'Set for data set ' + dsn : 'Following the source')
+                          : (p[1].error || 'Could not set');
+                      msg.className = 'text-[10px] ml-2 ' + (p[0] ? 'text-green-400' : 'text-red-400');
+                  }
+                  pollUecp();
+              });
+        }
+
+        function useUecpSourceSequence() {
+            saveUecpSequence(uecpLastStatus.sequence_from_source || '');
+        }
+
+        function clearUecpSequence() {
+            saveUecpSequence('');
+        }
 
         function saveUecpTransport() {
             fetch('/uecp/settings', {
@@ -18871,10 +19604,16 @@ UI_HTML = r"""
                       msg.className = 'text-[10px] ' + (p[0] ? 'text-green-400' : 'text-red-400');
                   }
                   if (p[0]) {
+                      uecpPaneDirty = false;
                       uecpTreeSig = null;
                       uecpPaneKey = null;
                       if (done) done();
                       else pollUecp();
+                  } else {
+                      // Nothing was stored, so what is on screen is still
+                      // unsaved: hold the pane open so the reason stays
+                      // visible and the typing is not thrown away.
+                      uecpPaneDirty = true;
                   }
               });
         }
@@ -18908,8 +19647,9 @@ UI_HTML = r"""
                   + '</div>'
                   + '<div id="uecp_ds_seq_msg" class="text-[10px] mt-1 text-gray-500">'
                   + (fromSource.length
-                       ? 'The source sends its own sequence for this data set (MEC 0x16); '
-                         + 'it replaces whatever is set here.'
+                       ? 'The source sends its own sequence for this data set (MEC 0x16): '
+                         + fromSource.join(' ') + '. What is set here wins over it; '
+                         + 'leave it blank to follow the source.'
                        : 'Leave blank for automatic. Groups are written like 0A 2A 0A 8A.')
                   + '</div>';
             if (live) {
@@ -18964,7 +19704,12 @@ UI_HTML = r"""
             var hasPin = row.en_pin !== undefined ? !!row.en_pin : pin > 0;
             return {
                 row: row, recv: recv, isMain: isMain,
-                role: row.role || (recv ? (isMain ? 'main' : 'eon') : 'eon'),
+                // With nothing received and no main service set, the first
+                // service someone fills in is the station itself - that is what
+                // they are almost always doing. Only once there is a main does
+                // a new one default to being an other network.
+                role: row.role || (recv ? (isMain ? 'main' : 'eon')
+                                        : (uecpHasMain(data, ds) ? 'eon' : 'main')),
                 pi: row.pi || (recv && recv.pi) || '',
                 ps: (row.ps !== undefined && row.ps !== '' ? row.ps
                      : (recv && recv.ps) || ''),
@@ -18981,6 +19726,16 @@ UI_HTML = r"""
                 linkage: row.linkage || {},
                 enabled: row.enabled === undefined ? true : !!row.enabled
             };
+        }
+
+        function uecpHasMain(data, ds) {
+            var rows = (data.local_services || {})[String(ds.dsn)] || [];
+            for (var i = 0; i < rows.length; i++) {
+                if (String(rows[i].role || '').toLowerCase() === 'main') return true;
+            }
+            return (ds.services || []).some(function(svc) {
+                return !svc.empty && svc.psn === ds.main_psn;
+            });
         }
 
         function uecpTabBar(dsn, psn, isMain) {
@@ -19037,10 +19792,13 @@ UI_HTML = r"""
             else if (uecpPsnTab === 'af') html += uecpPsnAfList(d);
             else html += uecpPsnEonAf(d);
             html += '</div>';
-            html += '<div class="flex items-center gap-2 mt-3">'
-                  + '<button class="btn" onclick="saveUecpPsn(' + ds.dsn + ',' + psn + ')">Save</button>'
+            html += '<div class="flex items-center justify-end gap-3 mt-4 pt-3 '
+                  + 'border-t border-[#333]">'
+                  + '<span id="uecp_form_msg" class="text-[10px] text-gray-500 mr-auto"></span>'
                   + '<button class="btn" onclick="selectUecpPsn(' + ds.dsn + ',' + psn + ')">Revert</button>'
-                  + '<span id="uecp_form_msg" class="text-[10px] text-gray-500"></span></div>';
+                  + '<button onclick="saveUecpPsn(' + ds.dsn + ',' + psn + ')" '
+                  + 'class="px-4 py-2 bg-pink-600 hover:bg-pink-500 rounded text-sm text-white font-bold">'
+                  + 'Save</button></div>';
             document.getElementById('uecp_detail').innerHTML = html;
         }
 
@@ -19147,7 +19905,6 @@ UI_HTML = r"""
         }
 
         function saveUecpPsn(dsn, psn) {
-            uecpPaneDirty = false;
             var rows = uecpLocalRows(dsn);
             var row = null;
             rows.forEach(function(r) { if (r.psn === psn) row = r; });
@@ -19245,6 +20002,8 @@ UI_HTML = r"""
 
             var html = '<table class="w-full text-[11px]"><tr class="text-gray-500">'
                      + '<td>On</td><td>Name</td><td>Type</td><td>Address</td><td>Port</td>'
+                     + '<td title="Skip the TLS certificate check. Only for a wss:// '
+                     + 'server with a self-signed or private certificate.">No cert check</td>'
                      + '<td>Access rights</td><td>State</td><td></td></tr>';
             uecpLinkDraft.forEach(function(l, i) {
                 var live = (data.links || [])[i] || {};
@@ -19262,6 +20021,12 @@ UI_HTML = r"""
                   + '<td>' + (isWs ? '<span class="text-gray-600">-</span>'
                      : '<input type="number" style="width:5rem" value="' + (l.port || 0)
                        + '" onchange="uecpLinkField(' + i + ',&quot;port&quot;,this)">') + '</td>'
+                  // Only a wss:// connection verifies anything, so only one
+                  // can be told not to.
+                  + '<td>' + (isWs && (l.url || '').toLowerCase().indexOf('wss://') === 0
+                     ? '<input type="checkbox"' + (l.insecure ? ' checked' : '')
+                       + ' onchange="uecpLinkField(' + i + ',&quot;insecure&quot;,this)">'
+                     : '<span class="text-gray-600">-</span>') + '</td>'
                   + '<td class="text-gray-400">'
                   + (l.mec_allowed === null || l.mec_allowed === undefined
                      ? 'default' : l.mec_allowed.length + ' allowed') + '</td>'
@@ -19307,7 +20072,7 @@ UI_HTML = r"""
             var n = uecpLinkDraft.length + 1;
             uecpLinkDraft.push(kind === 'ws'
                 ? {name: 'WebSocket ' + n, kind: 'ws', enabled: false, url: '',
-                   mec_allowed: null, timeout: 0}
+                   insecure: false, mec_allowed: null, timeout: 0}
                 : {name: 'TCP ' + n, kind: 'tcp', enabled: false, host: '0.0.0.0',
                    port: 0, mec_allowed: null, timeout: 0});
             uecpMecScopeSig = null;
@@ -19505,14 +20270,21 @@ UI_HTML = r"""
                 + (data.site === 0 && data.encoder === 0 ? '  (accepts any)' : ''));
             var seqEl = document.getElementById('uecp_seq_live');
             if (seqEl) seqEl.textContent = data.group_sequence || '-';
-            // The source can replace the sequence; reflect that in the box, but
-            // never while it is being edited.
+            // The box holds the operator's own sequence and nothing else, so it
+            // is only refreshed when the stored override actually differs - and
+            // never while it is being typed in.
             var boxEl = document.getElementById('uecp_group_sequence');
             if (boxEl && document.activeElement !== boxEl
                 && data.sequence_override !== undefined
                 && boxEl.value !== data.sequence_override) {
                 boxEl.value = data.sequence_override;
             }
+            // What the source asks for, shown whether or not it is being used.
+            var srcRow = document.getElementById('uecp_seq_source_row');
+            var srcEl = document.getElementById('uecp_seq_source');
+            var fromSrc = data.sequence_from_source || '';
+            if (srcRow) srcRow.style.display = fromSrc ? '' : 'none';
+            if (srcEl) srcEl.textContent = fromSrc || '-';
             var ctEl = document.getElementById('uecp_ct_mode');
             if (ctEl && document.activeElement !== ctEl && data.ct_mode
                 && ctEl.value !== data.ct_mode) {
@@ -19678,6 +20450,61 @@ UI_HTML = r"""
                 .catch(function(e) {
                     if (statusEl) statusEl.textContent = 'Device scan failed: ' + e;
                 });
+        }
+
+        function updateODAAFUI() {
+            var on = document.getElementById('en_oda_af');
+            var opts = document.getElementById('oda_af_opts');
+            if (!on || !opts) return;
+            opts.style.display = on.checked ? 'block' : 'none';
+
+            var method = document.getElementById('oda_af_method');
+            var listUI = document.getElementById('oda_af_method_a_ui');
+            var pairUI = document.getElementById('oda_af_method_b_ui');
+            if (method && listUI && pairUI) {
+                var isA = method.value !== 'B';
+                listUI.style.display = isA ? 'block' : 'none';
+                pairUI.style.display = isA ? 'none' : 'block';
+            }
+
+            // The application group is taken before eRT and before the built-in
+            // 11A and 12A handling, so a clash would take the other one off air.
+            var clash = '';
+            var chosen = document.getElementById('oda_af_group');
+            if (chosen) {
+                var wanted = parseInt(chosen.value, 10);
+                var checked = function(id) {
+                    var el = document.getElementById(id);
+                    return !!(el && el.checked);
+                };
+                var typeOf = function(id, fallback) {
+                    var el = document.getElementById(id);
+                    return el ? parseInt(el.value, 10) : fallback;
+                };
+                if (wanted === 11 && checked('en_rt_plus')) clash = 'RT+';
+                if (wanted === 12 && checked('en_dab')) clash = 'DAB cross-referencing';
+                if (checked('en_ert') && typeOf('ert_group_type', 13) === wanted) clash = 'eRT';
+                if (checked('en_ert') && checked('en_ert_rtplus')
+                    && typeOf('ert_rtplus_group_type', 7) === wanted) clash = 'eRT RT+';
+            }
+            var clashEl = document.getElementById('oda_af_clash_warning');
+            if (clashEl) {
+                clashEl.style.display = clash ? 'block' : 'none';
+                clashEl.innerText = clash
+                    ? ('Group ' + (chosen ? chosen.value : '') + 'A is already used by '
+                       + clash + '. The 9-bit AF ODA takes the slot, so ' + clash
+                       + ' stops being transmitted. Pick another group type.')
+                    : '';
+            }
+
+            // Saying "RDS2" while RDS2 is off would quietly send nothing at all.
+            var carrier = document.getElementById('oda_af_carrier');
+            var rds2 = document.getElementById('en_rds2');
+            var warn = document.getElementById('oda_af_rds2_warning');
+            if (carrier && warn) {
+                var wantsRDS2 = carrier.value === 'rds2' || carrier.value === 'both';
+                warn.style.display = (wantsRDS2 && rds2 && !rds2.checked) ? 'block' : 'none';
+            }
         }
 
         function updateAFMethodUI() {
@@ -20632,6 +21459,7 @@ UI_HTML = r"""
                         'rt_messages', 'en_rt_plus', 'rt_plus_mode', 'rt_plus_format_a', 'rt_plus_format_b',
                         'ptyn', 'en_ptyn', 'ptyn_centered', 'ps_long_32', 'en_lps', 'lps_centered', 'lps_cr'],
             'features': ['en_af', 'af_list', 'af_method', 'af_pairs', 'en_eon', 'eon_services',
+                         'en_oda_af', 'oda_af_list', 'oda_af_method', 'oda_af_group', 'oda_af_carrier',
                          'en_dab', 'dab_channel', 'dab_eid', 'dab_mode', 'dab_es_flag', 'dab_sid', 'dab_variant',
                          'ecc', 'lic', 'tz_offset', 'en_ct', 'en_id', 'en_pin', 'pin_day', 'pin_hour', 'pin_minute',
                          'en_ert', 'ert_text', 'ert_encoding', 'ert_messages', 'ert_group_type', 'ert_direction',
@@ -20643,7 +21471,7 @@ UI_HTML = r"""
                          'tdc_5a_mode', 'tdc_5b_mode', 'tdc_pc_show_cpu', 'tdc_pc_show_temp', 'tdc_pc_show_ip',
                          'tdc_pc_show_ram', 'tdc_pc_show_uptime'],
             'audio': ['device_out_idx', 'device_in_idx', 'genlock', 'passthrough', 'pilot_level', 'rds_level',
-                      'genlock_offset', 'output_channel', 'rds_freq',
+                      'genlock_offset', 'output_channel', 'rds_freq', 'asio_out_channels',
                       'en_rds2', 'rds2_num_carriers', 'rds2_carrier1_level', 'rds2_carrier2_level', 'rds2_carrier3_level',
                       'rds2_logo_path', 'rds2_logo_filename',
                       'en_ari', 'ari_region', 'ari_announcement', 'ari_announcement_mode', 'ari_bk_level', 'ari_dk_level'],
@@ -20663,7 +21491,8 @@ UI_HTML = r"""
                    'rt_ab_cycle_count', 'rt_auto_ab'],
             'rtplus': ['en_rt_plus', 'rt_plus_mode', 'rt_plus_format_a', 'rt_plus_format_b',
                        'rt_plus_builder_a', 'rt_plus_builder_b', 'rt_plus_regex_rules_a', 'rt_plus_regex_rules_b'],
-            'af': ['en_af', 'af_list', 'af_method', 'af_pairs'],
+            'af': ['en_af', 'af_list', 'af_method', 'af_pairs',
+                   'en_oda_af', 'oda_af_list', 'oda_af_method', 'oda_af_group', 'oda_af_carrier'],
             'eon': ['en_eon', 'eon_services'],
             'dab': ['en_dab', 'dab_channel', 'dab_eid', 'dab_mode', 'dab_es_flag', 'dab_sid', 'dab_variant'],
             'ct': ['ecc', 'lic', 'tz_offset', 'en_ct', 'en_id', 'en_pin', 'pin_day', 'pin_hour', 'pin_minute'],
@@ -20680,7 +21509,7 @@ UI_HTML = r"""
             'group_sequence': ['group_sequence', 'scheduler_auto'],
             'dynamic_control': ['dynamic_control_enabled', 'dynamic_control_rules'],
             'audio': ['device_out_idx', 'device_in_idx', 'genlock', 'passthrough', 'pilot_level', 'rds_level',
-                      'genlock_offset', 'output_channel', 'rds_freq'],
+                      'genlock_offset', 'output_channel', 'rds_freq', 'asio_out_channels'],
             'rds2': ['en_rds2', 'rds2_num_carriers', 'rds2_carrier1_level', 'rds2_carrier2_level', 'rds2_carrier3_level',
                      'rds2_logo_path', 'rds2_logo_filename'],
             'ari': ['en_ari', 'ari_region', 'ari_announcement', 'ari_announcement_mode', 'ari_bk_level', 'ari_dk_level'],
@@ -21168,8 +21997,35 @@ UI_HTML = r"""
             }
         }
 
+        // What kind of build is this? An installed one cannot be updated by
+        // replacing app.py, and saying so beforehand is better than letting
+        // somebody upload a file, restart, and find the old version running.
+        async function loadUpdateCapability() {
+            try {
+                const res = await fetch('/update/status');
+                const data = await res.json();
+                const blocked = data.blocked;
+                const box = document.getElementById('update_blocked');
+                const text = document.getElementById('update_blocked_text');
+                const form = document.getElementById('update_form');
+                if (box && text && form) {
+                    box.style.display = blocked ? 'block' : 'none';
+                    form.style.display = blocked ? 'none' : 'block';
+                    text.innerText = blocked || '';
+                }
+                const where = document.getElementById('update_app_dir');
+                if (where && data.app_dir) {
+                    where.innerText = 'Running ' + (data.version || '')
+                                      + ' from ' + data.app_dir;
+                }
+            } catch (e) {
+                console.error('Could not ask what this build supports:', e);
+            }
+        }
+
         // Load backup list on settings page load
         if (document.getElementById('update_file')) {
+            loadUpdateCapability();
             loadBackupList();
         }
 

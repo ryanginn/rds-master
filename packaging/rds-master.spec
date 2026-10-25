@@ -15,6 +15,17 @@ ICONS = os.path.join(PACKAGING, "icons")
 # The icons the tray loads at runtime, and the uecp package, which app.py
 # imports inside functions rather than at the top so PyInstaller cannot see it.
 datas = [(ICONS, "icons")]
+
+# certifi's CA bundle. PyInstaller's own hook usually finds it, but not on
+# every platform and install layout - the Linux build shipped the package
+# without its cacert.pem - and a wss:// source on a machine whose trust store
+# is missing a root is exactly what it is there for.
+try:
+    from PyInstaller.utils.hooks import collect_data_files
+
+    datas += collect_data_files("certifi")
+except Exception as _exc:                       # not fatal: the system store remains
+    print(f"certifi data files not collected: {_exc}")
 hiddenimports = [
     "uecp", "uecp.frame", "uecp.mec", "uecp.element", "uecp.store",
     "uecp.handler", "uecp.bridge", "uecp.transport",
@@ -23,6 +34,10 @@ hiddenimports = [
     "engineio.async_drivers.threading",
     # Optional at runtime, bundled so the features work if the hardware is there.
     "serial", "serial.tools.list_ports", "psutil", "websocket",
+    # The CA bundle for wss:// sources. A built application cannot fall back on
+    # a system Python's certificates, and the machine's own store may not have
+    # the root a source chains to.
+    "certifi",
 ]
 
 # updater.py is optional - app.py guards the import - so only bundle a copy

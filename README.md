@@ -64,6 +64,26 @@ A work-in-progress open-source webUI based RDS encoder. Ships with a lightweight
 
 - Long PS (32 chars), PTYN, CT, AF Method A & B controls; DAB cross-reference (12A) (experimental).
 
+- **9-bit AF (ODA-AF, AID 0x6365)** — the AF codes in group 0A are 8 bits and start at 87.5 MHz,
+  so a band that reaches below it cannot be expressed. This ODA (IEC 62106-6 Annex D) carries
+  9-bit codes covering 64.1 to 107.9 MHz, and LF/MF frequencies with them. Method A and method B
+  both work; method B uses the frequency pairs from the AF section, where a regional variant is
+  signalled by transmitting the pair in descending order. Four AF codes travel in each
+  application group, their ninth bits in the five spare bits of block 2. A toggle sends it on
+  **RDS1**, on the **RDS2** data streams, or on both — on RDS2 it is tunnelled as an ordinary
+  RDS group, announcement included, taking one slot in four and leaving the rest to the file
+  transfer. Frequencies above 87.5 MHz should stay in the 0A list as well, for receivers that do
+  not know the ODA. ⚠️ Experimental: verified against the standard and in the encoder's own
+  output, not yet against a receiver that decodes it.
+
+- **ASIO output** (Windows) — uses the soundcard's own driver: exclusive access, no resampling,
+  and it works from a Windows service. Off until switched on in **Audio**, because loading it
+  makes PortAudio open every ASIO driver on the machine to ask what it can do, and a bad one can
+  take the process with it. Which audio library is loaded is settled at startup, so the toggle
+  takes effect after a restart. A card with more than two outputs can be told which pair the MPX
+  goes to, numbered as they are on the card. `RDS_ASIO=0` forces it off from outside, which is
+  the way back in if a driver stops the encoder from starting.
+
 - Fast tuning (Group 15B) — off by default, toggled in **Flags & Switches**. Repeats TP, PTY,
   TA, M/S and the DI bits with no text payload so receivers acquire faster than waiting for the
   0A/0B rotation. Blocks 2 and 4 are identical, block 3 repeats the PI code, and the DI bits are
@@ -203,6 +223,14 @@ A work-in-progress open-source webUI based RDS encoder. Ships with a lightweight
   port of 0 deactivates it, as on a 2wcom. The monitor shows each one's state, its connected
   clients and any error.
 
+  **A `wss://` source's certificate** is verified against both the machine's own trust store
+  and certifi's bundle. Neither is enough alone: a Windows machine fetches roots when it first
+  needs one, so a locked-down or newly installed one can be missing a root every browser
+  accepts - the `unable to get local issuer certificate` failure - while certifi alone would
+  reject a private or corporate CA the machine does trust. A source with a self-signed
+  certificate can be given **No cert check** on its own connection, which turns verification
+  off for that one connection and nothing else.
+
   **MEC access rights** decide which commands a source may use, the way a 2wcom, Audemat or
   Deva encoder does - and they are set **per connection**, so a studio link can be allowed to
   set RadioText while a remote one cannot rewrite the PI or the AF list. A connection with no
@@ -248,6 +276,25 @@ pip install -r requirements.txt
 
   
 
+### Updating
+
+How you update depends on how you installed it.
+
+- **Installed with the installer** (Windows, Debian or macOS): run the installer for the new
+  version. It keeps your configuration, profiles and audit log, and replaces the program. The
+  **System Updater** panel in Settings says so and offers nothing else: the installed build is a
+  single compiled executable, so dropping a new `app.py` beside it would change nothing, and a
+  restart would come back on the old version.
+
+- **Running from source**: the **System Updater** panel takes a release `.zip` and replaces the
+  files in the directory the program is actually running from, after backing up what it is about
+  to touch. `datasets.json`, `config.ini` and `audit.log` are never overwritten. The restart
+  afterwards is the same one the Settings tab uses, so it works whether the program is under a
+  service manager or was started by hand.
+
+The panel shows which build it is and the directory it is running from, so there is no guessing
+about where an update has gone.
+
 ## Usage
 
 1. Start the app:
@@ -288,6 +335,8 @@ python app.py
 - EON (Enhanced Other Networks) Group 14A implemented but **experimental** - use with caution and verify on-air behavior. ⚠️
 
 - AF Method B with regional variant (RV) flag support. ✅
+
+- 9-bit AF ODA (AID 0x6365), on RDS1, RDS2 or both. ⚠️ Not yet confirmed against a receiver.
 
 - DAB cross-reference (Group 12A) is experimental and unverified on-air. ⚠️
 

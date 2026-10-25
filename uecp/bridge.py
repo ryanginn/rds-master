@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 
-from .store import ProgrammeService, Store
+from .store import DataSet, ProgrammeService, Store
 
 # AF codes are 87.5 MHz + n * 100 kHz; 205 means "no AF". Codes above the band
 # are list-length markers (224 + count) and are not frequencies themselves.
@@ -326,7 +326,13 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
     put("rt_centered", False)
     put("scheduler_auto", False)
 
+    # Nothing received for this data set does not mean nothing to transmit:
+    # the services may have been typed in here. A blank data set stands in so
+    # the operator's own entries are read the same way either way. It is not
+    # put in the store - that would invent a data set the source never sent.
     ds = store.live
+    if ds is None and local_services(state, store.current):
+        ds = DataSet(store.current)
     main, main_psn, main_row = (main_service(ds, state) if ds is not None
                                 else (None, None, None))
     if ds is None or main is None:
@@ -334,6 +340,7 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
         manual = str(sequence_overrides(state).get(str(store.current), "") or "").strip()
         put("group_sequence", manual or "0A")
         put("uecp_group_sequence", manual)
+        state["uecp_sequence_from_source"] = ""
         state["uecp_sequence_origin"] = "set here" if manual else "automatic"
         state["uecp_sequence_dsn"] = store.current
         # CT is the encoder's, not a data set's, so an operator who has asked
@@ -477,28 +484,31 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
     # UECP source asked for. So the sequence is always explicit here: the
     # source's own (MEC 0x16) when it sent one, otherwise one built from what it
     # has actually provided.
-    # A sequence sent by the source is written straight into the operator's own
-    # box, replacing whatever was there. That keeps one visible source of truth:
-    # what the box says is what goes out, whether a person or the source put it
-    # there. An empty box means automatic.
+    # A sequence set here wins over the source's. The source's used to be
+    # written into the operator's box, which meant a source sending MEC 0x16
+    # overwrote anything typed in it within the second - there was no way to
+    # set one at all without disconnecting the source first. The source's
+    # sequence is still shown, as its own line, so nothing is hidden. An empty
+    # box means "whatever the source sends, or automatic".
     # MEC 0x16 is addressed to a data set, so every DSN has its own sequence -
     # and so does every manual override. They are kept per DSN and the live
     # one is mirrored into uecp_group_sequence for the box in the UI, so
     # switching data set switches the sequence with it.
     key = str(ds.dsn)
     overrides = sequence_overrides(state)
-    if ds.group_sequence:
-        seq = " ".join(f"{(b >> 1) & 0x0F}{'B' if b & 1 else 'A'}" for b in ds.group_sequence)
-        origin = "from the source (MEC 0x16)"
-        overrides[key] = seq                  # the source replaces what was set
+    from_source = (" ".join(f"{(b >> 1) & 0x0F}{'B' if b & 1 else 'A'}"
+                            for b in ds.group_sequence)
+                   if ds.group_sequence else "")
+    manual = str(overrides.get(key, "") or "").strip()
+    if manual:
+        seq, origin = manual, "set here"
+    elif from_source:
+        seq, origin = from_source, "from the source (MEC 0x16)"
     else:
-        manual = str(overrides.get(key, "") or "").strip()
-        if manual:
-            seq, origin = manual, "set here"
-        else:
-            seq, origin = derive_sequence(store, ds, state), "automatic"
+        seq, origin = derive_sequence(store, ds, state), "automatic"
     put("uecp_group_sequence_by_dsn", json.dumps(overrides, sort_keys=True))
-    put("uecp_group_sequence", overrides.get(key, ""))
+    put("uecp_group_sequence", manual)
+    state["uecp_sequence_from_source"] = from_source
     put("group_sequence", seq)
     put("scheduler_auto", False)
     state["uecp_sequence_origin"] = origin
