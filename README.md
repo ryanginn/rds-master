@@ -1,7 +1,8 @@
 
-# RDS Master Pro (Python)
+# RDS Master RDS Encoder
 
-  ![Overview of the User Interface](http://uploads.mpbnl.nl/u/LeTzSM.png)
+  ![Overview of the User Interface](https://github.com/user-attachments/assets/68e1d484-b81f-4fe7-bedf-2c62e7de98f4)
+
 
 A work-in-progress open-source webUI based RDS encoder. Ships with a lightweight Flask + Socket.IO server, Tailwind-styled UI, and session-gated access for secure usage.
 
@@ -344,7 +345,7 @@ python app.py
 
 - Datasets Mode (Group 5A) for transparent data channel. ✅
 
-- No packaged EXE release yet; restart-on-crash not managed.
+- No packaged EXE release yet; restart-on-crash not managed. ✅
 
 - Support for RBDS variant. ✅
 
