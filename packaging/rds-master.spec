@@ -30,6 +30,9 @@ hiddenimports = [
     "uecp", "uecp.frame", "uecp.mec", "uecp.element", "uecp.store",
     "uecp.handler", "uecp.bridge", "uecp.transport",
     "rds_charset",
+    # The instance registry. The tray imports it too, and both of them are in
+    # this one build, so it has to be in it whichever entry point asks.
+    "instances",
     # Flask-SocketIO picks its async driver at runtime.
     "engineio.async_drivers.threading",
     # Optional at runtime, bundled so the features work if the hardware is there.

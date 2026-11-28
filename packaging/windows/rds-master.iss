@@ -164,9 +164,14 @@ var
 begin
   PortPage := CreateInputQueryPage(wpSelectTasks,
     'Web interface', 'Which port should the web interface listen on?',
-    'Leave this alone unless the port is already taken, or you are installing ' +
-    'a second copy on this machine.');
+    'Leave the port alone unless it is already taken. One install can run ' +
+    'several encoders, each with its own configuration, port and soundcard - ' +
+    'more can be added later from the tray icon.');
   PortPage.Add('Port:', False);
+  // One install can run several encoders, each with its own configuration and
+  // its own soundcard - a station with two services wants two of these, not two
+  // installs. More can be added later from the tray icon.
+  PortPage.Add('How many encoders?', False);
   Found := ExistingPort();
   if Found <> '' then
   begin
@@ -177,6 +182,14 @@ begin
   end
   else
     PortPage.Values[0] := '5000';
+  PortPage.Values[1] := '1';
+end;
+
+function ChosenInstances(): Integer;
+begin
+  Result := StrToIntDef(Trim(PortPage.Values[1]), 1);
+  if Result < 1 then
+    Result := 1;
 end;
 
 function ChosenPort(): String;
@@ -203,6 +216,26 @@ begin
     begin
       MsgBox('A port must be a number between 1 and 65535.', mbError, MB_OK);
       Result := False;
+    end;
+    Number := StrToIntDef(Trim(PortPage.Values[1]), -1);
+    if Number < 1 then
+    begin
+      MsgBox('The number of encoders must be 1 or more.' + #13#10 +
+             'More can be added afterwards from the tray icon.',
+             mbError, MB_OK);
+      Result := False;
+    end
+    else if Number > 8 then
+    begin
+      // Not a limit - a question. Each one is a full encoder with its own
+      // soundcard and its own share of the CPU.
+      if MsgBox('Set up ' + IntToStr(Number) + ' encoders?' + #13#10 + #13#10 +
+                'Each one runs as its own program with its own configuration, ' +
+                'its own port and its own soundcard, so they need the memory ' +
+                'and the audio outputs to match.' + #13#10 + #13#10 +
+                'They will use ports ' + ChosenPort() + ' upwards.',
+                mbConfirmation, MB_YESNO) <> IDYES then
+        Result := False;
     end;
   end;
 end;
@@ -274,6 +307,23 @@ begin
     SaveStringsToFile(Config, Lines, False);
 end;
 
+// Ask the encoder to register the instances. It owns the registry; the
+// installer only says how many are wanted and where to start counting ports.
+procedure CreateInstances();
+var
+  Code: Integer;
+  Arguments: String;
+begin
+  if ChosenInstances() <= 1 then
+    Exit;
+  Arguments := '--provision ' + IntToStr(ChosenInstances()) +
+               ' --base-port ' + ChosenPort();
+  if not Exec(ExpandConstant('{app}\rds-master.exe'), Arguments,
+              ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) then
+    MsgBox('The extra encoders could not be set up automatically.' + #13#10 +
+           'Add them from the tray icon instead.', mbInformation, MB_OK);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Config, Backup: String;
@@ -288,5 +338,8 @@ begin
     end;
   end;
   if CurStep = ssPostInstall then
+  begin
     WriteChosenPort();
+    CreateInstances();
+  end;
 end;

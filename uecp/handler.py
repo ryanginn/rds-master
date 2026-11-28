@@ -122,12 +122,31 @@ def _rt(svc: ProgrammeService, d: bytes) -> str:
 def _long_ps(svc: ProgrammeService, d: bytes) -> str:
     """MEC 0x21 - vendor extension, not in SPB 490 v7.05. MEL is the text length.
 
-    Sources send this in the RDS character set with a 0x0D terminator, exactly
-    like RadioText - not as UTF-8, which is what this used to assume.
+    No character set is specified for it and sources disagree: some send the
+    RDS set, as they do for RadioText, others send UTF-8, which is what group
+    15A itself carries. So UTF-8 is tried first, with the RDS set as the
+    fallback. Plain ASCII - which most long PS is - decodes the same either
+    way, so the choice only matters where it has to.
     """
     svc.long_ps_raw = bytes(d[:MAX_LONG_PS])
-    svc.long_ps = _rds_text(svc.long_ps_raw)
+    svc.long_ps = long_ps_text(svc.long_ps_raw)
     return f"Long PS {svc.long_ps!r}"
+
+
+def long_ps_text(raw: bytes) -> str:
+    """Decode long PS, preferring UTF-8 over the RDS character set.
+
+    Only a byte above 0x7F makes this a choice at all, and a sequence of those
+    that decodes cleanly as UTF-8 was UTF-8: for the RDS set to produce one by
+    chance it would have to hit a valid multi-byte sequence exactly.
+    """
+    body = raw[:-1] if raw.endswith(b"\x0d") else raw
+    if all(b < 0x80 for b in body):
+        return _rds_text(raw)
+    try:
+        return body.decode("utf-8").rstrip("\r")
+    except UnicodeDecodeError:
+        return _rds_text(raw)
 
 
 def _af(svc: ProgrammeService, d: bytes) -> str:
@@ -511,6 +530,40 @@ def _learn_oda(store: Store, d: bytes) -> None:
     app.announced_by = "raw 3A group"
 
 
+RT_PLUS_AID = 0x4BD7
+
+
+def _learn_rt_plus(store: Store, ds: DataSet, d: bytes) -> None:
+    """Decode an RT+ group the source sent, for the monitor to show.
+
+    Which group carries RT+ is whichever one the source's own 3A announcement
+    gives for AID 0x4BD7, so a source using 11A and one using 12A both work
+    without being told which.
+
+    Layout: the five spare bits of block 2 are the item toggle, the item
+    running bit and the top three bits of the first content type; block 3
+    carries the rest of it with that tag's start and length and the top bit of
+    the second type; block 4 the second tag.
+    """
+    app = store.oda.get(RT_PLUS_AID)
+    if app is None or not app.group_index or len(d) < 6:
+        return
+    if (d[0] & 0x1F) != app.group_index:
+        return
+    tail, b3, b4 = d[1] & 0x1F, (d[2] << 8) | d[3], (d[4] << 8) | d[5]
+    type1 = ((tail & 0x07) << 3) | ((b3 >> 13) & 0x07)
+    start1, len1 = (b3 >> 7) & 0x3F, (b3 >> 1) & 0x3F
+    type2 = ((b3 & 0x01) << 5) | ((b4 >> 11) & 0x1F)
+    start2, len2 = (b4 >> 5) & 0x3F, b4 & 0x1F
+    tags = []
+    if type1:
+        tags.append((type1, start1, len1 + 1))      # the field is length - 1
+    if type2:
+        tags.append((type2, start2, len2 + 1))
+    ds.rt_plus = {"toggle": (tail >> 4) & 1, "running": (tail >> 3) & 1,
+                  "tags": tags, "at": time.time()}
+
+
 def _paging(label: str):
     """Paging and EPP calls: decoded and kept for the monitor.
 
@@ -680,6 +733,8 @@ def apply_element(store: Store, el: Element, allowed=None, link: str = "") -> No
                 store.note(f"{el.name} on DSN {ds.dsn}: {exc}")
         if el.mec in (0x24, 0x42):
             _learn_oda(store, el.data)
+            for ds in targets:
+                _learn_rt_plus(store, ds, el.data)
         return
 
     svc_handler = SERVICE_HANDLERS.get(el.mec)

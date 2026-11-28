@@ -69,6 +69,32 @@ def clock_time_wanted(store: Store, state: dict) -> bool:
     return bool(store.ct_on and store.clock.valid)
 
 
+def repeat_intervals(state: dict) -> dict:
+    """How often each raw group is repeated, as {group index: seconds}.
+
+    Set as {"3A": 4000, "12A": 4000} in milliseconds, which is how a coder's
+    own settings read. An empty or missing setting leaves the defaults; 0 for a
+    group turns repeating off for it and restores "once and removed".
+    """
+    from .store import REPEAT_DEFAULT
+
+    intervals = dict(REPEAT_DEFAULT)
+    try:
+        configured = json.loads(state.get("uecp_repeat_ms") or "{}")
+    except (ValueError, TypeError):
+        return intervals
+    if not isinstance(configured, dict):
+        return intervals
+    for name, value in configured.items():
+        try:
+            text = str(name).strip().upper()
+            index = (int(text[:-1]) << 1) | (1 if text.endswith("B") else 0)
+            intervals[index] = max(0.0, float(value) / 1000.0)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return intervals
+
+
 def sequence_overrides(state: dict) -> dict:
     """The operator's per-data-set group sequences, {"<dsn>": "0A 2A ..."}."""
     try:
@@ -320,7 +346,7 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
                  "en_ert_rtplus", "en_dab", "en_rds2", "en_ari", "en_tdc_5a",
                  "en_tdc_5b", "en_fast_tuning", "en_paging", "en_rt_plus",
                  "en_id", "en_ecc", "en_lic", "en_ct", "en_pin", "en_af",
-                 "en_eon"):
+                 "en_oda_af", "en_eon"):
         put(flag, 0)
     put("rt_cr", False)
     put("rt_centered", False)
@@ -494,6 +520,10 @@ def apply_to_state(store: Store, state: dict) -> list[str]:
     # and so does every manual override. They are kept per DSN and the live
     # one is mirrored into uecp_group_sequence for the box in the UI, so
     # switching data set switches the sequence with it.
+    # How often a non-buffered group is repeated. Read on every pass so a
+    # change takes effect without restarting anything.
+    ds.repeat_every = repeat_intervals(state)
+
     key = str(ds.dsn)
     overrides = sequence_overrides(state)
     from_source = (" ".join(f"{(b >> 1) & 0x0F}{'B' if b & 1 else 'A'}"

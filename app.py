@@ -32,6 +32,30 @@ for _stream in (_sys.stdout, _sys.stderr):
 import json as _json
 import os as _os
 
+# Which instance this is. One install can run several encoders, each with its
+# own configuration directory and its own port; --data-dir is how a scheduled
+# task, a service unit or the tray says which one this process is. It is read
+# before anything else because everything below depends on it - including which
+# audio library gets loaded.
+for _index, _item in enumerate(_sys.argv[1:]):
+    if _item == "--data-dir" and _index + 2 <= len(_sys.argv[1:]):
+        _os.environ["RDS_DATA_DIR"] = _sys.argv[_index + 2]
+        break
+    if _item.startswith("--data-dir="):
+        _os.environ["RDS_DATA_DIR"] = _item.split("=", 1)[1]
+        break
+
+# Managing the instances themselves is done through the registry, not by
+# starting an encoder, so those arguments are answered here and nothing else is
+# loaded at all.
+try:
+    import instances as _instances
+
+    if _instances.wanted(_sys.argv[1:]):
+        _sys.exit(_instances.cli(_sys.argv[1:]))
+except ImportError:
+    pass
+
 
 def running_installed():
     """True when this is a built application rather than a checkout."""
@@ -110,7 +134,7 @@ import json
 import tempfile
 from datetime import datetime, timezone, date
 from flask import (Flask, render_template_string, request, redirect, url_for,
-                   session, jsonify, send_from_directory, Response)
+                   session, jsonify, send_from_directory, Response, g)
 from werkzeug.utils import secure_filename
 from flask_socketio import SocketIO
 from scipy import signal as dsp_signal
@@ -463,6 +487,10 @@ default_state = {
     # 9-bit AF (ODA-AF, AID 0x6365). Its own frequency list, because it reaches
     # below 87,5 MHz where the 0A list cannot follow; method B shares the pairs
     # above, since the network structure is the same either way.
+    # How often a non-buffered UECP group goes out again, in milliseconds,
+    # as {"3A": 4000}. A source using buffer configuration 00 sends each group
+    # once; without this, a receiver tuning in later never sees it.
+    "uecp_repeat_ms": "",
     "en_oda_af": 0, "oda_af_list": "", "oda_af_method": "A",
     "oda_af_group": 9, "oda_af_carrier": "rds1",
     "en_eon": 0, "eon_services": "[]", "eon_ta_burst": 8,
@@ -1318,7 +1346,17 @@ def _atomic_write_json(filepath, data):
         raise
 
 def save_config():
-    """Save configuration to datasets.json. Returns True when it reached disk."""
+    """Save configuration to datasets.json. Returns True when it reached disk.
+
+    Under STATE_LOCK: it writes the live settings into the live profile's slot,
+    and those two have to be read together or a save racing a switch writes
+    one profile's settings under the other's number.
+    """
+    with STATE_LOCK:
+        return _save_config_locked()
+
+
+def _save_config_locked():
     if not datasets_file_ready():
         print("⚠ Skipping config save — datasets.json is still unreadable.")
         return False
@@ -1452,6 +1490,13 @@ def is_uecp_mode():
 # DATASETS_FILE already defined above near CONFIG_FILE
 datasets = {}
 current_dataset = 1
+
+# Held by everything that changes which profile is live, writes the live
+# settings, or saves them. Reentrant, because a save happens inside an update
+# and inside a switch. Readers - the generator, the audio thread - do not take
+# it: they only read, and a read that sees the old profile for one more group
+# does no harm. What did harm was a writer seeing half a switch.
+STATE_LOCK = threading.RLock()
 auto_start = True  # Global setting, not per-dataset
 site_name = "Where am I"  # Global setting for UI branding
 http_port = 5000  # Global setting for HTTP port, not per-dataset
@@ -1565,7 +1610,12 @@ def datasets_file_ready():
     return datasets_load_ok
 
 def save_datasets():
-    """Save datasets along with auth and system settings."""
+    """Save datasets along with auth and system settings. Under STATE_LOCK."""
+    with STATE_LOCK:
+        return _save_datasets_locked()
+
+
+def _save_datasets_locked():
     global auto_start, http_port, http_host, asio_enabled
     if not datasets_file_ready():
         print("⚠ Skipping dataset save — datasets.json is still unreadable.")
@@ -1635,6 +1685,26 @@ def save_datasets():
         print(f"Error saving datasets: {e}")
 
 def switch_dataset(dataset_num):
+    """Put another profile on air.
+
+    Storing the outgoing profile, changing which one is live and loading the
+    incoming one happen under STATE_LOCK as one step, so no writer anywhere
+    can see the live number changed and the old settings still in place.
+    The UECP transports are restarted afterwards, outside the lock: that waits
+    on their threads, and nothing should wait while holding it.
+    """
+    with STATE_LOCK:
+        switched = _switch_dataset_locked(dataset_num)
+    if switched:
+        # A profile switch can change the mode, so the UECP transports follow it.
+        try:
+            start_uecp()
+        except Exception as exc:
+            print(f"[UECP] restart after profile switch failed: {exc}", flush=True)
+    return switched
+
+
+def _switch_dataset_locked(dataset_num):
     global state, current_dataset, monitor_data
     dataset_num = str(dataset_num)
     if dataset_num in datasets:
@@ -1669,12 +1739,6 @@ def switch_dataset(dataset_num):
         monitor_data["rt_plus_info"] = ""
         monitor_data["ert_rtplus_info"] = ""
         monitor_data["heartbeat"] = int(time.time() * 1000)
-
-        # A profile switch can change the mode, so the UECP transports follow it.
-        try:
-            start_uecp()
-        except Exception as exc:
-            print(f"[UECP] restart after profile switch failed: {exc}", flush=True)
 
         # Save datasets and current dataset info
         save_datasets()
@@ -1814,6 +1878,8 @@ def monitor_pusher_loop():
             monitor_data["af_list"] = state["af_list"]
             monitor_data["af_method"] = state.get("af_method", "A")
             monitor_data["af_pairs"] = state.get("af_pairs", "[]")
+            if is_uecp_mode():
+                monitor_data["rt_plus_info"] = uecp_rt_plus_info()
             # The 9-bit list goes out on its own carrier and in its own group,
             # so the dashboard says which, rather than leaving it to be assumed.
             if state.get("en_oda_af"):
@@ -5530,7 +5596,7 @@ class RDSScheduler:
 
             return self._get_group(6, 0, b2_tail, b3_val, b4_val)
 
-        elif g_type == 11 and (not state["scheduler_auto"] or state["en_rt_plus"]):
+        elif g_type == 11 and (hand_scheduled() or state["en_rt_plus"]):
              # --- CORRECTED RT+ PACKING (37 Bits split across blocks) ---
              # Supports 0, 1, or 2 tags. Running bit indicates whether tags are active.
 
@@ -5568,7 +5634,7 @@ class RDSScheduler:
              
              return self._get_group(11, 0, b2_tail, b3_val, b4_val)
 
-        elif g_type == 14 and (not state["scheduler_auto"] or state.get("en_eon")):
+        elif g_type == 14 and (hand_scheduled() or state.get("en_eon")):
             # Group 14A: Enhanced Other Networks (EON) - EN 50067 section 3.2.1.8
             eon_services = []
             eon_services_str = state.get("eon_services", "[]")
@@ -5905,10 +5971,10 @@ class RDSScheduler:
             # second 0 and would set receiver clocks wrong, so use the slot for PS.
             return self.ps_filler_group()
 
-        elif g_type == 15 and g_ver == 1 and (not state["scheduler_auto"] or state.get("en_fast_tuning")):
+        elif g_type == 15 and g_ver == 1 and (hand_scheduled() or state.get("en_fast_tuning")):
             return self.emit_fast_tuning_group()
 
-        elif g_type == 15 and (not state["scheduler_auto"] or state["en_lps"]):
+        elif g_type == 15 and (hand_scheduled() or state["en_lps"]):
             raw = self.get_text("ps_long_32")
             lps_centered = state['lps_centered']
             if raw != self.last_lps_content: self.last_lps_content, self.lps_ptr = raw, 0
@@ -5945,7 +6011,7 @@ class RDSScheduler:
             # so it must never be emitted as 15B (which is the fast-tuning group).
             return self._get_group(15, 0, seg, (lps_txt[seg*4]<<8)|lps_txt[seg*4+1], (lps_txt[seg*4+2]<<8)|lps_txt[seg*4+3])
 
-        elif g_type == 10 and (not state["scheduler_auto"] or state["en_ptyn"]):
+        elif g_type == 10 and (hand_scheduled() or state["en_ptyn"]):
             raw = self.get_text("ptyn")
             if raw != self.last_ptyn_content: self.last_ptyn_content, self.ptyn_ptr = raw, 0
             if not self.ptyn_sequence or raw != self.ptyn_sequence[0][1].strip(): 
@@ -5967,6 +6033,10 @@ class RDSScheduler:
             
         elif g_type == 1:
             # In manual mode, transmit if explicitly scheduled; in auto mode, check en_id or en_pin flag
+            # Group 1A is the exception to hand_scheduled(): with the flags
+            # off it carries zeros rather than inventing anything, so a
+            # hand-scheduled 1A is transmitted with an empty block 3 instead
+            # of somebody else's country code - or nothing at all.
             if not state["scheduler_auto"] or state["en_id"] or state.get("en_pin", 0):
                 # Group 1A: ECC/LIC in Block 3, PIN in Block 4 (if enabled)
                 # Cycle between ECC (variant 0) and LIC (variant 3) in Block 3
@@ -6012,7 +6082,7 @@ class RDSScheduler:
 
                 return self._get_group(1, g_ver, 0, block3, block4)
 
-        elif g_type == 12 and (not state["scheduler_auto"] or state.get("en_dab")):
+        elif g_type == 12 and (hand_scheduled() or state.get("en_dab")):
             # Group 12A: ODA data for DAB linkage (Ensemble table)
             # Per EN 301 700 spec section 5.3.3
             dab_ch = state.get("dab_channel", "12B")
@@ -6857,6 +6927,7 @@ def index():
                                   asio_loaded=asio_loaded(),
                                   asio_devices=asio_device_count(),
                                   profile_mode=profile_mode(),
+                                  current_profile=current_dataset,
                                   mec_catalogue=mec_catalogue(),
                                   profile_modes=list(PROFILE_MODES), state=state, auto_start=auto_start, pty_list_rds=PTY_LIST_RDS, pty_list_rbds=PTY_LIST_RBDS, auth_config=auth_config, site_name=site_name, http_port=http_port, version=VERSION, SERIAL_AVAILABLE=SERIAL_AVAILABLE)
 
@@ -6931,9 +7002,13 @@ def under_service_manager() -> bool:
 
 
 def relaunch_command() -> list:
-    """The command that starts another copy of this program."""
+    """How to start another copy of this process, arguments and all.
+
+    The arguments matter: --data-dir is what tells an encoder which instance it
+    is, so dropping it on a restart would bring the wrong configuration back.
+    """
     if getattr(sys, "frozen", False):
-        return [sys.executable]                 # the built executable itself
+        return [sys.executable] + list(sys.argv[1:])
     return [sys.executable] + list(sys.argv)
 
 
@@ -6995,6 +7070,58 @@ def wait_for_port_free(host: str, port: int, timeout: float = 20.0) -> bool:
                 return True
         time.sleep(0.4)
     return False
+
+
+# Endpoints that write the live profile's settings. A request to one of these
+# from a page rendered for another profile is refused, and the live profile
+# is held still for the whole request.
+PROFILE_WRITE_PREFIXES = ("/uecp/", "/rds2/", "/custom_groups/")
+
+
+def _writes_live_profile():
+    return (request.method in ("POST", "PUT", "DELETE")
+            and request.path.startswith(PROFILE_WRITE_PREFIXES))
+
+
+@app.before_request
+def _hold_profile_for_write():
+    """Refuse a write meant for a profile that is no longer live.
+
+    The page sends X-RDS-Profile with every request: the profile it was
+    rendered for. A mismatch means the page is out of date - another tab or
+    another person switched profile - and writing would put this page's values
+    into the profile that is live now. Untagged requests are scripts using the
+    API and are let through.
+    """
+    if not _writes_live_profile():
+        return None
+    STATE_LOCK.acquire()
+    g.holds_state_lock = True
+    claimed = request.headers.get("X-RDS-Profile")
+    if claimed is None:
+        return None
+    try:
+        claimed = int(claimed)
+    except ValueError:
+        claimed = None
+    if claimed == current_dataset:
+        return None
+    print(f"[Profiles] refused {request.method} {request.path} meant for profile "
+          f"{claimed} while profile {current_dataset} is live", flush=True)
+    if audit:
+        audit.record("config", "stale change refused",
+                     detail=f"{request.path}: meant for profile {claimed}, "
+                            f"profile {current_dataset} is live",
+                     user=auth_config.get("user", ""), request=request)
+    return jsonify({'error': f'This page is for profile {claimed}, but profile '
+                             f'{current_dataset} is on air now. Reload the page.',
+                    'profile_mismatch': True, 'live': current_dataset}), 409
+
+
+@app.teardown_request
+def _release_profile_for_write(_exc=None):
+    if g.pop("holds_state_lock", False):
+        STATE_LOCK.release()
 
 
 @app.route('/restart', methods=['POST'])
@@ -7431,14 +7558,53 @@ def resolve_content():
 
 @socketio.on('update')
 def handle_update(data):
+    """A change from the browser - applied only to the profile it was made on.
+
+    Every page says which profile it was rendered for, and sends that with
+    each change. One that does not match the live profile is refused and the
+    page is told to reload. This is what stops one profile's settings being
+    saved into another: a page left over from before a switch - or one whose
+    inputs the browser restored to the previous profile's values on reload -
+    can no longer write anything.
+
+    A change that does not say which profile it is for is refused too: it
+    cannot show it is not stale, and the cost of guessing wrong is a profile
+    overwritten.
+    """
     if not session.get('auth'): return
-    # Snapshot only the keys being written, so the comparison is cheap even
-    # though this runs on every change the browser sends.
-    before = ({k: state.get(k) for k in data} if audit and isinstance(data, dict)
-              else {})
-    Sanitize.to_state(data)
+    if not isinstance(data, dict):
+        return
+    data = dict(data)
+    claimed = data.pop('_profile', None)
+    with STATE_LOCK:
+        try:
+            claimed = int(claimed)
+        except (TypeError, ValueError):
+            claimed = None
+        if claimed != current_dataset:
+            print(f"[Profiles] refused a change meant for profile {claimed} "
+                  f"while profile {current_dataset} is live "
+                  f"({len(data)} field(s))", flush=True)
+            if audit:
+                audit.record("config", "stale change refused",
+                             detail=f"meant for profile {claimed}, "
+                                    f"profile {current_dataset} is live",
+                             user=auth_config.get("user", ""), request=request)
+            # Tell that page - and only that page - to reload. There is no
+            # socket to answer when this is called some other way, and a
+            # refusal must never fail in a way that looks like it was applied.
+            sid = getattr(request, 'sid', None)
+            if sid:
+                socketio.emit('profile_mismatch',
+                              {'live': current_dataset, 'claimed': claimed},
+                              to=sid)
+            return
+        # Snapshot only the keys being written, so the comparison is cheap even
+        # though this runs on every change the browser sends.
+        before = {k: state.get(k) for k in data} if audit else {}
+        Sanitize.to_state(data)
+        after = {k: state.get(k) for k in before} if before else {}
     if audit and before:
-        after = {k: state.get(k) for k in before}
         lines = audit.changes(before, after)
         if lines:
             audit.record("config", "settings changed",
@@ -7578,6 +7744,12 @@ def delete_dataset(num):
     global current_dataset
     if not session.get('auth'): return jsonify({'error': 'Not authenticated'}), 401
     num_str = str(num)
+    with STATE_LOCK:
+        return _delete_dataset_locked(num, num_str)
+
+
+def _delete_dataset_locked(num, num_str):
+    global current_dataset
     if num_str in datasets and len(datasets) > 1:
         # If deleting the active dataset, switch to another one first
         # so current_dataset never points to a non-existent slot
@@ -8034,6 +8206,43 @@ def uecp_text_bytes(key, length=None):
     return raw.ljust(length, b" ")[:length] if length else raw
 
 
+def hand_scheduled():
+    """Whether a slot in a hand-written sequence may be filled by this encoder.
+
+    The internal coder's rule is that scheduling a group by hand means you want
+    it, flag or no flag. A UECP sequence is always explicit - derived from what
+    the source sends, or typed by an operator - so that rule would hand every
+    slot to a built-in generator the moment the source's own queue for it ran
+    dry, which is how group 12A ended up carrying DAB cross-reference data
+    where RT+ belonged.
+    """
+    return not state["scheduler_auto"] and not is_uecp_mode()
+
+
+def uecp_rt_plus_info():
+    """The source's own RT+ tags, named, for the monitor. "" when there are none.
+
+    In UECP mode the tags on air are the source's raw groups. The line in the
+    dashboard used to be produced by the internal tagger running its rules over
+    the source's RadioText, so it showed tags that were never transmitted.
+    """
+    if _uecp_store is None or not is_uecp_mode():
+        return ""
+    ds = _uecp_store.live
+    if ds is None:
+        return ""
+    info = ds.rt_plus_summary()
+    if not info:
+        return ""
+    if not info.get("running"):
+        return "(item not running)"
+    parts = []
+    for tag in info.get("tags", []):
+        name = RTPLUS_CONTENT_TYPES.get(tag["type"], ("Unknown",))[0]
+        parts.append(f"{name}: {tag['text']}")
+    return " | ".join(parts) if parts else "(no tags)"
+
+
 def uecp_rt_queue():
     """The source's RadioText as (bytes, A/B flag, transmissions) tuples."""
     if _uecp_store is None:
@@ -8152,8 +8361,12 @@ def uecp_apply_loop():
         # that has received nothing still needs its internal-coder defaults
         # suppressed, or the encoder transmits ECC, CT and the rest regardless.
         try:
-            if is_uecp_mode() and _uecp_store is not None:
-                uecp.apply_to_state(_uecp_store, state)
+            # The mode is checked under the lock, with the write: checked
+            # outside it, a switch to an internal-coder profile could land in
+            # between and the source's data would be written into that one.
+            with STATE_LOCK:
+                if is_uecp_mode() and _uecp_store is not None:
+                    uecp.apply_to_state(_uecp_store, state)
         except Exception as exc:
             print(f"[UECP] apply failed: {exc}", flush=True)
 
@@ -13078,6 +13291,63 @@ UI_HTML = r"""
 
     <script>
         var socket = io();
+
+        // Which profile this page was rendered for. Every change sent to the
+        // server carries it, and the server refuses one meant for a profile
+        // that is no longer live - which is what stops a page left over from
+        // before a switch writing into the profile switched to.
+        var PAGE_PROFILE = {{ current_profile }};
+        (function() {
+            var send = socket.emit.bind(socket);
+            socket.emit = function(name, data) {
+                if (name === 'update') {
+                    // Mid-switch the page is about to be replaced; nothing it
+                    // holds belongs to the profile coming on air.
+                    if (window.__switchingProfile) return socket;
+                    if (data && typeof data === 'object') data._profile = PAGE_PROFILE;
+                }
+                return send.apply(null, arguments);
+            };
+        })();
+
+        // The server says this page is out of date: another tab or another
+        // person switched profile. Reload rather than keep editing a profile
+        // that is no longer on air.
+        function reloadForLiveProfile() {
+            if (window.__reloadingForProfile) return;
+            window.__reloadingForProfile = true;
+            window.__switchingProfile = true;
+            location.reload();
+        }
+        socket.on('profile_mismatch', function() { reloadForLiveProfile(); });
+
+        // Requests carry the profile too, so a button on a stale page cannot
+        // write into whichever profile happens to be live now.
+        (function() {
+            var realFetch = window.fetch.bind(window);
+            window.fetch = function(resource, init) {
+                init = Object.assign({}, init || {});
+                var headers = init.headers;
+                if (headers && typeof headers.set === 'function') {
+                    headers.set('X-RDS-Profile', String(PAGE_PROFILE));
+                } else {
+                    headers = Object.assign({}, headers || {});
+                    headers['X-RDS-Profile'] = String(PAGE_PROFILE);
+                    init.headers = headers;
+                }
+                return realFetch(resource, init).then(function(res) {
+                    if (res.status === 409) {
+                        res.clone().json().then(function(body) {
+                            if (body && body.profile_mismatch) reloadForLiveProfile();
+                        }).catch(function() {});
+                    }
+                    return res;
+                });
+            };
+        })();
+        socket.on('dataset_changed', function(msg) {
+            if (msg && Number(msg.current) !== PAGE_PROFILE) reloadForLiveProfile();
+        });
         var running = {{ 'true' if state.running else 'false' }};
         var pty_list_rds = {{ pty_list_rds|tojson }};
         var pty_list_rbds = {{ pty_list_rbds|tojson }};
@@ -15847,7 +16117,10 @@ UI_HTML = r"""
             }
         }
 
-        function updatePTYList() {
+        // `send` is false at start-up: setting up the labels is not a change,
+        // and sending the whole form on load is what carried a restored,
+        // stale form into the profile that had just been switched to.
+        function updatePTYList(send) {
             var isRBDS = document.getElementById('rbds').checked;
             var ptySelect = document.getElementById('pty');
             var currentValue = ptySelect.value;
@@ -15862,11 +16135,14 @@ UI_HTML = r"""
             // Keep same value selected
             ptySelect.value = currentValue;
 
-            // Sync the rbds checkbox state
-            sync();
+            // Sync the rbds checkbox state - only when it was actually changed
+            if (send !== false) sync();
         }
 
         function sync() {
+            // The page is being replaced by the next profile's; what is in
+            // its inputs belongs to the one going off air.
+            if (window.__switchingProfile) return;
             const getVal = (id) => {
                 let el = document.getElementById(id);
                 if(!el) return null;
@@ -16157,13 +16433,22 @@ UI_HTML = r"""
         }
 
         function switchDataset(num) {
+            // From here on this page holds the outgoing profile's values and
+            // must not send any of them: the server is about to be on another.
+            window.__switchingProfile = true;
             fetch('/datasets/' + num + '/switch', { method: 'POST' })
                 .then(function(res) {
                     if (res.ok) {
                         location.reload();
+                    } else {
+                        window.__switchingProfile = false;
+                        alert('Failed to switch profile');
                     }
                 })
-                .catch(function(e) { alert('Failed to switch profile'); });
+                .catch(function(e) {
+                    window.__switchingProfile = false;
+                    alert('Failed to switch profile');
+                });
         }
 
         function createDataset() {
@@ -19059,7 +19344,7 @@ UI_HTML = r"""
         // Initialize RT Messages on page load
         initRTMsgTagSelects();
         renderRTMessages();
-        updatePTYList(); // Initialize PTY list based on RDS/RBDS setting
+        updatePTYList(false); // Initialize PTY labels; this is not a change, so nothing is sent
         updateAFMethodUI(); // Initialize AF UI based on method
         updateODAAFUI(); // ...and the 9-bit AF ODA below it
         loadDatasets(); // Initialize datasets on page load
@@ -22033,6 +22318,43 @@ UI_HTML = r"""
 </body>
 </html>
 """
+
+
+def _no_form_restore(html):
+    """Mark every input, select and textarea in the markup autocomplete="off".
+
+    After a profile switch the page reloads, and without this a browser
+    restores the inputs to what they held before - the profile going off air -
+    over the values just rendered for the one coming on. That is half of how
+    one profile's settings used to end up saved into another.
+
+    Only the markup outside <script> blocks is touched. Inputs a script builds
+    are created after load, so a browser never restores those, and editing a
+    script's text could change what it does.
+    """
+    out, pos = [], 0
+    lower = html.lower()
+    while True:
+        start = lower.find("<script", pos)
+        chunk = html[pos:] if start < 0 else html[pos:start]
+        out.append(_RESTORABLE.sub(_mark_unrestorable, chunk))
+        if start < 0:
+            break
+        end = lower.find("</script>", start)
+        end = len(html) if end < 0 else end + len("</script>")
+        out.append(html[start:end])
+        pos = end
+    return "".join(out)
+
+
+_RESTORABLE = re.compile(r"<(input|select|textarea)\b(?![^>]*\bautocomplete=)", re.I)
+
+
+def _mark_unrestorable(match):
+    return f'<{match.group(1)} autocomplete="off"'
+
+
+UI_HTML = _no_form_restore(UI_HTML)
 
 if __name__ == '__main__':
     print("[STARTUP] RDS Encoder application starting...", flush=True)

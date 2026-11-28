@@ -1,8 +1,7 @@
 
-# RDS Master RDS Encoder
+# RDS Master Pro (Python)
 
-  ![Overview of the User Interface](https://github.com/user-attachments/assets/68e1d484-b81f-4fe7-bedf-2c62e7de98f4)
-
+  ![Overview of the User Interface](http://uploads.mpbnl.nl/u/LeTzSM.png)
 
 A work-in-progress open-source webUI based RDS encoder. Ships with a lightweight Flask + Socket.IO server, Tailwind-styled UI, and session-gated access for secure usage.
 
@@ -26,6 +25,15 @@ A work-in-progress open-source webUI based RDS encoder. Ships with a lightweight
   and shows a UECP Monitor instead. Switching profile switches the whole encoder, which makes
   failover scriptable - `POST /profiles/<n>/switch` (`/datasets/...` still works as an alias),
   so a watchdog can drop to a local internal-coder profile if the studio feed dies.
+
+  **One profile can never overwrite another.** Every change the web interface sends says
+  which profile the page was rendered for, and the server refuses a change meant for any
+  profile but the one on air - the page is told to reload instead. That covers a tab left
+  open from before a switch, another person switching profile underneath you, and the
+  browser restoring the previous profile's values into the form after a reload. Switching,
+  saving and every background writer share one lock, so nothing can land half-way through a
+  switch. A refused change is recorded in the audit log as *stale change refused*. Scripts
+  using the HTTP API are not affected: they say what they mean and have no form to go stale.
 
 - Auto-start option (enabled by default) to bring the encoder on-air when the moment the program launches; toggle in Settings.
 
@@ -232,6 +240,25 @@ A work-in-progress open-source webUI based RDS encoder. Ships with a lightweight
   certificate can be given **No cert check** on its own connection, which turns verification
   off for that one connection and nothing else.
 
+  **Non-buffered groups (buffer configuration 00)** are what a source sends when
+  it is set up for a Pira or FMB10 encoder: "transmitted once only and removed
+  after transmission". Taken at face value that leaves a receiver tuning in
+  afterwards with no RT+ and no announcement of it, so the last group of each
+  type is kept and sent again at an interval - 4 s by default for 3A, 11A and
+  12A, the way a hardware coder is told "send 3A every 4000 ms". Set
+  `uecp_repeat_ms` to `{"3A": 4000, "12A": 2000}` to change it, or to 0 for a
+  group to restore "once and removed" exactly. A buffer clear from the source
+  withdraws the repeat with it, and a source that has said nothing about a
+  group for five minutes loses it altogether - stale RT+ tags pointing into
+  RadioText that has since changed are worse than none.
+
+  **A slot belongs to the source.** In UECP mode the built-in generators do not
+  fill a group the source owns, even when the sequence is hand-written. They
+  used to: group 12A carried the encoder's own DAB cross-reference data
+  whenever the source's RT+ queue was momentarily empty, which is half the
+  groups in a minute measured against a live source, and no receiver could make
+  sense of RT+ through that.
+
   **MEC access rights** decide which commands a source may use, the way a 2wcom, Audemat or
   Deva encoder does - and they are set **per connection**, so a studio link can be allowed to
   set RadioText while a remote one cannot rewrite the PI or the AF list. A connection with no
@@ -276,6 +303,46 @@ pip install -r requirements.txt
    UECP over WebSocket; the TCP listener works without it.
 
   
+
+### Several encoders from one install
+
+A station with two services wants two encoders, not two installs. An instance is
+a name, a data directory and a port; the program directory, the tray icon and the
+updater are shared.
+
+- **At install time**, the Windows installer asks how many to set up and which
+  port to start counting from. There is no limit on the number: above eight it
+  asks whether that is really meant, because each instance is a full encoder
+  with its own soundcard and its own share of the CPU, so what runs out is the
+  machine rather than anything in the software. The tray asks them all at once
+  whether they are answering, so a long list does not slow its menu down.
+- **Afterwards**, the tray icon is the manager. Each instance has its own
+  submenu - open its web interface, start, stop, restart, change its port,
+  change its sign-in details, open its folder, remove it - and *Add another
+  instance...* creates one. With a single instance the menu looks as it always
+  did.
+- **From a prompt**, if you would rather:
+
+```bash
+
+rds-master --list-instances
+rds-master --add-instance "Studio 2" --port 5001
+rds-master --instance-port "Studio 2" --port 5002
+rds-master --instance-password "Studio 2" --user admin --password secret
+rds-master --remove-instance "Studio 2"
+
+```
+
+The first instance keeps the plain data directory and the scheduled task name
+an upgrade looks for, so an existing single-instance install is untouched by all
+of this. Each one is started with `--data-dir`, which is also what a restart
+keeps, and stopping one finds the process holding *that* instance's port -
+they all run from the same executable, so stopping by name would take the lot
+down.
+
+Automatic start per instance is set up on Windows (one scheduled task each). On
+Linux and macOS the first instance's service unit is installed as before and
+further ones are started by the tray.
 
 ### Updating
 
@@ -345,7 +412,7 @@ python app.py
 
 - Datasets Mode (Group 5A) for transparent data channel. ✅
 
-- No packaged EXE release yet; restart-on-crash not managed. ✅
+- No packaged EXE release yet; restart-on-crash not managed.
 
 - Support for RBDS variant. ✅
 

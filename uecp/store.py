@@ -47,6 +47,25 @@ MAX_FREE_FORMAT = 64      # queued raw groups per group type, per data set
 # waited this long is discarded instead of going to air late.
 STALE_AFTER = 20.0        # seconds
 
+# How often to send a non-buffered group again when nothing new has arrived,
+# by group index, in seconds. Buffer configuration 00 means "once only and
+# removed", which leaves a receiver that tunes in later with no RT+ and no
+# announcement of it, so the last one is kept and repeated at this rate.
+# 0 turns it off for that group and restores "once and removed" exactly.
+# Only the announcement and the tag groups are repeated by default: a TMC
+# message or a paging call describes a moment and must not be re-sent.
+REPEAT_DEFAULT = {
+    0x06: 4.0,            # 3A, the ODA announcement
+    0x16: 4.0,            # 11A, where RT+ usually is
+    0x18: 4.0,            # 12A, where this source puts it
+}
+
+# How long after the source last said anything about a group its last one goes
+# on being repeated. A source that has gone quiet for this long has stopped,
+# and RT+ tags pointing into RadioText that has since changed are worse than
+# no tags at all - so the group is given up and its slot with it.
+REPEAT_WINDOW = 300.0     # seconds
+
 # How long a group type keeps its place in the sequence after the last message
 # for it arrived. Long enough to bridge the gap between a source's messages,
 # short enough that a group it has stopped sending is dropped from the
@@ -169,6 +188,11 @@ class FreeFormatGroup:
     def group_name(self) -> str:
         return f"{(self.group_index >> 1) & 0x0F}{'B' if self.group_index & 1 else 'A'}"
 
+    @property
+    def content(self) -> tuple:
+        """What goes on the wire, which is what makes two groups the same one."""
+        return (self.group_index, self.b2_tail, self.b3, self.b4)
+
 
 @dataclass
 class OdaApplication:
@@ -199,6 +223,12 @@ class DataSet:
     # and so does ODA data once its AID resolves to a group.
     free_format: dict[int, list] = field(default_factory=dict)
 
+    # The RT+ tags last seen, decoded from the source's own 11A/12A groups:
+    # {"toggle": 0|1, "running": 0|1, "tags": [(type, start, length), ...]}.
+    # The groups themselves still go to air untouched; this is for the monitor,
+    # which used to show tags the internal tagger had invented instead.
+    rt_plus: dict = field(default_factory=dict)
+
     group_sequence: list[int] = field(default_factory=list)      # MEC 0x16
     ext_group_sequence: dict[int, list[int]] = field(default_factory=dict)  # MEC 0x38
     variant_sequence: dict[int, list[int]] = field(default_factory=dict)    # MEC 0x29
@@ -214,6 +244,12 @@ class DataSet:
     # Raw groups thrown away for having waited past STALE_AFTER. A health
     # figure for the operator, not part of the RDS data.
     dropped_stale: int = 0
+
+    # The last non-buffered group sent for each index, and when, so it can be
+    # sent again while the source says nothing new. Cleared by a buffer-clear,
+    # which is how a source withdraws RT+ between songs.
+    last_sent: dict = field(default_factory=dict)
+    repeat_every: dict = field(default_factory=lambda: dict(REPEAT_DEFAULT))
 
     def service(self, psn: int, create: bool = True) -> ProgrammeService | None:
         svc = self.services.get(psn)
@@ -232,10 +268,38 @@ class DataSet:
         return [s for psn, s in sorted(self.services.items()) if psn != self.main_psn]
 
     def queue_group(self, ff) -> int:
-        """Queue a raw group for transmission; returns the new queue depth."""
+        """Queue a raw group for transmission; returns the new queue depth.
+
+        A group the source sends again is the same group again, not a second
+        one. Sources re-send theirs several times a second, so appending every
+        copy filled the buffer with duplicates and the rotation went round
+        those instead of round the distinct groups - one 3A announcement
+        repeating while the other AIDs never got a turn, and the one waiting
+        longest dropping off the front once the buffer was full.
+
+        So identical content is one entry. A cyclic one is simply refreshed. A
+        "transmit once" one has its transmission count raised instead, so it
+        still goes out as many times as the source asked for - it takes its
+        turn in the bank rather than filling it.
+        """
         with QUEUE_LOCK:
             self.last_queued[ff.group_index] = time.time()
             bucket = self.free_format.setdefault(ff.group_index, [])
+            for queued in bucket:
+                if queued.cyclic != ff.cyclic or queued.content != ff.content:
+                    continue
+                if getattr(ff, "urgent", False) and not getattr(queued, "urgent", False):
+                    break            # an urgent copy still goes to the front
+                queued.queued_at = ff.queued_at
+                if ff.cyclic:
+                    queued.transmissions = ff.transmissions
+                else:
+                    # Capped: a source that sends the same group for an hour is
+                    # describing now, not asking for an hour of repeats.
+                    queued.transmissions = min(MAX_FREE_FORMAT,
+                                               queued.transmissions
+                                               + max(1, ff.transmissions))
+                return len(bucket)
             # An urgent TMC set goes to the front: that is the whole point of
             # the flag, and a backed-up buffer must not delay it.
             if getattr(ff, "urgent", False):
@@ -247,9 +311,14 @@ class DataSet:
             return len(bucket)
 
     def clear_group(self, index: int) -> None:
-        """Empty one group type's buffer (buffer configuration 11)."""
+        """Empty one group type's buffer (buffer configuration 11).
+
+        This is how a source withdraws what it sent - RT+ between songs, say -
+        so whatever was being repeated for that group is withdrawn with it.
+        """
         with QUEUE_LOCK:
             self.free_format.pop(index, None)
+            self.last_sent.pop(index, None)
 
     def take_group(self, index: int):
         """The next raw group to transmit for this group index, or None.
@@ -264,7 +333,7 @@ class DataSet:
         with QUEUE_LOCK:
             bucket = self.free_format.get(index)
             if not bucket:
-                return None
+                return self._repeat(index)
             # Drop anything that has been waiting too long to still be true.
             now = time.time()
             while bucket and not bucket[0].cyclic and now - bucket[0].queued_at > STALE_AFTER:
@@ -272,7 +341,7 @@ class DataSet:
                 bucket.pop(0)
             if not bucket:
                 self.free_format.pop(index, None)
-                return None
+                return self._repeat(index)
             ff = bucket.pop(0)
             if ff.cyclic:
                 bucket.append(ff)
@@ -282,7 +351,35 @@ class DataSet:
                     bucket.append(ff)
             if not bucket:
                 self.free_format.pop(index, None)
+            if not ff.cyclic:
+                # Kept as the current one for this group, so it can go out
+                # again while the source says nothing new.
+                self.last_sent[index] = (ff, time.time())
             return ff
+
+    def _repeat(self, index: int):
+        """The last non-buffered group again, if it is time. Caller holds the lock.
+
+        "Once only and removed" is what the source asked for, and on its own it
+        means a receiver that tunes in afterwards never sees the group at all.
+        Repeating the last one at a set rate is what a hardware coder does, and
+        it is what makes RT+ work from a source that does not buffer.
+        """
+        every = self.repeat_every.get(index, 0)
+        if not every:
+            return None
+        remembered = self.last_sent.get(index)
+        if remembered is None:
+            return None
+        now = time.time()
+        if now - self.last_queued.get(index, 0) > REPEAT_WINDOW:
+            self.last_sent.pop(index, None)      # the source has stopped
+            return None
+        ff, sent_at = remembered
+        if now - sent_at < every:
+            return None
+        self.last_sent[index] = (ff, now)
+        return ff
 
     def pending(self) -> dict:
         """Queue depth per group index, for the sequence and the monitor."""
@@ -302,7 +399,38 @@ class DataSet:
             for index, at in self.last_queued.items():
                 if at >= cutoff:
                     depths.setdefault(index, 0)
+            # A group being repeated is still in use, even with an empty
+            # queue and nothing new for a while: it needs its slot. Only while
+            # the repeat is still live, though - once the source has stopped
+            # for good, the slot goes back.
+            repeat_cutoff = time.time() - REPEAT_WINDOW
+            for index in self.last_sent:
+                if (self.repeat_every.get(index)
+                        and self.last_queued.get(index, 0) >= repeat_cutoff):
+                    depths.setdefault(index, 0)
             return depths
+
+    def rt_plus_summary(self) -> dict:
+        """The decoded tags, with the text each one points at.
+
+        A tag is a start and a length into the RadioText, so the text is cut
+        from the raw bytes the source sent and decoded afterwards - cutting the
+        decoded string would go wrong the moment a character is not one byte.
+        """
+        if not self.rt_plus:
+            return {}
+        svc = self.services.get(self.main_psn)
+        raw = b""
+        if svc is not None and svc.rt:
+            raw = svc.rt[0].raw or b""
+        out = dict(self.rt_plus)
+        tags = []
+        for kind, start, length in self.rt_plus.get("tags", []):
+            piece = raw[start:start + length]
+            tags.append({"type": kind, "start": start, "length": length,
+                         "text": rds_bytes_to_text(piece) if piece else ""})
+        out["tags"] = tags
+        return out
 
     def summary(self) -> dict:
         return {
@@ -311,6 +439,7 @@ class DataSet:
             "group_sequence": list(self.group_sequence),
             "slc": dict(self.slc),
             "variant_sequence": {k: list(v) for k, v in self.variant_sequence.items()},
+            "rt_plus": self.rt_plus_summary(),
             "free_format": {
                 f"{(gi >> 1) & 0x0F}{'B' if gi & 1 else 'A'}": len(q)
                 for gi, q in sorted(self.free_format.items()) if q

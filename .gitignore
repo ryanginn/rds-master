@@ -2,6 +2,7 @@
 # datasets.json holds the web-UI username/password and the Flask secret key.
 # Never commit it. Ship a datasets.example.json instead if you need a template.
 datasets.json
+instances.json
 datasets.json.*
 config.ini
 

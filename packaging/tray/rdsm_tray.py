@@ -42,6 +42,33 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Where the encoder is, and what it is doing
 # ---------------------------------------------------------------------------
 
+def registry():
+    """The instance registry, which the encoder ships beside this.
+
+    Imported late and guarded: a tray from an older build, or one unpacked on
+    its own, still manages the single instance it knows about.
+    """
+    try:
+        import instances
+
+        return instances
+    except ImportError:
+        return None
+
+
+def instance_rows() -> list:
+    """Every instance, newest configuration each time it is asked for."""
+    registry_module = registry()
+    if registry_module is None:
+        settings = read_settings()
+        return [{"name": "Main", "data_dir": data_directory(),
+                 "port": settings["port"], "autostart": True}]
+    try:
+        return registry_module.load()
+    except Exception:
+        return []
+
+
 def data_directory() -> str:
     """The same directory the encoder keeps its configuration in."""
     override = os.environ.get("RDS_DATA_DIR")
@@ -294,6 +321,10 @@ class Tray:
     def __init__(self):
         self.settings = read_settings()
         self.status = {"up": False, "detail": {}}
+        # One row per instance: name, data directory, port and whether it is
+        # answering. Rebuilt on every poll, because the tray is also how they
+        # are created and removed.
+        self.instances = []
         self.message = ""
         self.icon = None
         # When a start was asked for, so the menu can say "starting..." rather
@@ -325,7 +356,24 @@ class Tray:
         return "Not answering - use Start, or check the port below"
 
     def settings_line(self, _item=None) -> str:
+        if len(self.instances) > 1:
+            up = sum(1 for row in self.instances if row.get("up"))
+            return f"{up} of {len(self.instances)} instances running"
         return f"Listening on {self.settings['host']}:{self.settings['port']}"
+
+    def instance_line(self, row: dict):
+        """The label for one instance's submenu."""
+        def label(_item=None):
+            current = self.row_named(row["name"]) or row
+            state = "running" if current.get("up") else "stopped"
+            return f"{current['name']} - port {current['port']} ({state})"
+        return label
+
+    def row_named(self, name: str):
+        for row in self.instances:
+            if row["name"] == name:
+                return row
+        return None
 
     def message_line(self, _item=None) -> str:
         return self.message or "Ready"
@@ -353,6 +401,178 @@ class Tray:
 
         def handler(*_):
             threading.Thread(target=work, daemon=True).start()
+        return handler
+
+    def instance_action(self, name: str, action: str):
+        """Start, stop or restart one instance - and only that one.
+
+        Several encoders run from the same executable, so this goes through the
+        registry, which finds the process holding that instance's port rather
+        than stopping everything with the same name.
+        """
+        def work():
+            registry_module = registry()
+            row = self.row_named(name)
+            if registry_module is None or row is None:
+                code, output = service_command(action)
+            else:
+                if action in ("start", "restart"):
+                    self.starting_since = time.time()
+                self.message = f"{action.title()}ing {name}..."
+                code, output = getattr(registry_module, action)(row)
+            self.message = (f"{name}: {action} done" if code == 0
+                            else f"{name}: " + (output.splitlines() or ["failed"])[0][:60])
+            self.poll_once()
+
+        def handler(*_):
+            threading.Thread(target=work, daemon=True).start()
+        return handler
+
+    def open_instance(self, name: str):
+        def handler(*_):
+            row = self.row_named(name)
+            if row is None:
+                return
+            host = row.get("host") or "127.0.0.1"
+            if host in ("0.0.0.0", "::", ""):
+                host = "127.0.0.1"
+            webbrowser.open(f"http://{host}:{row['port']}/")
+        return handler
+
+    def edit_instance_port(self, name: str):
+        def handler(*_):
+            threading.Thread(target=self._edit_instance_port, args=(name,),
+                             daemon=True).start()
+        return handler
+
+    def _edit_instance_port(self, name: str):
+        registry_module = registry()
+        row = self.row_named(name)
+        if registry_module is None or row is None:
+            return
+        answer = ask_text(APP_NAME, f"Port for {name}:", str(row["port"]))
+        if not answer:
+            return
+        try:
+            port = int(answer.strip())
+        except ValueError:
+            show_message(APP_NAME, f"{answer!r} is not a port number.")
+            return
+        taken = [r for r in self.instances
+                 if r["name"] != name and r["port"] == port]
+        if taken:
+            show_message(APP_NAME, f"Port {port} is already {taken[0]['name']}'s.")
+            return
+        problem = registry_module.set_port(row["data_dir"], port)
+        if problem:
+            show_message(APP_NAME, problem)
+            return
+        self.message = f"{name}: port {port}"
+        self.poll_once()
+        if ask_yes_no(APP_NAME, f"{name} will use port {port} once it restarts."
+                      + NEWLINE + NEWLINE + "Restart it now?"):
+            self.instance_action(name, "restart")()
+
+    def edit_instance_password(self, name: str):
+        def handler(*_):
+            threading.Thread(target=self._edit_instance_password, args=(name,),
+                             daemon=True).start()
+        return handler
+
+    def _edit_instance_password(self, name: str):
+        registry_module = registry()
+        row = self.row_named(name)
+        if registry_module is None or row is None:
+            return
+        user = ask_text(APP_NAME, f"Web interface user name for {name}:",
+                        "admin")
+        if user is None or user == "":
+            return
+        password = ask_text(APP_NAME, f"New password for {name}:", "")
+        if not password:
+            return
+        problem = registry_module.set_password(row["data_dir"], user, password)
+        if problem:
+            show_message(APP_NAME, problem)
+            return
+        self.message = f"{name}: sign-in changed"
+        if ask_yes_no(APP_NAME, "Saved. It takes effect when the encoder"
+                      + " restarts." + NEWLINE + NEWLINE + "Restart it now?"):
+            self.instance_action(name, "restart")()
+
+    def add_instance(self, *_):
+        threading.Thread(target=self._add_instance, daemon=True).start()
+
+    def _add_instance(self):
+        """Create another encoder: its own configuration, its own port."""
+        registry_module = registry()
+        if registry_module is None:
+            show_message(APP_NAME, "This build cannot manage several instances.")
+            return
+        name = ask_text(APP_NAME, "A name for the new instance:",
+                        f"Instance {len(self.instances) + 1}")
+        if not name:
+            return
+        suggested = registry_module.free_port(
+            max([row["port"] for row in self.instances] or
+                [registry_module.DEFAULT_PORT]) + 1)
+        answer = ask_text(APP_NAME, f"Port for {name}:", str(suggested))
+        if not answer:
+            return
+        try:
+            port = int(answer.strip())
+        except ValueError:
+            show_message(APP_NAME, f"{answer!r} is not a port number.")
+            return
+        row, message = registry_module.add(name, port=port)
+        if row is None:
+            show_message(APP_NAME, message)
+            return
+        self.message = message
+        self.poll_once()
+        if ask_yes_no(APP_NAME, message + "." + NEWLINE + NEWLINE
+                      + "Start it now?"):
+            self.instance_action(row["name"], "start")()
+
+    def remove_instance(self, name: str):
+        def handler(*_):
+            threading.Thread(target=self._remove_instance, args=(name,),
+                             daemon=True).start()
+        return handler
+
+    def _remove_instance(self, name: str):
+        registry_module = registry()
+        if registry_module is None:
+            return
+        answer = ask_yes_no(
+            APP_NAME,
+            f"Remove {name}?" + NEWLINE + NEWLINE
+            + "It is stopped and taken out of the list. Its configuration and"
+            + " profiles are left on disk." + NEWLINE
+            + "Delete those as well? Choose No to keep them.")
+        if answer is None:
+            return
+        ok, message = registry_module.remove(name, delete_data=bool(answer))
+        self.message = message
+        if not ok:
+            show_message(APP_NAME, message)
+        self.poll_once()
+
+    def open_data_folder(self, name: str):
+        def handler(*_):
+            row = self.row_named(name)
+            if row is None:
+                return
+            folder = row["data_dir"]
+            try:
+                if sys.platform == "win32":
+                    os.startfile(folder)                  # noqa: S606
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", folder])
+                else:
+                    subprocess.Popen(["xdg-open", folder])
+            except Exception as exc:
+                show_message(APP_NAME, f"Cannot open {folder}: {exc}")
         return handler
 
     def show_addresses(self, *_):
@@ -449,6 +669,28 @@ class Tray:
         self.status = encoder_status(self.settings)
         if self.status["up"]:
             self.starting_since = 0.0
+
+        registry_module = registry()
+        rows = instance_rows()
+        if registry_module is not None and hasattr(registry_module, "statuses"):
+            for row in rows:
+                row["host"] = registry_module.host_of(row["data_dir"])
+            # All of them together: one at a time meant waiting out the timeout
+            # for every stopped instance in turn.
+            answering = registry_module.statuses(rows)
+            for row in rows:
+                row["up"] = answering.get(row["name"], False)
+        else:
+            for row in rows:
+                row["up"] = self.status["up"]
+        # The menu is rebuilt only when the shape of it changes, because on the
+        # Windows backend rebuilding it while it is open is what makes items
+        # stop responding.
+        shape = [(r["name"], r["port"]) for r in rows]
+        rebuild = shape != [(r["name"], r["port"]) for r in self.instances]
+        self.instances = rows
+        if rebuild and self.icon is not None:
+            self.icon.menu = self.build_menu()
         self.refresh()
 
     def refresh(self):
@@ -490,27 +732,76 @@ class Tray:
                         and time.time() - self.starting_since < STARTING_GRACE)
             time.sleep(POLL_STARTING if starting else POLL_SECONDS)
 
-    def run(self):
+    def instance_menu(self, row: dict):
+        """One instance's own submenu."""
         import pystray
 
-        menu = pystray.Menu(
+        name = row["name"]
+        items = [
+            pystray.MenuItem("Open web interface", self.open_instance(name),
+                             default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Start", self.instance_action(name, "start")),
+            pystray.MenuItem("Stop", self.instance_action(name, "stop")),
+            pystray.MenuItem("Restart", self.instance_action(name, "restart")),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Change port...", self.edit_instance_port(name)),
+            pystray.MenuItem("Change password...",
+                             self.edit_instance_password(name)),
+            pystray.MenuItem("Open its folder", self.open_data_folder(name)),
+        ]
+        if len(self.instances) > 1:
+            items.extend([pystray.Menu.SEPARATOR,
+                          pystray.MenuItem("Remove this instance...",
+                                           self.remove_instance(name))])
+        return pystray.Menu(*items)
+
+    def build_menu(self):
+        """The whole menu. Rebuilt when an instance is added or removed."""
+        import pystray
+
+        items = [
             pystray.MenuItem(self.status_line, self.open_ui, default=True),
             pystray.MenuItem(self.settings_line, None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Open web interface", self.open_ui),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Start", self.do("start")),
-            pystray.MenuItem("Stop", self.do("stop")),
-            pystray.MenuItem("Restart", self.do("restart")),
+        ]
+        rows = self.instances or instance_rows()
+        if len(rows) == 1:
+            # One encoder: the old menu, because a submenu holding a single
+            # thing is only in the way.
+            name = rows[0]["name"]
+            items.extend([
+                pystray.MenuItem("Open web interface", self.open_instance(name)),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Start", self.instance_action(name, "start")),
+                pystray.MenuItem("Stop", self.instance_action(name, "stop")),
+                pystray.MenuItem("Restart", self.instance_action(name, "restart")),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Change password...",
+                                 self.edit_instance_password(name)),
+            ])
+        else:
+            for row in rows:
+                items.append(pystray.MenuItem(self.instance_line(row),
+                                              self.instance_menu(row)))
+            items.append(pystray.Menu.SEPARATOR)
+        items.extend([
+            pystray.MenuItem("Add another instance...", self.add_instance),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Network settings...", self.edit_network),
             pystray.MenuItem("Where can I reach it?", self.show_addresses),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self.message_line, None, enabled=False),
             pystray.MenuItem("Quit RDS Master", self.quit),
-        )
+        ])
+        return pystray.Menu(*items)
+
+    def run(self):
+        import pystray
+
+        self.instances = instance_rows()
         self.icon = pystray.Icon("rdsmaster", tint(self.base_image, False),
-                                 self.title(), menu)
+                                 self.title(), self.build_menu())
         threading.Thread(target=self.poll_forever, daemon=True).start()
         threading.Thread(target=self.supervise, daemon=True).start()
         self.icon.run()
